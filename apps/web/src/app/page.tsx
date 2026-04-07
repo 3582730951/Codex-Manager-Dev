@@ -194,6 +194,13 @@ export default async function Page({
     getTenants(),
     getAdminHealth()
   ]);
+  const surfaceTitle =
+    data.title === "Codex Manager 2.0" ? "Codex 管理台" : data.title;
+  const surfaceSubtitle =
+    data.subtitle ===
+    "Responses-first, lease-bound routing, dual-candidate selection, and warp-aware recovery."
+      ? "响应优先、租约粘连、双候选调度、Warp 恢复。"
+      : data.subtitle;
 
   const ringStyle = {
     "--progress": `${percent(data.cacheMetrics.prefixHitRatio)}%`
@@ -243,8 +250,8 @@ export default async function Page({
       <section className="hero">
         <div className="hero-copy">
           <p className="eyebrow">Codex Manager / Admin Surface</p>
-          <h1>{data.title}</h1>
-          <p className="hero-subtitle">{data.subtitle}</p>
+          <h1>{surfaceTitle}</h1>
+          <p className="hero-subtitle">{surfaceSubtitle}</p>
 
           <div className="status-strip">
             {healthBlocks.map((item) => (
@@ -267,19 +274,19 @@ export default async function Page({
 
           <div className="metric-stack">
             <article className="metric-block">
-              <span>Cached</span>
+              <span>缓存</span>
               <strong>{number(data.cacheMetrics.cachedTokens)}</strong>
             </article>
             <article className="metric-block">
-              <span>Replay</span>
+              <span>回放</span>
               <strong>{number(data.cacheMetrics.replayTokens)}</strong>
             </article>
             <article className="metric-block">
-              <span>Static</span>
+              <span>前缀</span>
               <strong>{number(data.cacheMetrics.staticPrefixTokens)}</strong>
             </article>
             <article className="metric-block">
-              <span>ROI</span>
+              <span>收益</span>
               <strong>{data.cacheMetrics.warmupRoi.toFixed(2)}x</strong>
             </article>
           </div>

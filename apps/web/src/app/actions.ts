@@ -110,10 +110,11 @@ export async function createTenantAction(formData: FormData) {
     }
 
     await createTenant({ slug, name });
-    finishSuccess("租户已创建。", "connect");
   } catch (error) {
     finishError(error, "connect");
   }
+
+  finishSuccess("租户已创建。", "connect");
 }
 
 export async function importAccountAction(formData: FormData) {
@@ -143,11 +144,11 @@ export async function importAccountAction(formData: FormData) {
       healthScore: readOptionalNumber(formData, "healthScore"),
       egressStability: readOptionalNumber(formData, "egressStability")
     });
-
-    finishSuccess("账号已导入。", "connect");
   } catch (error) {
     finishError(error, "connect");
   }
+
+  finishSuccess("账号已导入。", "connect");
 }
 
 async function submitTaskAction(
@@ -175,17 +176,19 @@ async function submitTaskAction(
 export async function browserLoginAction(formData: FormData) {
   try {
     await submitTaskAction("login", formData);
-    finishSuccess("登录任务已启动。", "login");
   } catch (error) {
     finishError(error, "login");
   }
+
+  finishSuccess("登录任务已启动。", "login");
 }
 
 export async function browserRecoverAction(formData: FormData) {
   try {
     await submitTaskAction("recover", formData);
-    finishSuccess("恢复任务已启动。", "login");
   } catch (error) {
     finishError(error, "login");
   }
+
+  finishSuccess("恢复任务已启动。", "login");
 }
