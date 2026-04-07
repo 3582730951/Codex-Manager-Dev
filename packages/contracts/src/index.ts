@@ -101,30 +101,30 @@ export interface DashboardSnapshot {
 }
 
 export const dashboardFallback: DashboardSnapshot = {
-  title: "Codex Manager 2.0",
-  subtitle: "Responses-first, lease-bound routing, cache-aware failover.",
+  title: "Codex 管理台",
+  subtitle: "路由、缓存、恢复，一屏看完。",
   topology: [
     {
       name: "web",
-      purpose: "Node SSR management console",
+      purpose: "中文前台界面",
       hotPath: false,
       port: 3000
     },
     {
       name: "server:data",
-      purpose: "OpenAI-compatible gateway",
+      purpose: "OpenAI 兼容网关",
       hotPath: true,
       port: 8080
     },
     {
       name: "server:admin",
-      purpose: "Control plane and observability",
+      purpose: "控制面与观测面",
       hotPath: false,
       port: 8081
     },
     {
       name: "browser-assist",
-      purpose: "Login and challenge recovery sidecar",
+      purpose: "登录与挑战恢复",
       hotPath: false,
       port: 8090
     }
@@ -140,7 +140,7 @@ export const dashboardFallback: DashboardSnapshot = {
     {
       id: "acc_demo_1",
       tenantId: "demo",
-      label: "Meridian",
+      label: "子午线",
       models: ["gpt-5.4", "gpt-5.3-codex"],
       currentMode: "direct",
       routeMode: "direct",
@@ -168,7 +168,7 @@ export const dashboardFallback: DashboardSnapshot = {
     {
       principalId: "tenant:demo/principal:atlas-shell",
       accountId: "acc_demo_1",
-      accountLabel: "Meridian",
+      accountLabel: "子午线",
       model: "gpt-5.4",
       routeMode: "direct",
       generation: 8,
@@ -178,7 +178,7 @@ export const dashboardFallback: DashboardSnapshot = {
     {
       principalId: "tenant:demo/principal:review-bot",
       accountId: "acc_demo_2",
-      accountLabel: "Mistral Wing",
+      accountLabel: "西风翼",
       model: "gpt-5.4",
       routeMode: "warp",
       generation: 3,
@@ -190,7 +190,7 @@ export const dashboardFallback: DashboardSnapshot = {
     {
       id: "incident_demo_1",
       accountId: "acc_demo_2",
-      accountLabel: "Mistral Wing",
+      accountLabel: "西风翼",
       routeMode: "warp",
       severity: "cooldown",
       happenedAt: new Date().toISOString(),
@@ -202,13 +202,13 @@ export const dashboardFallback: DashboardSnapshot = {
       id: "task_demo_1",
       kind: "recover",
       accountId: "acc_demo_2",
-      accountLabel: "Mistral Wing",
+      accountLabel: "西风翼",
       provider: "openai",
       routeMode: "warp",
       status: "completed",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      notes: "warp recovery dry run",
+      notes: "warp 恢复演练",
       profileDir: "/tmp/cmgr-browser-assist/acc_demo_2",
       screenshotPath: null,
       storageStatePath: "/tmp/cmgr-browser-assist/acc_demo_2/recover.storage-state.json",
