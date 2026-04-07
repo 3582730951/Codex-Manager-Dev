@@ -1,7 +1,8 @@
-import type { CSSProperties } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import {
   browserLoginAction,
   browserRecoverAction,
+  bulkImportAccountsAction,
   createTenantAction,
   importAccountAction
 } from "@/app/actions";
@@ -25,6 +26,20 @@ type SearchParams =
   | Promise<Record<string, string | string[] | undefined>>
   | Record<string, string | string[] | undefined>
   | undefined;
+
+type GlyphKind =
+  | "brand"
+  | "overview"
+  | "cache"
+  | "accounts"
+  | "login"
+  | "topology"
+  | "leases"
+  | "alerts"
+  | "tasks"
+  | "status"
+  | "tenant"
+  | "key";
 
 function clamp01(value: number) {
   return Math.min(1, Math.max(0, value));
@@ -54,12 +69,12 @@ function firstValue(
 
 function modeLabel(mode: string | null | undefined) {
   if (mode === "warp") {
-    return "◌ Warp";
+    return "Warp";
   }
   if (mode === "direct") {
-    return "◎ 直连";
+    return "Direct";
   }
-  return "○ 混合";
+  return "Hybrid";
 }
 
 function healthLabel(ok: boolean) {
@@ -69,18 +84,18 @@ function healthLabel(ok: boolean) {
 function severityLabel(value: string) {
   const token = value.toLowerCase();
   if (token.includes("cool")) {
-    return "◍ 冷却";
+    return "冷却";
   }
   if (token.includes("critical")) {
-    return "◆ 严重";
+    return "严重";
   }
   if (token.includes("warn")) {
-    return "△ 告警";
+    return "告警";
   }
   if (token.includes("recover")) {
-    return "↗ 恢复";
+    return "恢复";
   }
-  return `○ ${value}`;
+  return value;
 }
 
 function taskKindLabel(kind: string) {
@@ -117,7 +132,7 @@ function providerLabel(provider: string | null) {
 
 function topologyLabel(name: string, purpose: string) {
   const labels: Record<string, string> = {
-    web: "前台",
+    web: "前端入口",
     "server:data": "数据网关",
     "server:admin": "控制面",
     "browser-assist": "浏览器辅助"
@@ -148,6 +163,191 @@ function signalClass(value: number) {
   return "weak";
 }
 
+function modelsLabel(models: string[]) {
+  if (models.length <= 2) {
+    return models.join(" / ");
+  }
+  return `${models.slice(0, 2).join(" / ")} +${models.length - 2}`;
+}
+
+function credentialLabel(
+  hasCredential: boolean,
+  baseUrl: string | null | undefined,
+  chatgptAccountId: string | null | undefined
+) {
+  if (!hasCredential) {
+    return "未绑定";
+  }
+  if (chatgptAccountId) {
+    return chatgptAccountId;
+  }
+  if (baseUrl) {
+    return baseUrl.replace(/^https?:\/\//, "");
+  }
+  return "已绑定";
+}
+
+function taskAssetLabel(task: {
+  storageStatePath: string | null;
+  screenshotPath: string | null;
+}) {
+  if (task.storageStatePath && task.screenshotPath) {
+    return "State + Shot";
+  }
+  if (task.storageStatePath) {
+    return "State";
+  }
+  if (task.screenshotPath) {
+    return "Shot";
+  }
+  return "None";
+}
+
+function meterStyle(value: number) {
+  return {
+    "--meter": `${percent(value)}%`
+  } as CSSProperties;
+}
+
+function Glyph({
+  kind,
+  className
+}: {
+  kind: GlyphKind;
+  className?: string;
+}) {
+  let body: ReactNode;
+
+  switch (kind) {
+    case "brand":
+      body = (
+        <>
+          <circle cx="18" cy="18" r="12" />
+          <circle cx="18" cy="18" r="6" />
+          <path d="M18 2v6M18 28v6M2 18h6M28 18h6" />
+        </>
+      );
+      break;
+    case "overview":
+      body = (
+        <>
+          <rect x="5" y="6" width="10" height="10" rx="2" />
+          <rect x="19" y="6" width="10" height="6" rx="2" />
+          <rect x="19" y="16" width="10" height="12" rx="2" />
+          <rect x="5" y="20" width="10" height="8" rx="2" />
+        </>
+      );
+      break;
+    case "cache":
+      body = (
+        <>
+          <path d="M8 10h18v14H8z" />
+          <path d="M11 7h12M11 28h12" />
+          <path d="M14 14h6M14 18h8M14 22h4" />
+        </>
+      );
+      break;
+    case "accounts":
+      body = (
+        <>
+          <circle cx="18" cy="13" r="5" />
+          <path d="M8 29c1.8-5 6.4-8 10-8s8.2 3 10 8" />
+        </>
+      );
+      break;
+    case "login":
+      body = (
+        <>
+          <path d="M15 8h11v20H15" />
+          <path d="M9 18h14" />
+          <path d="m17 12 6 6-6 6" />
+        </>
+      );
+      break;
+    case "topology":
+      body = (
+        <>
+          <circle cx="9" cy="18" r="3" />
+          <circle cx="27" cy="10" r="3" />
+          <circle cx="27" cy="26" r="3" />
+          <path d="M12 18h8M22 12l-6 4M22 24l-6-4" />
+        </>
+      );
+      break;
+    case "leases":
+      body = (
+        <>
+          <path d="M13 22l-3 3a5 5 0 1 1-7-7l3-3" />
+          <path d="M23 12l3-3a5 5 0 0 1 7 7l-3 3" />
+          <path d="M12 24 24 12" />
+        </>
+      );
+      break;
+    case "alerts":
+      body = (
+        <>
+          <path d="m18 6 13 24H5Z" />
+          <path d="M18 13v7M18 24h.01" />
+        </>
+      );
+      break;
+    case "tasks":
+      body = (
+        <>
+          <path d="M9 8h18v20H9z" />
+          <path d="M13 12h10M13 18h10M13 24h6" />
+          <path d="M5 12h2M5 18h2M5 24h2" />
+        </>
+      );
+      break;
+    case "status":
+      body = (
+        <>
+          <path d="M8 25V11" />
+          <path d="M18 25V7" />
+          <path d="M28 25V15" />
+        </>
+      );
+      break;
+    case "tenant":
+      body = (
+        <>
+          <path d="M6 13 18 6l12 7-12 7Z" />
+          <path d="M10 17v7l8 4 8-4v-7" />
+        </>
+      );
+      break;
+    case "key":
+      body = (
+        <>
+          <circle cx="12" cy="18" r="4" />
+          <path d="M16 18h12M24 18v4M20 18v3" />
+        </>
+      );
+      break;
+    default:
+      body = null;
+  }
+
+  return (
+    <svg
+      aria-hidden="true"
+      className={className}
+      fill="none"
+      viewBox="0 0 36 36"
+    >
+      <g
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.75"
+      >
+        {body}
+      </g>
+    </svg>
+  );
+}
+
 function Notice({
   tone,
   message
@@ -157,7 +357,9 @@ function Notice({
 }) {
   return (
     <section className={`notice ${tone}`}>
-      <span className="notice-mark">{tone === "ok" ? "●" : "▲"}</span>
+      <span className="notice-mark" aria-hidden="true">
+        {tone === "ok" ? "OK" : "ER"}
+      </span>
       <p>{message}</p>
     </section>
   );
@@ -194,6 +396,7 @@ export default async function Page({
     getTenants(),
     getAdminHealth()
   ]);
+
   const surfaceTitle =
     data.title === "Codex Manager 2.0" ? "Codex 管理台" : data.title;
   const surfaceSubtitle =
@@ -205,16 +408,9 @@ export default async function Page({
   const ringStyle = {
     "--progress": `${percent(data.cacheMetrics.prefixHitRatio)}%`
   } as CSSProperties;
+  const generatedAt = formatTime(new Date().toISOString());
 
-  const stats = [
-    { label: "租户", value: number(data.counts.tenants) },
-    { label: "账号", value: number(data.counts.accounts) },
-    { label: "租约", value: number(data.counts.activeLeases) },
-    { label: "Warp", value: number(data.counts.warpAccounts) },
-    { label: "任务", value: number(data.counts.browserTasks) }
-  ];
-
-  const healthBlocks = [
+  const sidebarStatus = [
     {
       label: "管理面",
       value: healthLabel(health.status === "ok"),
@@ -232,547 +428,853 @@ export default async function Page({
     },
     {
       label: "Redis",
-      value: health.redisConnected ? "已连通" : "未连通",
+      value: health.redisConnected ? "在线" : "离线",
       accent: health.redisConnected
     },
     {
       label: "Browser",
-      value: health.browserAssistUrl === "n/a" ? "未配置" : "已挂接",
+      value: health.browserAssistUrl === "n/a" ? "未挂接" : "已挂接",
       accent: health.browserAssistUrl !== "n/a"
     }
   ];
 
+  const summaryCards = [
+    {
+      glyph: "overview" as const,
+      label: "租户",
+      value: number(data.counts.tenants),
+      note: "Tenant"
+    },
+    {
+      glyph: "accounts" as const,
+      label: "账号",
+      value: number(data.counts.accounts),
+      note: "Accounts"
+    },
+    {
+      glyph: "leases" as const,
+      label: "租约",
+      value: number(data.counts.activeLeases),
+      note: "Sticky"
+    },
+    {
+      glyph: "tasks" as const,
+      label: "任务",
+      value: number(data.counts.browserTasks),
+      note: "Browser"
+    }
+  ];
+
+  const navItems = [
+    { href: "#overview", label: "总览", glyph: "overview" as const },
+    { href: "#connect", label: "接入", glyph: "key" as const },
+    { href: "#accounts-ledger", label: "账号", glyph: "accounts" as const },
+    { href: "#topology", label: "拓扑", glyph: "topology" as const },
+    { href: "#leases", label: "租约", glyph: "leases" as const },
+    { href: "#alerts", label: "告警", glyph: "alerts" as const },
+    { href: "#tasks", label: "任务", glyph: "tasks" as const }
+  ];
+
   return (
-    <main className="shell">
-      <div className="halo halo-a" />
-      <div className="halo halo-b" />
+    <main className="console-shell">
+      <div className="ambient ambient-a" />
+      <div className="ambient ambient-b" />
 
-      <section className="hero">
-        <div className="hero-copy">
-          <p className="eyebrow">Codex Manager / Admin Surface</p>
-          <h1>{surfaceTitle}</h1>
-          <p className="hero-subtitle">{surfaceSubtitle}</p>
+      <aside className="chrome-sidebar">
+        <div className="brand-card">
+          <div className="brand-mark">
+            <Glyph kind="brand" className="glyph" />
+          </div>
+          <div className="brand-copy">
+            <strong>Codex Manager</strong>
+            <span>Admin Surface / 中文默认</span>
+          </div>
+        </div>
 
-          <div className="status-strip">
-            {healthBlocks.map((item) => (
+        <nav className="nav-stack" aria-label="主导航">
+          {navItems.map((item, index) => (
+            <a className="nav-link" href={item.href} key={item.href}>
+              <span className="nav-glyph">
+                <Glyph kind={item.glyph} className="glyph" />
+              </span>
+              <span className="nav-copy">
+                <strong>{item.label}</strong>
+                <small>{String(index + 1).padStart(2, "0")}</small>
+              </span>
+            </a>
+          ))}
+        </nav>
+
+        <section className="sidebar-panel">
+          <header className="sidebar-head">
+            <p className="section-kicker">Status Matrix</p>
+            <h2>运行态</h2>
+          </header>
+          <div className="sidebar-status">
+            {sidebarStatus.map((item) => (
               <div className="status-pill" key={item.label}>
                 <span className={`status-dot ${item.accent ? "on" : "off"}`} />
-                <strong>{item.label}</strong>
-                <small>{item.value}</small>
+                <div>
+                  <strong>{item.label}</strong>
+                  <small>{item.value}</small>
+                </div>
               </div>
             ))}
           </div>
-        </div>
+        </section>
 
-        <div className="hero-signal">
-          <div className="signal-ring" style={ringStyle}>
-            <div className="signal-core">
+        <section className="sidebar-panel slim">
+          <header className="sidebar-head compact">
+            <p className="section-kicker">Route</p>
+            <h2>Warm Path</h2>
+          </header>
+          <div className="mini-metric-grid">
+            <article className="mini-metric">
+              <span>Hit</span>
               <strong>{percent(data.cacheMetrics.prefixHitRatio)}%</strong>
-              <span>缓存命中</span>
-            </div>
-          </div>
-
-          <div className="metric-stack">
-            <article className="metric-block">
-              <span>缓存</span>
-              <strong>{number(data.cacheMetrics.cachedTokens)}</strong>
             </article>
-            <article className="metric-block">
-              <span>回放</span>
-              <strong>{number(data.cacheMetrics.replayTokens)}</strong>
-            </article>
-            <article className="metric-block">
-              <span>前缀</span>
-              <strong>{number(data.cacheMetrics.staticPrefixTokens)}</strong>
-            </article>
-            <article className="metric-block">
-              <span>收益</span>
-              <strong>{data.cacheMetrics.warmupRoi.toFixed(2)}x</strong>
+            <article className="mini-metric">
+              <span>Warp</span>
+              <strong>{number(data.counts.warpAccounts)}</strong>
             </article>
           </div>
-        </div>
-      </section>
+        </section>
+      </aside>
 
-      {noticeMessage ? (
-        <Notice message={noticeMessage} tone={noticeTone} />
-      ) : null}
-
-      <section className="stats-grid">
-        {stats.map((item, index) => (
-          <article className="stat-card" key={item.label}>
-            <small>{String(index + 1).padStart(2, "0")}</small>
-            <strong>{item.value}</strong>
-            <span>{item.label}</span>
-          </article>
-        ))}
-      </section>
-
-      <section className="action-grid">
-        <article className="panel" id="connect">
-          <header className="panel-head">
-            <div>
-              <p className="section-kicker">01</p>
-              <h2>接入账号</h2>
-            </div>
-            <p className="panel-note">
-              这里负责租户和上游凭证导入。用于网关真实转发。
-            </p>
-          </header>
-
-          <div className="form-stack">
-            <form action={createTenantAction} className="form-card">
-              <div className="form-head">
-                <strong>创建租户</strong>
-                <span>先建租户，再导入账号</span>
-              </div>
-              <div className="field-grid compact">
-                <label className="field">
-                  <span>标识</span>
-                  <input
-                    autoComplete="off"
-                    name="slug"
-                    placeholder="demo-team"
-                    type="text"
-                  />
-                </label>
-                <label className="field">
-                  <span>名称</span>
-                  <input
-                    autoComplete="off"
-                    name="name"
-                    placeholder="演示租户"
-                    type="text"
-                  />
-                </label>
-              </div>
-              <div className="form-actions">
-                <button className="button primary" type="submit">
-                  创建租户
-                </button>
-              </div>
-            </form>
-
-            <form action={importAccountAction} className="form-card">
-              <div className="form-head">
-                <strong>导入账号</strong>
-                <span>推荐填入 bearer token 与 ChatGPT Account ID</span>
-              </div>
-
-              <div className="field-grid">
-                <label className="field">
-                  <span>租户</span>
-                  <select
-                    defaultValue={tenants[0]?.id ?? ""}
-                    disabled={tenants.length === 0}
-                    name="tenantId"
-                  >
-                    {tenants.length === 0 ? (
-                      <option value="">暂无租户</option>
-                    ) : (
-                      tenants.map((tenant) => (
-                        <option key={tenant.id} value={tenant.id}>
-                          {tenant.name} / {tenant.slug}
-                        </option>
-                      ))
-                    )}
-                  </select>
-                </label>
-                <label className="field">
-                  <span>账号名</span>
-                  <input
-                    autoComplete="off"
-                    name="label"
-                    placeholder="OpenAI 主账号"
-                    type="text"
-                  />
-                </label>
-                <label className="field span-2">
-                  <span>模型</span>
-                  <input
-                    autoComplete="off"
-                    defaultValue="gpt-5.4, gpt-5.3-codex, gpt-5.2"
-                    name="models"
-                    type="text"
-                  />
-                </label>
-                <label className="field span-2">
-                  <span>Base URL</span>
-                  <input
-                    autoComplete="off"
-                    defaultValue="https://chatgpt.com/backend-api/codex"
-                    name="baseUrl"
-                    type="text"
-                  />
-                </label>
-                <label className="field span-2">
-                  <span>Bearer Token</span>
-                  <input
-                    autoComplete="off"
-                    name="bearerToken"
-                    placeholder="sk-... / session token"
-                    type="password"
-                  />
-                </label>
-                <label className="field span-2">
-                  <span>ChatGPT Account ID</span>
-                  <input
-                    autoComplete="off"
-                    name="chatgptAccountId"
-                    placeholder="acct_..."
-                    type="text"
-                  />
-                </label>
-                <label className="field span-2">
-                  <span>额外请求头</span>
-                  <textarea
-                    name="extraHeaders"
-                    placeholder={"Header-Name: value\nAnother-Header: value"}
-                    rows={3}
-                  />
-                </label>
-                <label className="field">
-                  <span>Quota</span>
-                  <input
-                    inputMode="decimal"
-                    name="quotaHeadroom"
-                    placeholder="0.95"
-                    type="text"
-                  />
-                </label>
-                <label className="field">
-                  <span>Quota 5h</span>
-                  <input
-                    inputMode="decimal"
-                    name="quotaHeadroom5h"
-                    placeholder="0.95"
-                    type="text"
-                  />
-                </label>
-                <label className="field">
-                  <span>Quota 7d</span>
-                  <input
-                    inputMode="decimal"
-                    name="quotaHeadroom7d"
-                    placeholder="0.95"
-                    type="text"
-                  />
-                </label>
-                <label className="field">
-                  <span>Health</span>
-                  <input
-                    inputMode="decimal"
-                    name="healthScore"
-                    placeholder="0.90"
-                    type="text"
-                  />
-                </label>
-                <label className="field">
-                  <span>Egress</span>
-                  <input
-                    inputMode="decimal"
-                    name="egressStability"
-                    placeholder="0.88"
-                    type="text"
-                  />
-                </label>
-              </div>
-
-              <div className="form-actions">
-                <button
-                  className="button primary"
-                  disabled={tenants.length === 0}
-                  type="submit"
-                >
-                  导入到控制面
-                </button>
-              </div>
-            </form>
+      <div className="chrome-main">
+        <header className="chrome-header">
+          <div className="header-copy">
+            <p className="eyebrow">Operations Console</p>
+            <h1>{surfaceTitle}</h1>
+            <p>{surfaceSubtitle}</p>
           </div>
-        </article>
 
-        <article className="panel" id="login">
-          <header className="panel-head">
-            <div>
-              <p className="section-kicker">02</p>
-              <h2>OpenAI 登录</h2>
+          <div className="header-strip">
+            <div className="header-chip strong">
+              <Glyph kind="status" className="glyph chip-glyph" />
+              <span>{healthLabel(health.status === "ok")}</span>
             </div>
-            <p className="panel-note">
-              这里提交 browser-assist 任务，用于登录与恢复，不会替代 bearer token 导入。
-            </p>
-          </header>
-
-          <form className="form-card tall" action={browserLoginAction}>
-            <div className="form-head">
-              <strong>浏览器辅助</strong>
-              <span>
-                Browser Assist: {health.browserAssistUrl === "n/a" ? "未挂接" : "已挂接"}
-              </span>
+            <div className="header-chip">
+              <Glyph kind="cache" className="glyph chip-glyph" />
+              <span>{percent(data.cacheMetrics.prefixHitRatio)}% 命中</span>
             </div>
+            <div className="header-chip">
+              <Glyph kind="tasks" className="glyph chip-glyph" />
+              <span>{generatedAt}</span>
+            </div>
+          </div>
+        </header>
 
-            <div className="field-grid">
-              <label className="field">
-                <span>账号</span>
-                <select
-                  defaultValue={data.accounts[0]?.id ?? ""}
-                  disabled={data.accounts.length === 0}
-                  name="accountId"
-                >
-                  {data.accounts.length === 0 ? (
-                    <option value="">暂无账号</option>
-                  ) : (
-                    data.accounts.map((account) => (
-                      <option key={account.id} value={account.id}>
-                        {account.label} / {account.id}
-                      </option>
-                    ))
-                  )}
-                </select>
-              </label>
-              <label className="field">
-                <span>路由</span>
-                <select defaultValue="direct" name="routeMode">
-                  <option value="direct">直连</option>
-                  <option value="warp">Warp</option>
-                </select>
-              </label>
-              <label className="field">
-                <span>模式</span>
-                <select defaultValue="true" name="headless">
-                  <option value="true">无头</option>
-                  <option value="false">带界面</option>
-                </select>
-              </label>
-              <label className="field span-2">
-                <span>登录地址</span>
-                <input
-                  autoComplete="off"
-                  defaultValue="https://chatgpt.com/auth/login"
-                  name="loginUrl"
-                  type="text"
-                />
-              </label>
-              <label className="field">
-                <span>邮箱</span>
-                <input autoComplete="username" name="email" type="text" />
-              </label>
-              <label className="field">
-                <span>密码</span>
-                <input autoComplete="current-password" name="password" type="password" />
-              </label>
-              <label className="field">
-                <span>OTP</span>
-                <input autoComplete="one-time-code" name="otpCode" type="text" />
-              </label>
-              <label className="field span-2">
-                <span>备注</span>
-                <textarea
-                  name="notes"
-                  placeholder="例如：首次登录、验证 Warp 会话"
-                  rows={3}
-                />
-              </label>
+        {noticeMessage ? (
+          <Notice message={noticeMessage} tone={noticeTone} />
+        ) : null}
+
+        <section className="hero-grid" id="overview">
+          <article className="glass-card hero-panel">
+            <header className="panel-head hero-head">
+              <div>
+                <p className="section-kicker">Overview</p>
+                <h2>控制台总览</h2>
+              </div>
+              <p className="panel-note">
+                用更少的文字暴露关键状态，重点保留缓存、租约、账号和浏览器登录链路。
+              </p>
+            </header>
+
+            <div className="hero-band">
+              <div className="hero-band-copy">
+                <strong>Responses-first / Sticky / Dual-Candidate</strong>
+                <p>
+                  入口、控制面、数据面、Browser Assist 分层展示；下方所有入口都保持中文默认。
+                </p>
+              </div>
+              <div className="hero-band-tags">
+                <span className="info-chip">CN</span>
+                <span className="info-chip">OpenAI</span>
+                <span className="info-chip">Docker</span>
+                <span className="info-chip">Warp-aware</span>
+              </div>
             </div>
 
-            <div className="form-actions dual">
-              <button
-                className="button primary"
-                disabled={data.accounts.length === 0}
-                type="submit"
-              >
-                启动登录
-              </button>
-              <button
-                className="button ghost"
-                disabled={data.accounts.length === 0}
-                formAction={browserRecoverAction}
-                type="submit"
-              >
-                恢复已有会话
-              </button>
-            </div>
-          </form>
-        </article>
-      </section>
-
-      <section className="content-grid">
-        <article className="panel">
-          <header className="panel-head compact">
-            <div>
-              <p className="section-kicker">03</p>
-              <h2>拓扑</h2>
-            </div>
-            <p className="panel-note">热路径与冷路径分离</p>
-          </header>
-
-          <div className="stack">
-            {data.topology.map((node) => (
-              <div className="row-card topology" key={node.name}>
-                <div className="mark-block">{topologyMark(node.name)}</div>
-                <div className="row-copy">
-                  <strong>{topologyLabel(node.name, node.purpose)}</strong>
-                  <p>{node.name}</p>
-                </div>
-                <div className="row-meta">
-                  <span>{node.hotPath ? "热" : "冷"}</span>
+            <div className="topology-rail">
+              {data.topology.map((node, index) => (
+                <div className="topology-node" key={node.name}>
+                  <div className="topology-badge">{topologyMark(node.name)}</div>
+                  <div className="topology-copy">
+                    <strong>{topologyLabel(node.name, node.purpose)}</strong>
+                    <small>{node.hotPath ? "Hot" : "Cold"}</small>
+                  </div>
                   <code>:{node.port}</code>
+                  {index < data.topology.length - 1 ? (
+                    <div className="topology-line" aria-hidden="true" />
+                  ) : null}
                 </div>
+              ))}
+            </div>
+
+            <div className="hero-stats">
+              {summaryCards.map((item) => (
+                <article className="summary-card" key={item.label}>
+                  <span className="summary-glyph">
+                    <Glyph kind={item.glyph} className="glyph" />
+                  </span>
+                  <div>
+                    <strong>{item.value}</strong>
+                    <span>{item.label}</span>
+                  </div>
+                  <small>{item.note}</small>
+                </article>
+              ))}
+            </div>
+          </article>
+
+          <article className="glass-card cache-panel">
+            <header className="panel-head compact">
+              <div>
+                <p className="section-kicker">Cache</p>
+                <h2>缓存命中</h2>
               </div>
-            ))}
-          </div>
-        </article>
+            </header>
 
-        <article className="panel">
-          <header className="panel-head compact">
-            <div>
-              <p className="section-kicker">04</p>
-              <h2>租约</h2>
+            <div className="signal-ring" style={ringStyle}>
+              <div className="signal-core">
+                <strong>{percent(data.cacheMetrics.prefixHitRatio)}%</strong>
+                <span>Prefix Hit</span>
+              </div>
             </div>
-            <p className="panel-note">principal 与 account 粘连</p>
-          </header>
 
-          <div className="stack">
-            {data.leases.length === 0 ? (
-              <Empty
-                detail="当前没有活跃租约。"
-                title="空闲"
-              />
-            ) : (
-              data.leases.map((lease) => (
-                <div className="row-card" key={lease.principalId}>
-                  <div className="row-copy">
-                    <strong>{lease.accountLabel}</strong>
-                    <p>{lease.principalId}</p>
-                  </div>
-                  <div className="badge-strip">
-                    <span className="badge">{modeLabel(lease.routeMode)}</span>
-                    <span className="badge">{lease.model}</span>
-                    <span className="badge">G{lease.generation}</span>
-                    <span className="badge">A{lease.activeSubagents}</span>
-                    <span className="badge">{formatTime(lease.lastUsedAt)}</span>
-                  </div>
+            <div className="metric-stack">
+              <article className="metric-block">
+                <span>Cached Tokens</span>
+                <strong>{number(data.cacheMetrics.cachedTokens)}</strong>
+              </article>
+              <article className="metric-block">
+                <span>Replay Tokens</span>
+                <strong>{number(data.cacheMetrics.replayTokens)}</strong>
+              </article>
+              <article className="metric-block">
+                <span>Static Prefix</span>
+                <strong>{number(data.cacheMetrics.staticPrefixTokens)}</strong>
+              </article>
+              <article className="metric-block">
+                <span>Warmup ROI</span>
+                <strong>{data.cacheMetrics.warmupRoi.toFixed(2)}x</strong>
+              </article>
+            </div>
+          </article>
+        </section>
+
+        <section className="workspace-grid">
+          <article className="glass-card intake-panel" id="connect">
+            <header className="panel-head">
+              <div>
+                <p className="section-kicker">Intake</p>
+                <h2>接入账号</h2>
+              </div>
+              <p className="panel-note">
+                接入流分成租户、Token 导入、批量导入和浏览器登录四段。风格更接近控制台，而不是表单堆叠。
+              </p>
+            </header>
+
+            <div className="flow-rail">
+              <div className="flow-step">
+                <span>01</span>
+                <strong>Tenant</strong>
+                <small>建立租户</small>
+              </div>
+              <div className="flow-step">
+                <span>02</span>
+                <strong>Token</strong>
+                <small>导入网关凭证</small>
+              </div>
+              <div className="flow-step">
+                <span>03</span>
+                <strong>Bulk</strong>
+                <small>批量归档</small>
+              </div>
+              <div className="flow-step" id="login">
+                <span>04</span>
+                <strong>Browser</strong>
+                <small>登录与恢复</small>
+              </div>
+            </div>
+
+            <div className="form-stack">
+              <form action={createTenantAction} className="form-card slim">
+                <div className="form-head">
+                  <strong>
+                    <Glyph kind="tenant" className="glyph inline-glyph" />
+                    创建租户
+                  </strong>
+                  <span>先建租户，再导入账号</span>
                 </div>
-              ))
-            )}
-          </div>
-        </article>
+                <div className="field-grid compact">
+                  <label className="field">
+                    <span>标识</span>
+                    <input
+                      autoComplete="off"
+                      name="slug"
+                      placeholder="demo-team"
+                      type="text"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>名称</span>
+                    <input
+                      autoComplete="off"
+                      name="name"
+                      placeholder="演示租户"
+                      type="text"
+                    />
+                  </label>
+                </div>
+                <div className="form-actions">
+                  <button className="button primary" type="submit">
+                    创建租户
+                  </button>
+                </div>
+              </form>
 
-        <article className="panel">
-          <header className="panel-head compact">
-            <div>
-              <p className="section-kicker">05</p>
-              <h2>账号池</h2>
+              <form action={importAccountAction} className="form-card">
+                <div className="form-head">
+                  <strong>
+                    <Glyph kind="key" className="glyph inline-glyph" />
+                    Token 导入
+                  </strong>
+                  <span>这里负责网关真实转发所需的账号与凭证</span>
+                </div>
+
+                <div className="field-grid">
+                  <label className="field">
+                    <span>租户</span>
+                    <select
+                      defaultValue={tenants[0]?.id ?? ""}
+                      disabled={tenants.length === 0}
+                      name="tenantId"
+                    >
+                      {tenants.length === 0 ? (
+                        <option value="">暂无租户</option>
+                      ) : (
+                        tenants.map((tenant) => (
+                          <option key={tenant.id} value={tenant.id}>
+                            {tenant.name} / {tenant.slug}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span>账号名</span>
+                    <input
+                      autoComplete="off"
+                      name="label"
+                      placeholder="OpenAI 主账号"
+                      type="text"
+                    />
+                  </label>
+                  <label className="field span-2">
+                    <span>模型</span>
+                    <input
+                      autoComplete="off"
+                      defaultValue="gpt-5.4, gpt-5.3-codex, gpt-5.2"
+                      name="models"
+                      type="text"
+                    />
+                  </label>
+                  <label className="field span-2">
+                    <span>Base URL</span>
+                    <input
+                      autoComplete="off"
+                      defaultValue="https://chatgpt.com/backend-api/codex"
+                      name="baseUrl"
+                      type="text"
+                    />
+                  </label>
+                  <label className="field span-2">
+                    <span>Bearer Token</span>
+                    <input
+                      autoComplete="off"
+                      name="bearerToken"
+                      placeholder="sk-... / session token"
+                      type="password"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Account ID</span>
+                    <input
+                      autoComplete="off"
+                      name="chatgptAccountId"
+                      placeholder="acct_..."
+                      type="text"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Health</span>
+                    <input
+                      inputMode="decimal"
+                      name="healthScore"
+                      placeholder="0.90"
+                      type="text"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Quota</span>
+                    <input
+                      inputMode="decimal"
+                      name="quotaHeadroom"
+                      placeholder="0.95"
+                      type="text"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>Egress</span>
+                    <input
+                      inputMode="decimal"
+                      name="egressStability"
+                      placeholder="0.88"
+                      type="text"
+                    />
+                  </label>
+                  <label className="field span-2">
+                    <span>额外请求头</span>
+                    <textarea
+                      name="extraHeaders"
+                      placeholder={"Header-Name: value\nAnother-Header: value"}
+                      rows={3}
+                    />
+                  </label>
+                </div>
+
+                <div className="form-actions">
+                  <button
+                    className="button primary"
+                    disabled={tenants.length === 0}
+                    type="submit"
+                  >
+                    导入到控制面
+                  </button>
+                </div>
+              </form>
+
+              <form action={bulkImportAccountsAction} className="form-card">
+                <div className="form-head">
+                  <strong>
+                    <Glyph kind="accounts" className="glyph inline-glyph" />
+                    批量导入
+                  </strong>
+                  <span>支持 JSON / JSON 数组 / 每行一个 token</span>
+                </div>
+
+                <div className="field-grid">
+                  <label className="field">
+                    <span>租户</span>
+                    <select
+                      defaultValue={tenants[0]?.id ?? ""}
+                      disabled={tenants.length === 0}
+                      name="tenantId"
+                    >
+                      {tenants.length === 0 ? (
+                        <option value="">暂无租户</option>
+                      ) : (
+                        tenants.map((tenant) => (
+                          <option key={tenant.id} value={tenant.id}>
+                            {tenant.name} / {tenant.slug}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </label>
+                  <label className="field span-2">
+                    <span>默认模型</span>
+                    <input
+                      autoComplete="off"
+                      defaultValue="gpt-5.4, gpt-5.3-codex, gpt-5.2"
+                      name="models"
+                      type="text"
+                    />
+                  </label>
+                  <label className="field span-2">
+                    <span>默认 Base URL</span>
+                    <input
+                      autoComplete="off"
+                      defaultValue="https://chatgpt.com/backend-api/codex"
+                      name="baseUrl"
+                      type="text"
+                    />
+                  </label>
+                  <label className="field span-2">
+                    <span>账号数据</span>
+                    <textarea
+                      name="bulkContent"
+                      placeholder={
+                        '支持 `{"label":"主号","bearerToken":"..."}`、JSON 数组，或每行一个 bearer token'
+                      }
+                      rows={7}
+                    />
+                  </label>
+                </div>
+
+                <div className="form-actions">
+                  <button
+                    className="button primary"
+                    disabled={tenants.length === 0}
+                    type="submit"
+                  >
+                    批量归档
+                  </button>
+                </div>
+              </form>
+
+              <form className="form-card" action={browserLoginAction}>
+                <div className="form-head">
+                  <strong>
+                    <Glyph kind="login" className="glyph inline-glyph" />
+                    OpenAI 登录
+                  </strong>
+                  <span>
+                    Browser Assist: {health.browserAssistUrl === "n/a" ? "未挂接" : "已挂接"}
+                  </span>
+                </div>
+
+                <div className="field-grid">
+                  <label className="field">
+                    <span>账号</span>
+                    <select
+                      defaultValue={data.accounts[0]?.id ?? ""}
+                      disabled={data.accounts.length === 0}
+                      name="accountId"
+                    >
+                      {data.accounts.length === 0 ? (
+                        <option value="">暂无账号</option>
+                      ) : (
+                        data.accounts.map((account) => (
+                          <option key={account.id} value={account.id}>
+                            {account.label} / {account.id}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span>路由</span>
+                    <select defaultValue="direct" name="routeMode">
+                      <option value="direct">Direct</option>
+                      <option value="warp">Warp</option>
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span>模式</span>
+                    <select defaultValue="true" name="headless">
+                      <option value="true">无头</option>
+                      <option value="false">带界面</option>
+                    </select>
+                  </label>
+                  <label className="field span-2">
+                    <span>登录地址</span>
+                    <input
+                      autoComplete="off"
+                      defaultValue="https://chatgpt.com/auth/login"
+                      name="loginUrl"
+                      type="text"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>邮箱</span>
+                    <input autoComplete="username" name="email" type="text" />
+                  </label>
+                  <label className="field">
+                    <span>密码</span>
+                    <input autoComplete="current-password" name="password" type="password" />
+                  </label>
+                  <label className="field">
+                    <span>OTP</span>
+                    <input autoComplete="one-time-code" name="otpCode" type="text" />
+                  </label>
+                  <label className="field span-2">
+                    <span>备注</span>
+                    <textarea
+                      name="notes"
+                      placeholder="例如：首次登录、验证 Warp 会话"
+                      rows={3}
+                    />
+                  </label>
+                </div>
+
+                <div className="callout-card">
+                  浏览器登录用于建立或恢复浏览器会话；网关真实转发仍然以 Token 导入为准。
+                </div>
+
+                <div className="form-actions dual">
+                  <button
+                    className="button primary"
+                    disabled={data.accounts.length === 0}
+                    type="submit"
+                  >
+                    启动登录
+                  </button>
+                  <button
+                    className="button ghost"
+                    disabled={data.accounts.length === 0}
+                    formAction={browserRecoverAction}
+                    type="submit"
+                  >
+                    恢复已有会话
+                  </button>
+                </div>
+              </form>
             </div>
-            <p className="panel-note">凭证、健康度、配额头寸</p>
-          </header>
+          </article>
 
-          <div className="stack">
+          <article className="glass-card ledger-panel" id="accounts-ledger">
+            <header className="panel-head">
+              <div>
+                <p className="section-kicker">Ledger</p>
+                <h2>账号工作台</h2>
+              </div>
+              <p className="panel-note">
+                表格化展示账号池，比大块卡片更适合看路由、配额和凭证状态。
+              </p>
+            </header>
+
             {data.accounts.length === 0 ? (
               <Empty detail="先导入账号，才能开启转发和登录任务。" title="暂无账号" />
             ) : (
-              data.accounts.map((account) => (
-                <div className="row-card account" key={account.id}>
+              <div className="table-wrap">
+                <table className="ledger-table">
+                  <thead>
+                    <tr>
+                      <th>账号</th>
+                      <th>模型</th>
+                      <th>路由</th>
+                      <th>H</th>
+                      <th>Q</th>
+                      <th>E</th>
+                      <th>凭证</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.accounts.map((account) => (
+                      <tr key={account.id}>
+                        <td>
+                          <div className="table-primary">
+                            <strong>{account.label}</strong>
+                            <span>{account.id}</span>
+                          </div>
+                        </td>
+                        <td>
+                          <div className="table-secondary">
+                            <strong>{modelsLabel(account.models)}</strong>
+                            <span>
+                              {account.nearQuotaGuardEnabled ? "Guard On" : "Guard Off"}
+                            </span>
+                          </div>
+                        </td>
+                        <td>
+                          <div className="route-cell">
+                            <span className="badge">{modeLabel(account.routeMode)}</span>
+                            <span className="badge">L{account.cooldownLevel}</span>
+                            <span className="badge">
+                              {account.proxyEnabled ? "Proxy" : "Native"}
+                            </span>
+                          </div>
+                        </td>
+                        <td>
+                          <div
+                            className={`meter-card ${signalClass(account.healthScore)}`}
+                            style={meterStyle(account.healthScore)}
+                          >
+                            <span>{percent(account.healthScore)}%</span>
+                          </div>
+                        </td>
+                        <td>
+                          <div
+                            className={`meter-card ${signalClass(account.quotaHeadroom)}`}
+                            style={meterStyle(account.quotaHeadroom)}
+                          >
+                            <span>{percent(account.quotaHeadroom)}%</span>
+                          </div>
+                        </td>
+                        <td>
+                          <div
+                            className={`meter-card ${signalClass(account.egressStability)}`}
+                            style={meterStyle(account.egressStability)}
+                          >
+                            <span>{percent(account.egressStability)}%</span>
+                          </div>
+                        </td>
+                        <td>
+                          <div className="table-secondary">
+                            <strong>
+                              {account.hasCredential ? "已绑定凭证" : "未绑定凭证"}
+                            </strong>
+                            <span>
+                              {credentialLabel(
+                                account.hasCredential,
+                                account.baseUrl,
+                                account.chatgptAccountId
+                              )}
+                            </span>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </article>
+        </section>
+
+        <section className="board-grid">
+          <article className="glass-card" id="topology">
+            <header className="panel-head compact">
+              <div>
+                <p className="section-kicker">Topology</p>
+                <h2>拓扑</h2>
+              </div>
+              <p className="panel-note">热路径与冷路径分离</p>
+            </header>
+            <div className="stack">
+              {data.topology.map((node) => (
+                <div className="row-card topology-card" key={node.name}>
+                  <div className="mark-block">{topologyMark(node.name)}</div>
                   <div className="row-copy">
-                    <strong>{account.label}</strong>
-                    <p>{account.id}</p>
+                    <strong>{topologyLabel(node.name, node.purpose)}</strong>
+                    <p>{node.name}</p>
                   </div>
-                  <div className="account-signals">
-                    <div className={`signal-tag ${signalClass(account.healthScore)}`}>
-                      <small>Health</small>
-                      <strong>{percent(account.healthScore)}</strong>
-                    </div>
-                    <div className={`signal-tag ${signalClass(account.quotaHeadroom)}`}>
-                      <small>Quota</small>
-                      <strong>{percent(account.quotaHeadroom)}</strong>
-                    </div>
-                    <div className={`signal-tag ${signalClass(account.egressStability)}`}>
-                      <small>Egress</small>
-                      <strong>{percent(account.egressStability)}</strong>
-                    </div>
-                  </div>
-                  <div className="badge-strip">
-                    <span className="badge">{modeLabel(account.routeMode)}</span>
-                    <span className="badge">L{account.cooldownLevel}</span>
-                    <span className="badge">
-                      {account.hasCredential ? "已绑凭证" : "未绑凭证"}
-                    </span>
-                    <span className="badge">
-                      {account.nearQuotaGuardEnabled ? "Guard On" : "Guard Off"}
-                    </span>
-                    <span className="badge">
-                      {account.proxyEnabled ? "Proxy" : "Native"}
-                    </span>
+                  <div className="row-meta">
+                    <span>{node.hotPath ? "Hot" : "Cold"}</span>
+                    <code>:{node.port}</code>
                   </div>
                 </div>
-              ))
-            )}
-          </div>
-        </article>
-
-        <article className="panel">
-          <header className="panel-head compact">
-            <div>
-              <p className="section-kicker">06</p>
-              <h2>告警</h2>
+              ))}
             </div>
-            <p className="panel-note">CF 压力与冷却等级</p>
-          </header>
+          </article>
 
-          <div className="stack">
-            {data.cfIncidents.length === 0 ? (
-              <Empty detail="当前没有 Cloudflare 压力事件。" title="平稳" />
-            ) : (
-              data.cfIncidents.map((incident) => (
-                <div className="row-card" key={incident.id}>
-                  <div className="row-copy">
-                    <strong>{incident.accountLabel}</strong>
-                    <p>{incident.accountId}</p>
+          <article className="glass-card" id="leases">
+            <header className="panel-head compact">
+              <div>
+                <p className="section-kicker">Sticky Lease</p>
+                <h2>租约</h2>
+              </div>
+              <p className="panel-note">principal 与 account 粘连</p>
+            </header>
+            <div className="stack">
+              {data.leases.length === 0 ? (
+                <Empty detail="当前没有活跃租约。" title="空闲" />
+              ) : (
+                data.leases.map((lease) => (
+                  <div className="row-card" key={lease.principalId}>
+                    <div className="row-copy">
+                      <strong>{lease.accountLabel}</strong>
+                      <p>{lease.principalId}</p>
+                    </div>
+                    <div className="badge-strip">
+                      <span className="badge">{modeLabel(lease.routeMode)}</span>
+                      <span className="badge">{lease.model}</span>
+                      <span className="badge">G{lease.generation}</span>
+                      <span className="badge">A{lease.activeSubagents}</span>
+                      <span className="badge">{formatTime(lease.lastUsedAt)}</span>
+                    </div>
                   </div>
-                  <div className="badge-strip">
-                    <span className="badge">{modeLabel(incident.routeMode)}</span>
-                    <span className="badge">{severityLabel(incident.severity)}</span>
-                    <span className="badge">L{incident.cooldownLevel}</span>
-                    <span className="badge">{formatTime(incident.happenedAt)}</span>
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-        </article>
+                ))
+              )}
+            </div>
+          </article>
 
-        <article className="panel full">
-          <header className="panel-head compact">
+          <article className="glass-card" id="alerts">
+            <header className="panel-head compact">
+              <div>
+                <p className="section-kicker">Incidents</p>
+                <h2>告警</h2>
+              </div>
+              <p className="panel-note">CF 压力与冷却等级</p>
+            </header>
+            <div className="stack">
+              {data.cfIncidents.length === 0 ? (
+                <Empty detail="当前没有 Cloudflare 压力事件。" title="平稳" />
+              ) : (
+                data.cfIncidents.map((incident) => (
+                  <div className="row-card" key={incident.id}>
+                    <div className="row-copy">
+                      <strong>{incident.accountLabel}</strong>
+                      <p>{incident.accountId}</p>
+                    </div>
+                    <div className="badge-strip">
+                      <span className="badge">{modeLabel(incident.routeMode)}</span>
+                      <span className="badge">{severityLabel(incident.severity)}</span>
+                      <span className="badge">L{incident.cooldownLevel}</span>
+                      <span className="badge">{formatTime(incident.happenedAt)}</span>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </article>
+        </section>
+
+        <section className="glass-card task-panel" id="tasks">
+          <header className="panel-head">
             <div>
-              <p className="section-kicker">07</p>
+              <p className="section-kicker">Browser Tasks</p>
               <h2>浏览器任务</h2>
             </div>
-            <p className="panel-note">登录、恢复、执行结果</p>
+            <p className="panel-note">
+              登录、恢复、执行结果统一落在这里，便于判断 browser-assist 是否真正挂接。
+            </p>
           </header>
 
-          <div className="stack">
-            {data.browserTasks.length === 0 ? (
-              <Empty detail="当前没有浏览器任务。" title="空队列" />
-            ) : (
-              data.browserTasks.map((task) => (
-                <div className="row-card" key={task.id}>
-                  <div className="row-copy">
-                    <strong>{taskKindLabel(task.kind)}</strong>
-                    <p>{task.accountLabel ?? task.accountId ?? "未绑定账号"}</p>
-                  </div>
-                  <div className="badge-strip">
-                    <span className="badge">{providerLabel(task.provider)}</span>
-                    <span className="badge">{modeLabel(task.routeMode)}</span>
-                    <span className="badge">{taskStatusLabel(task.status)}</span>
-                    <span className="badge">S{task.stepCount}</span>
-                    <span className="badge">{task.storageStatePath ? "State" : "No State"}</span>
-                    <span className="badge">{task.screenshotPath ? "Shot" : "No Shot"}</span>
-                    <span className="badge">{formatTime(task.updatedAt)}</span>
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-        </article>
-      </section>
+          {data.browserTasks.length === 0 ? (
+            <Empty detail="当前没有浏览器任务。" title="空队列" />
+          ) : (
+            <div className="table-wrap">
+              <table className="ledger-table task-table">
+                <thead>
+                  <tr>
+                    <th>任务</th>
+                    <th>账号</th>
+                    <th>Provider</th>
+                    <th>Route</th>
+                    <th>状态</th>
+                    <th>资产</th>
+                    <th>更新时间</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.browserTasks.map((task) => (
+                    <tr key={task.id}>
+                      <td>
+                        <div className="table-primary">
+                          <strong>{taskKindLabel(task.kind)}</strong>
+                          <span>{task.id}</span>
+                        </div>
+                      </td>
+                      <td>
+                        <div className="table-secondary">
+                          <strong>{task.accountLabel ?? "未绑定账号"}</strong>
+                          <span>{task.accountId ?? "--"}</span>
+                        </div>
+                      </td>
+                      <td>{providerLabel(task.provider)}</td>
+                      <td>{modeLabel(task.routeMode)}</td>
+                      <td>
+                        <span className="badge">{taskStatusLabel(task.status)}</span>
+                      </td>
+                      <td>
+                        <div className="table-secondary">
+                          <strong>{taskAssetLabel(task)}</strong>
+                          <span>S{task.stepCount}</span>
+                        </div>
+                      </td>
+                      <td>{formatTime(task.updatedAt)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      </div>
     </main>
   );
 }

@@ -8,6 +8,21 @@ import {
   submitBrowserTask
 } from "@/lib/dashboard";
 
+type ImportPayload = {
+  tenantId: string;
+  label: string;
+  models: string[];
+  baseUrl?: string;
+  bearerToken?: string;
+  chatgptAccountId?: string;
+  extraHeaders?: Array<[string, string]>;
+  quotaHeadroom?: number;
+  quotaHeadroom5h?: number;
+  quotaHeadroom7d?: number;
+  healthScore?: number;
+  egressStability?: number;
+};
+
 function readString(formData: FormData, key: string) {
   const value = formData.get(key);
   return typeof value === "string" ? value.trim() : "";
@@ -64,6 +79,193 @@ function parseExtraHeaders(raw: string) {
     });
 
   return pairs.length > 0 ? pairs : undefined;
+}
+
+function readNumberFromUnknown(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (!Number.isNaN(parsed)) {
+      return parsed;
+    }
+  }
+  return undefined;
+}
+
+function readStringFromRecord(
+  record: Record<string, unknown>,
+  keys: string[]
+) {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function normalizeModelsValue(value: unknown, fallback: string[]) {
+  if (Array.isArray(value)) {
+    const models = value
+      .map((item) => (typeof item === "string" ? item.trim() : ""))
+      .filter(Boolean);
+    return models.length > 0 ? models : fallback;
+  }
+
+  if (typeof value === "string" && value.trim()) {
+    return parseModels(value);
+  }
+
+  return fallback;
+}
+
+function normalizeExtraHeadersValue(value: unknown) {
+  if (!value) {
+    return undefined;
+  }
+
+  if (typeof value === "string") {
+    return parseExtraHeaders(value);
+  }
+
+  if (Array.isArray(value)) {
+    const pairs = value
+      .map((entry) => {
+        if (!Array.isArray(entry) || entry.length < 2) {
+          return null;
+        }
+        const [name, headerValue] = entry;
+        if (typeof name !== "string" || typeof headerValue !== "string") {
+          return null;
+        }
+        return [name.trim(), headerValue.trim()] as [string, string];
+      })
+      .filter((entry): entry is [string, string] => Boolean(entry));
+    return pairs.length > 0 ? pairs : undefined;
+  }
+
+  if (typeof value === "object") {
+    const pairs = Object.entries(value as Record<string, unknown>)
+      .map(([name, headerValue]) => {
+        if (typeof headerValue !== "string" || !headerValue.trim()) {
+          return null;
+        }
+        return [name.trim(), headerValue.trim()] as [string, string];
+      })
+      .filter((entry): entry is [string, string] => Boolean(entry));
+    return pairs.length > 0 ? pairs : undefined;
+  }
+
+  return undefined;
+}
+
+function normalizeBulkRecord(
+  entry: unknown,
+  index: number,
+  tenantId: string,
+  fallbackModels: string[],
+  fallbackBaseUrl?: string
+): ImportPayload {
+  if (typeof entry === "string") {
+    const bearerToken = entry.trim();
+    if (!bearerToken) {
+      throw new Error(`第 ${index + 1} 条为空。`);
+    }
+    return {
+      tenantId,
+      label: `OpenAI 导入 ${String(index + 1).padStart(2, "0")}`,
+      models: fallbackModels,
+      baseUrl: fallbackBaseUrl,
+      bearerToken
+    };
+  }
+
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    throw new Error(`第 ${index + 1} 条格式无法识别。`);
+  }
+
+  const record = entry as Record<string, unknown>;
+  const label =
+    readStringFromRecord(record, ["label", "name", "accountName", "account_name"]) ??
+    `OpenAI 导入 ${String(index + 1).padStart(2, "0")}`;
+  const bearerToken = readStringFromRecord(record, [
+    "bearerToken",
+    "bearer_token",
+    "accessToken",
+    "access_token",
+    "token",
+    "sessionToken",
+    "session_token"
+  ]);
+  const chatgptAccountId = readStringFromRecord(record, [
+    "chatgptAccountId",
+    "chatgpt_account_id",
+    "accountId",
+    "account_id"
+  ]);
+  const extraHeaders = normalizeExtraHeadersValue(
+    record.extraHeaders ?? record.extra_headers ?? record.headers
+  );
+
+  if (!bearerToken && !chatgptAccountId && !extraHeaders) {
+    throw new Error(`第 ${index + 1} 条缺少 bearer token 或可识别凭证。`);
+  }
+
+  return {
+    tenantId,
+    label,
+    models: normalizeModelsValue(record.models ?? record.model ?? record.modelIds, fallbackModels),
+    baseUrl:
+      readStringFromRecord(record, ["baseUrl", "base_url", "endpoint"]) ?? fallbackBaseUrl,
+    bearerToken,
+    chatgptAccountId,
+    extraHeaders,
+    quotaHeadroom: readNumberFromUnknown(record.quotaHeadroom ?? record.quota_headroom),
+    quotaHeadroom5h: readNumberFromUnknown(record.quotaHeadroom5h ?? record.quota_headroom_5h),
+    quotaHeadroom7d: readNumberFromUnknown(record.quotaHeadroom7d ?? record.quota_headroom_7d),
+    healthScore: readNumberFromUnknown(record.healthScore ?? record.health_score),
+    egressStability: readNumberFromUnknown(record.egressStability ?? record.egress_stability)
+  };
+}
+
+function parseBulkImportContent(
+  raw: string,
+  tenantId: string,
+  fallbackModels: string[],
+  fallbackBaseUrl?: string
+) {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    throw new Error("请先填写账号数据。");
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    const source = Array.isArray(parsed)
+      ? parsed
+      : parsed &&
+          typeof parsed === "object" &&
+          Array.isArray((parsed as { accounts?: unknown[] }).accounts)
+        ? (parsed as { accounts: unknown[] }).accounts
+        : [parsed];
+    return source.map((entry, index) =>
+      normalizeBulkRecord(entry, index, tenantId, fallbackModels, fallbackBaseUrl)
+    );
+  } catch {
+    const lines = trimmed
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (lines.length === 0) {
+      throw new Error("请先填写账号数据。");
+    }
+    return lines.map((line, index) =>
+      normalizeBulkRecord(line, index, tenantId, fallbackModels, fallbackBaseUrl)
+    );
+  }
 }
 
 function routeModeFromForm(formData: FormData) {
@@ -149,6 +351,32 @@ export async function importAccountAction(formData: FormData) {
   }
 
   finishSuccess("账号已导入。", "connect");
+}
+
+export async function bulkImportAccountsAction(formData: FormData) {
+  try {
+    const tenantId = readString(formData, "tenantId");
+    const models = parseModels(readString(formData, "models"));
+    const baseUrl = readOptionalString(formData, "baseUrl");
+    const records = parseBulkImportContent(
+      readString(formData, "bulkContent"),
+      tenantId,
+      models,
+      baseUrl
+    );
+
+    if (!tenantId) {
+      throw new Error("请先选择租户。");
+    }
+
+    for (const record of records) {
+      await importAccount(record);
+    }
+
+    finishSuccess(`已批量导入 ${records.length} 个账号。`, "connect");
+  } catch (error) {
+    finishError(error, "connect");
+  }
 }
 
 async function submitTaskAction(
