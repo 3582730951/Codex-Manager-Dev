@@ -1514,8 +1514,45 @@ code {
   margin-top: 16px;
 }
 
+.recover-detail summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--ink-soft);
+  font-family: var(--font-body);
+  font-size: 0.92rem;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.recover-detail summary::after {
+  content: "展开";
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 54px;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
 .recover-detail[open] {
   padding-bottom: 2px;
+}
+
+.recover-detail[open] summary::after {
+  content: "收起";
 }
 
 @media (max-width: 1320px) {
