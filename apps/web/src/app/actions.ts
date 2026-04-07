@@ -403,6 +403,7 @@ export async function bulkImportAccountsAction(formData: FormData) {
 }
 
 export async function startOpenAiLoginAction(formData: FormData) {
+  let authUrl = "";
   try {
     const tenantId = readString(formData, "tenantId");
     const redirectUri = readString(formData, "redirectUri");
@@ -422,11 +423,12 @@ export async function startOpenAiLoginAction(formData: FormData) {
       models: parseModels(readString(formData, "models")),
       baseUrl: readOptionalString(formData, "baseUrl")
     });
-
-    redirect(result.authUrl);
+    authUrl = result.authUrl;
   } catch (error) {
     finishError(error, "login");
   }
+
+  redirect(authUrl);
 }
 
 export async function parseOpenAiCallbackAction(formData: FormData) {
