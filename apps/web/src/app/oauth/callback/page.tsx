@@ -78,7 +78,7 @@ export default async function OAuthCallbackPage({
         <section className="glass-card callback-stage">
           <header className="panel-head">
             <div>
-              <p className="section-kicker">OAuth Callback</p>
+              <p className="section-kicker">授权回调</p>
               <h2>OpenAI 授权回调</h2>
             </div>
             <p className="panel-note">
@@ -95,15 +95,15 @@ export default async function OAuthCallbackPage({
             <article className="form-card">
               <div className="form-head">
                 <strong>当前回调</strong>
-                <span>自动解析优先</span>
+                <span>优先自动完成</span>
               </div>
               <div className="field-grid">
                 <label className="field span-2">
-                  <span>Redirect URI</span>
+                  <span>回调地址</span>
                   <input defaultValue={redirectUri} readOnly type="text" />
                 </label>
                 <label className="field span-2">
-                  <span>当前地址</span>
+                  <span>当前浏览器地址</span>
                   <textarea defaultValue={callbackUrl} readOnly rows={4} />
                 </label>
               </div>

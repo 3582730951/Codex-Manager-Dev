@@ -71,9 +71,9 @@ function modeLabel(mode: string | null | undefined) {
     return "Warp";
   }
   if (mode === "direct") {
-    return "Direct";
+    return "直连";
   }
-  return "Hybrid";
+  return "混合";
 }
 
 function healthLabel(ok: boolean) {
@@ -149,6 +149,10 @@ function topologyMark(name: string) {
   return labels[name] ?? "ND";
 }
 
+function thermalLabel(hotPath: boolean) {
+  return hotPath ? "热路径" : "冷路径";
+}
+
 function signalClass(value: number) {
   if (value >= 0.8) {
     return "strong";
@@ -191,15 +195,15 @@ function taskAssetLabel(task: {
   screenshotPath: string | null;
 }) {
   if (task.storageStatePath && task.screenshotPath) {
-    return "State + Shot";
+    return "状态 + 截图";
   }
   if (task.storageStatePath) {
-    return "State";
+    return "状态";
   }
   if (task.screenshotPath) {
-    return "Shot";
+    return "截图";
   }
-  return "None";
+  return "无";
 }
 
 function meterStyle(value: number) {
@@ -440,7 +444,7 @@ export default async function Page({
       accent: health.redisConnected
     },
     {
-      label: "Browser",
+      label: "浏览器",
       value: health.browserAssistUrl === "n/a" ? "未挂接" : "已挂接",
       accent: health.browserAssistUrl !== "n/a"
     }
@@ -451,25 +455,25 @@ export default async function Page({
       glyph: "overview" as const,
       label: "租户",
       value: number(data.counts.tenants),
-      note: "Tenant"
+      note: "租户池"
     },
     {
       glyph: "accounts" as const,
       label: "账号",
       value: number(data.counts.accounts),
-      note: "Accounts"
+      note: "活跃账号"
     },
     {
       glyph: "leases" as const,
       label: "租约",
       value: number(data.counts.activeLeases),
-      note: "Sticky"
+      note: "粘连路由"
     },
     {
       glyph: "tasks" as const,
       label: "任务",
       value: number(data.counts.browserTasks),
-      note: "Browser"
+      note: "浏览器队列"
     }
   ];
 
@@ -495,7 +499,7 @@ export default async function Page({
           </div>
           <div className="brand-copy">
             <strong>Codex Manager</strong>
-            <span>Admin Surface / 中文默认</span>
+            <span>控制台 / 中文默认</span>
           </div>
         </div>
 
@@ -515,7 +519,7 @@ export default async function Page({
 
         <section className="sidebar-panel">
           <header className="sidebar-head">
-            <p className="section-kicker">Status Matrix</p>
+            <p className="section-kicker">运行矩阵</p>
             <h2>运行态</h2>
           </header>
           <div className="sidebar-status">
@@ -533,12 +537,12 @@ export default async function Page({
 
         <section className="sidebar-panel slim">
           <header className="sidebar-head compact">
-            <p className="section-kicker">Route</p>
-            <h2>Warm Path</h2>
+            <p className="section-kicker">热路径</p>
+            <h2>命中概览</h2>
           </header>
           <div className="mini-metric-grid">
             <article className="mini-metric">
-              <span>Hit</span>
+              <span>命中</span>
               <strong>{percent(data.cacheMetrics.prefixHitRatio)}%</strong>
             </article>
             <article className="mini-metric">
@@ -577,128 +581,33 @@ export default async function Page({
           <Notice message={noticeMessage} tone={noticeTone} />
         ) : null}
 
-        <section className="hero-grid" id="overview">
-          <article className="glass-card hero-panel">
-            <header className="panel-head hero-head">
-              <div>
-                <p className="section-kicker">Overview</p>
-                <h2>控制台总览</h2>
-              </div>
-              <p className="panel-note">
-                用更少的文字暴露关键状态，重点保留缓存、租约、账号和浏览器登录链路。
-              </p>
-            </header>
-
-            <div className="hero-band">
-              <div className="hero-band-copy">
-                <strong>Responses-first / Sticky / Dual-Candidate</strong>
-                <p>
-                  入口、控制面、数据面、Browser Assist 分层展示；下方所有入口都保持中文默认。
-                </p>
-              </div>
-              <div className="hero-band-tags">
-                <span className="info-chip">CN</span>
-                <span className="info-chip">OpenAI</span>
-                <span className="info-chip">Docker</span>
-                <span className="info-chip">Warp-aware</span>
-              </div>
-            </div>
-
-            <div className="topology-rail">
-              {data.topology.map((node, index) => (
-                <div className="topology-node" key={node.name}>
-                  <div className="topology-badge">{topologyMark(node.name)}</div>
-                  <div className="topology-copy">
-                    <strong>{topologyLabel(node.name, node.purpose)}</strong>
-                    <small>{node.hotPath ? "Hot" : "Cold"}</small>
-                  </div>
-                  <code>:{node.port}</code>
-                  {index < data.topology.length - 1 ? (
-                    <div className="topology-line" aria-hidden="true" />
-                  ) : null}
-                </div>
-              ))}
-            </div>
-
-            <div className="hero-stats">
-              {summaryCards.map((item) => (
-                <article className="summary-card" key={item.label}>
-                  <span className="summary-glyph">
-                    <Glyph kind={item.glyph} className="glyph" />
-                  </span>
-                  <div>
-                    <strong>{item.value}</strong>
-                    <span>{item.label}</span>
-                  </div>
-                  <small>{item.note}</small>
-                </article>
-              ))}
-            </div>
-          </article>
-
-          <article className="glass-card cache-panel">
-            <header className="panel-head compact">
-              <div>
-                <p className="section-kicker">Cache</p>
-                <h2>缓存命中</h2>
-              </div>
-            </header>
-
-            <div className="signal-ring" style={ringStyle}>
-              <div className="signal-core">
-                <strong>{percent(data.cacheMetrics.prefixHitRatio)}%</strong>
-                <span>Prefix Hit</span>
-              </div>
-            </div>
-
-            <div className="metric-stack">
-              <article className="metric-block">
-                <span>Cached Tokens</span>
-                <strong>{number(data.cacheMetrics.cachedTokens)}</strong>
-              </article>
-              <article className="metric-block">
-                <span>Replay Tokens</span>
-                <strong>{number(data.cacheMetrics.replayTokens)}</strong>
-              </article>
-              <article className="metric-block">
-                <span>Static Prefix</span>
-                <strong>{number(data.cacheMetrics.staticPrefixTokens)}</strong>
-              </article>
-              <article className="metric-block">
-                <span>Warmup ROI</span>
-                <strong>{data.cacheMetrics.warmupRoi.toFixed(2)}x</strong>
-              </article>
-            </div>
-          </article>
-        </section>
-
         <section className="workspace-grid">
           <article className="glass-card intake-panel" id="connect">
             <header className="panel-head">
               <div>
-                <p className="section-kicker">Intake</p>
+                <p className="section-kicker">接入入口</p>
                 <h2>接入账号</h2>
               </div>
               <p className="panel-note">
-                OpenAI 授权现在是主入口，会直接打开官方登录页；租户和 Token 导入保留为辅助工具。
+                把主操作前置。进入页面后，先登录导入，再看账号、路由和缓存状态。
               </p>
             </header>
 
             <div className="flow-rail compact">
               <div className="flow-step">
                 <span>01</span>
-                <strong>Login</strong>
-                <small>登录导入</small>
+                <strong>授权</strong>
+                <small>弹窗登录</small>
               </div>
               <div className="flow-step">
                 <span>02</span>
-                <strong>Callback</strong>
-                <small>回调解析</small>
+                <strong>回填</strong>
+                <small>自动回调</small>
               </div>
               <div className="flow-step">
                 <span>03</span>
-                <strong>Import</strong>
-                <small>文件导入</small>
+                <strong>导入</strong>
+                <small>文件补录</small>
               </div>
             </div>
 
@@ -708,81 +617,81 @@ export default async function Page({
               tenantCount={tenants.length}
             />
 
-            <form className="form-card recover-card" action={browserRecoverAction}>
-              <div className="form-head">
-                <strong>
-                  <Glyph kind="tasks" className="glyph inline-glyph" />
-                  浏览器辅助恢复
-                </strong>
-                <span>保留 browser-assist 恢复入口，用于已有本地会话的恢复和截图校验。</span>
-              </div>
+            <details className="detail-panel recover-detail">
+              <summary>浏览器辅助恢复</summary>
+              <div className="detail-grid">
+                <p className="detail-lead">
+                  保留 browser-assist 恢复入口，用于已有本地会话的恢复和截图校验。
+                </p>
+                <form className="form-card recover-card" action={browserRecoverAction}>
+                  <div className="field-grid">
+                    <label className="field">
+                      <span>账号</span>
+                      <select
+                        defaultValue={data.accounts[0]?.id ?? ""}
+                        disabled={data.accounts.length === 0}
+                        name="accountId"
+                      >
+                        {data.accounts.length === 0 ? (
+                          <option value="">暂无账号</option>
+                        ) : (
+                          data.accounts.map((account) => (
+                            <option key={account.id} value={account.id}>
+                              {account.label} / {account.id}
+                            </option>
+                          ))
+                        )}
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span>路由</span>
+                      <select defaultValue="direct" name="routeMode">
+                        <option value="direct">直连</option>
+                        <option value="warp">Warp</option>
+                      </select>
+                    </label>
+                    <label className="field">
+                      <span>模式</span>
+                      <select defaultValue="true" name="headless">
+                        <option value="true">无头</option>
+                        <option value="false">带界面</option>
+                      </select>
+                    </label>
+                    <label className="field span-2">
+                      <span>登录地址</span>
+                      <input
+                        autoComplete="off"
+                        defaultValue="https://chatgpt.com/auth/login"
+                        name="loginUrl"
+                        type="text"
+                      />
+                    </label>
+                    <label className="field span-2">
+                      <span>备注</span>
+                      <textarea
+                        name="notes"
+                        placeholder="例如：恢复本地浏览器状态并截图验证"
+                        rows={3}
+                      />
+                    </label>
+                  </div>
 
-              <div className="field-grid">
-                <label className="field">
-                  <span>账号</span>
-                  <select
-                    defaultValue={data.accounts[0]?.id ?? ""}
-                    disabled={data.accounts.length === 0}
-                    name="accountId"
-                  >
-                    {data.accounts.length === 0 ? (
-                      <option value="">暂无账号</option>
-                    ) : (
-                      data.accounts.map((account) => (
-                        <option key={account.id} value={account.id}>
-                          {account.label} / {account.id}
-                        </option>
-                      ))
-                    )}
-                  </select>
-                </label>
-                <label className="field">
-                  <span>路由</span>
-                  <select defaultValue="direct" name="routeMode">
-                    <option value="direct">Direct</option>
-                    <option value="warp">Warp</option>
-                  </select>
-                </label>
-                <label className="field">
-                  <span>模式</span>
-                  <select defaultValue="true" name="headless">
-                    <option value="true">无头</option>
-                    <option value="false">带界面</option>
-                  </select>
-                </label>
-                <label className="field span-2">
-                  <span>登录地址</span>
-                  <input
-                    autoComplete="off"
-                    defaultValue="https://chatgpt.com/auth/login"
-                    name="loginUrl"
-                    type="text"
-                  />
-                </label>
-                <label className="field span-2">
-                  <span>备注</span>
-                  <textarea
-                    name="notes"
-                    placeholder="例如：恢复本地浏览器状态并截图验证"
-                    rows={3}
-                  />
-                </label>
+                  <div className="form-actions">
+                    <BrowserRecoverButton disabled={data.accounts.length === 0} />
+                  </div>
+                </form>
               </div>
-
-              <div className="form-actions">
-                <BrowserRecoverButton disabled={data.accounts.length === 0} />
-              </div>
-            </form>
+            </details>
           </article>
 
           <article className="glass-card ledger-panel" id="accounts-ledger">
             <header className="panel-head">
               <div>
-                <p className="section-kicker">Ledger</p>
+                <p className="section-kicker">账号工作台</p>
                 <h2>账号工作台</h2>
               </div>
               <p className="panel-note">
-                表格化展示账号池，比大块卡片更适合看路由、配额和凭证状态。
+                用表格直接看账号池、模型、路由、配额和凭证，比大卡片更适合控制台。
               </p>
             </header>
 
@@ -815,7 +724,7 @@ export default async function Page({
                           <div className="table-secondary">
                             <strong>{modelsLabel(account.models)}</strong>
                             <span>
-                              {account.nearQuotaGuardEnabled ? "Guard On" : "Guard Off"}
+                              {account.nearQuotaGuardEnabled ? "保护开启" : "保护关闭"}
                             </span>
                           </div>
                         </td>
@@ -824,7 +733,7 @@ export default async function Page({
                             <span className="badge">{modeLabel(account.routeMode)}</span>
                             <span className="badge">L{account.cooldownLevel}</span>
                             <span className="badge">
-                              {account.proxyEnabled ? "Proxy" : "Native"}
+                              {account.proxyEnabled ? "代理" : "原生"}
                             </span>
                           </div>
                         </td>
@@ -875,11 +784,104 @@ export default async function Page({
           </article>
         </section>
 
+        <section className="hero-grid" id="overview">
+          <article className="glass-card hero-panel">
+            <header className="panel-head hero-head">
+              <div>
+                <p className="section-kicker">总览</p>
+                <h2>控制台总览</h2>
+              </div>
+              <p className="panel-note">
+                这里收口运行态和缓存概览，把需要盯住的热路径、账号池和任务状态聚在一起。
+              </p>
+            </header>
+
+            <div className="hero-band">
+              <div className="hero-band-copy">
+                <strong>Responses-first / Sticky / Dual-Candidate</strong>
+                <p>入口、数据面、控制面和浏览器辅助分层展示，所有核心入口默认中文。</p>
+              </div>
+              <div className="hero-band-tags">
+                <span className="info-chip">CN</span>
+                <span className="info-chip">OpenAI</span>
+                <span className="info-chip">Docker</span>
+                <span className="info-chip">Warp-aware</span>
+              </div>
+            </div>
+
+            <div className="topology-rail">
+              {data.topology.map((node, index) => (
+                <div className="topology-node" key={node.name}>
+                  <div className="topology-badge">{topologyMark(node.name)}</div>
+                  <div className="topology-copy">
+                    <strong>{topologyLabel(node.name, node.purpose)}</strong>
+                    <small>{thermalLabel(node.hotPath)}</small>
+                  </div>
+                  <code>:{node.port}</code>
+                  {index < data.topology.length - 1 ? (
+                    <div className="topology-line" aria-hidden="true" />
+                  ) : null}
+                </div>
+              ))}
+            </div>
+
+            <div className="hero-stats">
+              {summaryCards.map((item) => (
+                <article className="summary-card" key={item.label}>
+                  <span className="summary-glyph">
+                    <Glyph kind={item.glyph} className="glyph" />
+                  </span>
+                  <div>
+                    <strong>{item.value}</strong>
+                    <span>{item.label}</span>
+                  </div>
+                  <small>{item.note}</small>
+                </article>
+              ))}
+            </div>
+          </article>
+
+          <article className="glass-card cache-panel">
+            <header className="panel-head compact">
+              <div>
+                <p className="section-kicker">缓存</p>
+                <h2>缓存命中</h2>
+              </div>
+            </header>
+
+            <div className="signal-ring" style={ringStyle}>
+              <div className="signal-core">
+                <strong>{percent(data.cacheMetrics.prefixHitRatio)}%</strong>
+                <span>前缀命中</span>
+              </div>
+            </div>
+
+            <div className="metric-stack">
+              <article className="metric-block">
+                <span>缓存令牌</span>
+                <strong>{number(data.cacheMetrics.cachedTokens)}</strong>
+              </article>
+              <article className="metric-block">
+                <span>重放令牌</span>
+                <strong>{number(data.cacheMetrics.replayTokens)}</strong>
+              </article>
+              <article className="metric-block">
+                <span>固定前缀</span>
+                <strong>{number(data.cacheMetrics.staticPrefixTokens)}</strong>
+              </article>
+              <article className="metric-block">
+                <span>预热收益</span>
+                <strong>{data.cacheMetrics.warmupRoi.toFixed(2)}x</strong>
+              </article>
+            </div>
+          </article>
+        </section>
+
         <section className="board-grid">
           <article className="glass-card" id="topology">
             <header className="panel-head compact">
               <div>
-                <p className="section-kicker">Topology</p>
+                <p className="section-kicker">拓扑</p>
                 <h2>拓扑</h2>
               </div>
               <p className="panel-note">热路径与冷路径分离</p>
@@ -893,7 +895,7 @@ export default async function Page({
                     <p>{node.name}</p>
                   </div>
                   <div className="row-meta">
-                    <span>{node.hotPath ? "Hot" : "Cold"}</span>
+                    <span>{thermalLabel(node.hotPath)}</span>
                     <code>:{node.port}</code>
                   </div>
                 </div>
@@ -904,7 +906,7 @@ export default async function Page({
           <article className="glass-card" id="leases">
             <header className="panel-head compact">
               <div>
-                <p className="section-kicker">Sticky Lease</p>
+                <p className="section-kicker">租约</p>
                 <h2>租约</h2>
               </div>
               <p className="panel-note">principal 与 account 粘连</p>
@@ -935,7 +937,7 @@ export default async function Page({
           <article className="glass-card" id="alerts">
             <header className="panel-head compact">
               <div>
-                <p className="section-kicker">Incidents</p>
+                <p className="section-kicker">告警</p>
                 <h2>告警</h2>
               </div>
               <p className="panel-note">CF 压力与冷却等级</p>
@@ -966,7 +968,7 @@ export default async function Page({
         <section className="glass-card task-panel" id="tasks">
           <header className="panel-head">
             <div>
-              <p className="section-kicker">Browser Tasks</p>
+              <p className="section-kicker">浏览器任务</p>
               <h2>浏览器任务</h2>
             </div>
             <p className="panel-note">
@@ -983,8 +985,8 @@ export default async function Page({
                   <tr>
                     <th>任务</th>
                     <th>账号</th>
-                    <th>Provider</th>
-                    <th>Route</th>
+                    <th>来源</th>
+                    <th>路由</th>
                     <th>状态</th>
                     <th>资产</th>
                     <th>更新时间</th>
