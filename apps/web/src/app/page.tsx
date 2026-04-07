@@ -478,13 +478,10 @@ export default async function Page({
   ];
 
   const navItems = [
-    { href: "#overview", label: "总览", glyph: "overview" as const },
+    { href: "#ops-overview", label: "概览", glyph: "overview" as const },
     { href: "#connect", label: "接入", glyph: "key" as const },
     { href: "#accounts-ledger", label: "账号", glyph: "accounts" as const },
-    { href: "#topology", label: "拓扑", glyph: "topology" as const },
-    { href: "#leases", label: "租约", glyph: "leases" as const },
-    { href: "#alerts", label: "告警", glyph: "alerts" as const },
-    { href: "#tasks", label: "任务", glyph: "tasks" as const }
+    { href: "#runtime-detail", label: "细节", glyph: "tasks" as const }
   ];
 
   return (
@@ -784,248 +781,282 @@ export default async function Page({
           </article>
         </section>
 
-        <section className="hero-grid" id="overview">
-          <article className="glass-card hero-panel">
-            <header className="panel-head hero-head">
-              <div>
-                <p className="section-kicker">总览</p>
-                <h2>控制台总览</h2>
-              </div>
-              <p className="panel-note">
-                这里收口运行态和缓存概览，把需要盯住的热路径、账号池和任务状态聚在一起。
-              </p>
-            </header>
-
-            <div className="hero-band">
-              <div className="hero-band-copy">
-                <strong>Responses-first / Sticky / Dual-Candidate</strong>
-                <p>入口、数据面、控制面和浏览器辅助分层展示，所有核心入口默认中文。</p>
-              </div>
-              <div className="hero-band-tags">
-                <span className="info-chip">CN</span>
-                <span className="info-chip">OpenAI</span>
-                <span className="info-chip">Docker</span>
-                <span className="info-chip">Warp-aware</span>
-              </div>
+        <details className="surface-detail" id="ops-overview">
+          <summary>
+            <div className="surface-detail-copy">
+              <p className="section-kicker">总览</p>
+              <strong>控制台概览</strong>
+              <span>缓存、拓扑和核心计数统一收在这里。</span>
             </div>
-
-            <div className="topology-rail">
-              {data.topology.map((node, index) => (
-                <div className="topology-node" key={node.name}>
-                  <div className="topology-badge">{topologyMark(node.name)}</div>
-                  <div className="topology-copy">
-                    <strong>{topologyLabel(node.name, node.purpose)}</strong>
-                    <small>{thermalLabel(node.hotPath)}</small>
-                  </div>
-                  <code>:{node.port}</code>
-                  {index < data.topology.length - 1 ? (
-                    <div className="topology-line" aria-hidden="true" />
-                  ) : null}
-                </div>
-              ))}
+            <div className="surface-detail-metrics">
+              <span>{percent(data.cacheMetrics.prefixHitRatio)}% 命中</span>
+              <span>{number(data.counts.accounts)} 账号</span>
+              <span>{number(data.counts.activeLeases)} 租约</span>
             </div>
+          </summary>
 
-            <div className="hero-stats">
-              {summaryCards.map((item) => (
-                <article className="summary-card" key={item.label}>
-                  <span className="summary-glyph">
-                    <Glyph kind={item.glyph} className="glyph" />
-                  </span>
+          <div className="surface-detail-body">
+            <section className="hero-grid">
+              <article className="glass-card hero-panel">
+                <header className="panel-head hero-head">
                   <div>
-                    <strong>{item.value}</strong>
-                    <span>{item.label}</span>
+                    <p className="section-kicker">总览</p>
+                    <h2>控制台总览</h2>
                   </div>
-                  <small>{item.note}</small>
-                </article>
-              ))}
-            </div>
-          </article>
+                  <p className="panel-note">
+                    这里收口运行态和缓存概览，把需要盯住的热路径、账号池和任务状态聚在一起。
+                  </p>
+                </header>
 
-          <article className="glass-card cache-panel">
-            <header className="panel-head compact">
-              <div>
-                <p className="section-kicker">缓存</p>
-                <h2>缓存命中</h2>
-              </div>
-            </header>
-
-            <div className="signal-ring" style={ringStyle}>
-              <div className="signal-core">
-                <strong>{percent(data.cacheMetrics.prefixHitRatio)}%</strong>
-                <span>前缀命中</span>
-              </div>
-            </div>
-
-            <div className="metric-stack">
-              <article className="metric-block">
-                <span>缓存令牌</span>
-                <strong>{number(data.cacheMetrics.cachedTokens)}</strong>
-              </article>
-              <article className="metric-block">
-                <span>重放令牌</span>
-                <strong>{number(data.cacheMetrics.replayTokens)}</strong>
-              </article>
-              <article className="metric-block">
-                <span>固定前缀</span>
-                <strong>{number(data.cacheMetrics.staticPrefixTokens)}</strong>
-              </article>
-              <article className="metric-block">
-                <span>预热收益</span>
-                <strong>{data.cacheMetrics.warmupRoi.toFixed(2)}x</strong>
-              </article>
-            </div>
-          </article>
-        </section>
-
-        <section className="board-grid">
-          <article className="glass-card" id="topology">
-            <header className="panel-head compact">
-              <div>
-                <p className="section-kicker">拓扑</p>
-                <h2>拓扑</h2>
-              </div>
-              <p className="panel-note">热路径与冷路径分离</p>
-            </header>
-            <div className="stack">
-              {data.topology.map((node) => (
-                <div className="row-card topology-card" key={node.name}>
-                  <div className="mark-block">{topologyMark(node.name)}</div>
-                  <div className="row-copy">
-                    <strong>{topologyLabel(node.name, node.purpose)}</strong>
-                    <p>{node.name}</p>
+                <div className="hero-band">
+                  <div className="hero-band-copy">
+                    <strong>Responses-first / Sticky / Dual-Candidate</strong>
+                    <p>入口、数据面、控制面和浏览器辅助分层展示，所有核心入口默认中文。</p>
                   </div>
-                  <div className="row-meta">
-                    <span>{thermalLabel(node.hotPath)}</span>
-                    <code>:{node.port}</code>
+                  <div className="hero-band-tags">
+                    <span className="info-chip">CN</span>
+                    <span className="info-chip">OpenAI</span>
+                    <span className="info-chip">Docker</span>
+                    <span className="info-chip">Warp-aware</span>
                   </div>
                 </div>
-              ))}
-            </div>
-          </article>
 
-          <article className="glass-card" id="leases">
-            <header className="panel-head compact">
-              <div>
-                <p className="section-kicker">租约</p>
-                <h2>租约</h2>
-              </div>
-              <p className="panel-note">principal 与 account 粘连</p>
-            </header>
-            <div className="stack">
-              {data.leases.length === 0 ? (
-                <Empty detail="当前没有活跃租约。" title="空闲" />
-              ) : (
-                data.leases.map((lease) => (
-                  <div className="row-card" key={lease.principalId}>
-                    <div className="row-copy">
-                      <strong>{lease.accountLabel}</strong>
-                      <p>{lease.principalId}</p>
+                <div className="topology-rail">
+                  {data.topology.map((node, index) => (
+                    <div className="topology-node" key={node.name}>
+                      <div className="topology-badge">{topologyMark(node.name)}</div>
+                      <div className="topology-copy">
+                        <strong>{topologyLabel(node.name, node.purpose)}</strong>
+                        <small>{thermalLabel(node.hotPath)}</small>
+                      </div>
+                      <code>:{node.port}</code>
+                      {index < data.topology.length - 1 ? (
+                        <div className="topology-line" aria-hidden="true" />
+                      ) : null}
                     </div>
-                    <div className="badge-strip">
-                      <span className="badge">{modeLabel(lease.routeMode)}</span>
-                      <span className="badge">{lease.model}</span>
-                      <span className="badge">G{lease.generation}</span>
-                      <span className="badge">A{lease.activeSubagents}</span>
-                      <span className="badge">{formatTime(lease.lastUsedAt)}</span>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-          </article>
-
-          <article className="glass-card" id="alerts">
-            <header className="panel-head compact">
-              <div>
-                <p className="section-kicker">告警</p>
-                <h2>告警</h2>
-              </div>
-              <p className="panel-note">CF 压力与冷却等级</p>
-            </header>
-            <div className="stack">
-              {data.cfIncidents.length === 0 ? (
-                <Empty detail="当前没有 Cloudflare 压力事件。" title="平稳" />
-              ) : (
-                data.cfIncidents.map((incident) => (
-                  <div className="row-card" key={incident.id}>
-                    <div className="row-copy">
-                      <strong>{incident.accountLabel}</strong>
-                      <p>{incident.accountId}</p>
-                    </div>
-                    <div className="badge-strip">
-                      <span className="badge">{modeLabel(incident.routeMode)}</span>
-                      <span className="badge">{severityLabel(incident.severity)}</span>
-                      <span className="badge">L{incident.cooldownLevel}</span>
-                      <span className="badge">{formatTime(incident.happenedAt)}</span>
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-          </article>
-        </section>
-
-        <section className="glass-card task-panel" id="tasks">
-          <header className="panel-head">
-            <div>
-              <p className="section-kicker">浏览器任务</p>
-              <h2>浏览器任务</h2>
-            </div>
-            <p className="panel-note">
-              登录、恢复、执行结果统一落在这里，便于判断 browser-assist 是否真正挂接。
-            </p>
-          </header>
-
-          {data.browserTasks.length === 0 ? (
-            <Empty detail="当前没有浏览器任务。" title="空队列" />
-          ) : (
-            <div className="table-wrap">
-              <table className="ledger-table task-table">
-                <thead>
-                  <tr>
-                    <th>任务</th>
-                    <th>账号</th>
-                    <th>来源</th>
-                    <th>路由</th>
-                    <th>状态</th>
-                    <th>资产</th>
-                    <th>更新时间</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {data.browserTasks.map((task) => (
-                    <tr key={task.id}>
-                      <td>
-                        <div className="table-primary">
-                          <strong>{taskKindLabel(task.kind)}</strong>
-                          <span>{task.id}</span>
-                        </div>
-                      </td>
-                      <td>
-                        <div className="table-secondary">
-                          <strong>{task.accountLabel ?? "未绑定账号"}</strong>
-                          <span>{task.accountId ?? "--"}</span>
-                        </div>
-                      </td>
-                      <td>{providerLabel(task.provider)}</td>
-                      <td>{modeLabel(task.routeMode)}</td>
-                      <td>
-                        <span className="badge">{taskStatusLabel(task.status)}</span>
-                      </td>
-                      <td>
-                        <div className="table-secondary">
-                          <strong>{taskAssetLabel(task)}</strong>
-                          <span>S{task.stepCount}</span>
-                        </div>
-                      </td>
-                      <td>{formatTime(task.updatedAt)}</td>
-                    </tr>
                   ))}
-                </tbody>
-              </table>
+                </div>
+
+                <div className="hero-stats">
+                  {summaryCards.map((item) => (
+                    <article className="summary-card" key={item.label}>
+                      <span className="summary-glyph">
+                        <Glyph kind={item.glyph} className="glyph" />
+                      </span>
+                      <div>
+                        <strong>{item.value}</strong>
+                        <span>{item.label}</span>
+                      </div>
+                      <small>{item.note}</small>
+                    </article>
+                  ))}
+                </div>
+              </article>
+
+              <article className="glass-card cache-panel">
+                <header className="panel-head compact">
+                  <div>
+                    <p className="section-kicker">缓存</p>
+                    <h2>缓存命中</h2>
+                  </div>
+                </header>
+
+                <div className="signal-ring" style={ringStyle}>
+                  <div className="signal-core">
+                    <strong>{percent(data.cacheMetrics.prefixHitRatio)}%</strong>
+                    <span>前缀命中</span>
+                  </div>
+                </div>
+
+                <div className="metric-stack">
+                  <article className="metric-block">
+                    <span>缓存令牌</span>
+                    <strong>{number(data.cacheMetrics.cachedTokens)}</strong>
+                  </article>
+                  <article className="metric-block">
+                    <span>重放令牌</span>
+                    <strong>{number(data.cacheMetrics.replayTokens)}</strong>
+                  </article>
+                  <article className="metric-block">
+                    <span>固定前缀</span>
+                    <strong>{number(data.cacheMetrics.staticPrefixTokens)}</strong>
+                  </article>
+                  <article className="metric-block">
+                    <span>预热收益</span>
+                    <strong>{data.cacheMetrics.warmupRoi.toFixed(2)}x</strong>
+                  </article>
+                </div>
+              </article>
+            </section>
+          </div>
+        </details>
+
+        <details className="surface-detail" id="runtime-detail">
+          <summary>
+            <div className="surface-detail-copy">
+              <p className="section-kicker">细节</p>
+              <strong>运行细节</strong>
+              <span>拓扑、租约、告警和浏览器任务按需展开查看。</span>
             </div>
-          )}
-        </section>
+            <div className="surface-detail-metrics">
+              <span>{number(data.topology.length)} 节点</span>
+              <span>{number(data.counts.browserTasks)} 任务</span>
+              <span>{number(data.cfIncidents.length)} 告警</span>
+            </div>
+          </summary>
+
+          <div className="surface-detail-body">
+            <section className="board-grid">
+              <article className="glass-card" id="topology">
+                <header className="panel-head compact">
+                  <div>
+                    <p className="section-kicker">拓扑</p>
+                    <h2>拓扑</h2>
+                  </div>
+                  <p className="panel-note">热路径与冷路径分离</p>
+                </header>
+                <div className="stack">
+                  {data.topology.map((node) => (
+                    <div className="row-card topology-card" key={node.name}>
+                      <div className="mark-block">{topologyMark(node.name)}</div>
+                      <div className="row-copy">
+                        <strong>{topologyLabel(node.name, node.purpose)}</strong>
+                        <p>{node.name}</p>
+                      </div>
+                      <div className="row-meta">
+                        <span>{thermalLabel(node.hotPath)}</span>
+                        <code>:{node.port}</code>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </article>
+
+              <article className="glass-card" id="leases">
+                <header className="panel-head compact">
+                  <div>
+                    <p className="section-kicker">租约</p>
+                    <h2>租约</h2>
+                  </div>
+                  <p className="panel-note">principal 与 account 粘连</p>
+                </header>
+                <div className="stack">
+                  {data.leases.length === 0 ? (
+                    <Empty detail="当前没有活跃租约。" title="空闲" />
+                  ) : (
+                    data.leases.map((lease) => (
+                      <div className="row-card" key={lease.principalId}>
+                        <div className="row-copy">
+                          <strong>{lease.accountLabel}</strong>
+                          <p>{lease.principalId}</p>
+                        </div>
+                        <div className="badge-strip">
+                          <span className="badge">{modeLabel(lease.routeMode)}</span>
+                          <span className="badge">{lease.model}</span>
+                          <span className="badge">G{lease.generation}</span>
+                          <span className="badge">A{lease.activeSubagents}</span>
+                          <span className="badge">{formatTime(lease.lastUsedAt)}</span>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </article>
+
+              <article className="glass-card" id="alerts">
+                <header className="panel-head compact">
+                  <div>
+                    <p className="section-kicker">告警</p>
+                    <h2>告警</h2>
+                  </div>
+                  <p className="panel-note">CF 压力与冷却等级</p>
+                </header>
+                <div className="stack">
+                  {data.cfIncidents.length === 0 ? (
+                    <Empty detail="当前没有 Cloudflare 压力事件。" title="平稳" />
+                  ) : (
+                    data.cfIncidents.map((incident) => (
+                      <div className="row-card" key={incident.id}>
+                        <div className="row-copy">
+                          <strong>{incident.accountLabel}</strong>
+                          <p>{incident.accountId}</p>
+                        </div>
+                        <div className="badge-strip">
+                          <span className="badge">{modeLabel(incident.routeMode)}</span>
+                          <span className="badge">{severityLabel(incident.severity)}</span>
+                          <span className="badge">L{incident.cooldownLevel}</span>
+                          <span className="badge">{formatTime(incident.happenedAt)}</span>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </article>
+            </section>
+
+            <section className="glass-card task-panel" id="tasks">
+              <header className="panel-head">
+                <div>
+                  <p className="section-kicker">浏览器任务</p>
+                  <h2>浏览器任务</h2>
+                </div>
+                <p className="panel-note">
+                  登录、恢复、执行结果统一落在这里，便于判断 browser-assist 是否真正挂接。
+                </p>
+              </header>
+
+              {data.browserTasks.length === 0 ? (
+                <Empty detail="当前没有浏览器任务。" title="空队列" />
+              ) : (
+                <div className="table-wrap">
+                  <table className="ledger-table task-table">
+                    <thead>
+                      <tr>
+                        <th>任务</th>
+                        <th>账号</th>
+                        <th>来源</th>
+                        <th>路由</th>
+                        <th>状态</th>
+                        <th>资产</th>
+                        <th>更新时间</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.browserTasks.map((task) => (
+                        <tr key={task.id}>
+                          <td>
+                            <div className="table-primary">
+                              <strong>{taskKindLabel(task.kind)}</strong>
+                              <span>{task.id}</span>
+                            </div>
+                          </td>
+                          <td>
+                            <div className="table-secondary">
+                              <strong>{task.accountLabel ?? "未绑定账号"}</strong>
+                              <span>{task.accountId ?? "--"}</span>
+                            </div>
+                          </td>
+                          <td>{providerLabel(task.provider)}</td>
+                          <td>{modeLabel(task.routeMode)}</td>
+                          <td>
+                            <span className="badge">{taskStatusLabel(task.status)}</span>
+                          </td>
+                          <td>
+                            <div className="table-secondary">
+                              <strong>{taskAssetLabel(task)}</strong>
+                              <span>S{task.stepCount}</span>
+                            </div>
+                          </td>
+                          <td>{formatTime(task.updatedAt)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </section>
+          </div>
+        </details>
       </div>
     </main>
   );

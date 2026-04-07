@@ -116,9 +116,10 @@ export function AddAccountLauncher({
   const [callbackValue, setCallbackValue] = useState("");
   const [loginUrl, setLoginUrl] = useState("");
   const [loginId, setLoginId] = useState("");
+  const [copyReady, setCopyReady] = useState(false);
   const [statusTone, setStatusTone] = useState<"neutral" | "ok" | "error">("neutral");
   const [statusMessage, setStatusMessage] = useState(
-    "点击主按钮后，会直接打开 OpenAI 官方登录窗口。"
+    "点击主按钮后，会直接生成 OpenAI 官方登录链接。"
   );
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const popupRef = useRef<Window | null>(null);
@@ -137,10 +138,10 @@ export function AddAccountLauncher({
       return {
         kicker: "主入口",
         title: "弹窗授权，一次完成",
-        body: "这里是默认入口。点击后会直接打开 OpenAI 官方授权页，登录成功后自动回写主页面。",
+        body: "这里是默认入口。点击后会生成 OpenAI 官方授权页，你可以直接打开，也可以复制到自己常用浏览器里登录。",
         steps: [
-          "点击“登录 OpenAI”，浏览器会打开官方授权页。",
-          "在新窗口完成登录或授权，保持当前页面不关闭。",
+          "点击“登录 OpenAI”后，系统先生成一条专属授权链接。",
+          "你可以直接打开，也可以复制这条 auth.openai.com 链接到常用浏览器。",
           "回调页会自动把结果通知主页面，账号直接入池。"
         ]
       };
@@ -280,9 +281,10 @@ export function AddAccountLauncher({
     setNote("");
     setCallbackValue("");
     setLoginUrl("");
+    setCopyReady(false);
     setSelectedFiles([]);
     setStatusTone("neutral");
-    setStatusMessage("点击主按钮后，会直接打开 OpenAI 官方登录窗口。");
+    setStatusMessage("点击主按钮后，会直接生成 OpenAI 官方登录链接。");
   }
 
   function finishSuccess(message: string) {
@@ -299,50 +301,83 @@ export function AddAccountLauncher({
     }, 900);
   }
 
-  async function handleStartLogin() {
+  async function createLoginSession(options?: {
+    openTab?: boolean;
+    manualOnly?: boolean;
+  }) {
     setStatusTone("neutral");
     setStatusMessage(
       tenantCount === 0
-        ? "正在生成授权窗口，默认租户会在首次成功后自动创建。"
-        : "正在生成 OpenAI 授权窗口..."
+        ? "正在生成授权链接，默认租户会在首次成功后自动创建。"
+        : "正在生成 OpenAI 授权链接..."
     );
 
+    const response = await fetch("/api/account-intake/login/start", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        label,
+        note,
+        redirectUri: callbackUrl
+      })
+    });
+    const result = await readJson<LoginStartResult>(
+      response,
+      "OpenAI 授权地址生成失败。"
+    );
+    setLoginId(result.loginId);
+    setLoginUrl(result.authUrl);
+    setCopyReady(true);
+
+    if (options?.openTab === false) {
+      setStatusMessage("授权链接已生成。你可以直接复制到常用浏览器打开。");
+      return result.authUrl;
+    }
+
+    const popup = window.open(result.authUrl, "_blank");
+    if (!popup) {
+      setStatusTone("error");
+      setStatusMessage("浏览器拦截了新标签页。请改用“复制登录链接”。");
+      return result.authUrl;
+    }
+
+    popupRef.current = popup;
+    popup.focus();
+    setStatusMessage(
+      options?.manualOnly
+        ? "授权链接已打开；如果验证页有问题，也可以直接复制下面的链接。"
+        : "授权页已打开；如果验证页有问题，也可以直接复制下面的链接。"
+    );
+    return result.authUrl;
+  }
+
+  async function handleStartLogin() {
     try {
-      const response = await fetch("/api/account-intake/login/start", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json"
-        },
-        body: JSON.stringify({
-          label,
-          note,
-          redirectUri: callbackUrl
-        })
-      });
-      const result = await readJson<LoginStartResult>(
-        response,
-        "OpenAI 授权地址生成失败。"
-      );
-      setLoginId(result.loginId);
-      setLoginUrl(result.authUrl);
-      setStatusMessage("授权窗口已打开，完成登录后会自动导入账号。");
-
-      const popup = window.open(
-        result.authUrl,
-        "codex-manager-openai-login",
-        "popup=yes,width=560,height=760,resizable=yes,scrollbars=yes"
-      );
-      if (!popup) {
-        setStatusTone("error");
-        setStatusMessage("浏览器拦截了弹窗。请使用下方“打开当前授权页”继续。");
-        return;
-      }
-
-      popupRef.current = popup;
-      popup.focus();
+      await createLoginSession();
     } catch (error) {
       setStatusTone("error");
       setStatusMessage(error instanceof Error ? error.message : "OpenAI 授权启动失败。");
+    }
+  }
+
+  async function handleCopyLoginUrl() {
+    try {
+      const authUrl =
+        loginUrl.trim() || (await createLoginSession({ openTab: false, manualOnly: true }));
+      if (!authUrl) {
+        throw new Error("授权链接生成失败。");
+      }
+      await navigator.clipboard.writeText(authUrl);
+      setCopyReady(true);
+      setStatusTone("ok");
+      setStatusMessage("授权链接已复制。请粘贴到你自己的浏览器地址栏打开。");
+    } catch (error) {
+      setStatusTone("error");
+      setStatusMessage(
+        error instanceof Error ? error.message : "授权链接复制失败，请手动复制。"
+      );
     }
   }
 
@@ -424,7 +459,7 @@ export function AddAccountLauncher({
         <article className="launcher-card launcher-card-primary">
           <span className="launcher-mark">01</span>
           <strong>一键登录接入</strong>
-          <p>主入口直接打开 OpenAI 官方登录页，成功后自动写入账号工作台。</p>
+          <p>主入口先生成专属授权链接。你可以直接打开，也可以复制到自己的浏览器。</p>
           <button
             className="button primary"
             onClick={() => {
@@ -490,7 +525,7 @@ export function AddAccountLauncher({
                 <p className="section-kicker">账号接入</p>
                 <h3>一键接入 OpenAI 账号</h3>
                 <p className="modal-intro">
-                  默认走官方授权页。成功后会回到当前站点的回调页，再自动把账号写入控制面。
+                  默认先生成官方授权链接。成功后会回到当前站点的回调页，再自动把账号写入控制面。
                 </p>
               </div>
               <div className="modal-head-actions">
@@ -616,7 +651,7 @@ export function AddAccountLauncher({
                     </div>
 
                     <div className="callout-card modal-callout">
-                      打开的是 OpenAI 官方授权页。成功后会自动返回当前回调页，并把结果通知主页面。
+                      如果弹出的验证页不好用，直接复制下面的 `auth.openai.com` 链接到你自己的浏览器地址栏打开。
                     </div>
 
                     <div className="modal-actions">
@@ -628,6 +663,14 @@ export function AddAccountLauncher({
                       >
                         <span>{loginId ? "重新打开授权页" : "登录 OpenAI"}</span>
                       </button>
+                      <button
+                        className="button ghost"
+                        disabled={isPending}
+                        onClick={handleCopyLoginUrl}
+                        type="button"
+                      >
+                        <span>{copyReady ? "复制登录链接" : "生成并复制链接"}</span>
+                      </button>
                       <a
                         className="button ghost"
                         href={loginUrl || callbackUrl}
@@ -637,6 +680,15 @@ export function AddAccountLauncher({
                         <span>{loginUrl ? "打开当前授权页" : "打开回调页"}</span>
                       </a>
                     </div>
+
+                    {loginUrl ? (
+                      <div className="auth-link-panel">
+                        <label className="modal-field">
+                          <span>可复制的 OpenAI 登录链接</span>
+                          <textarea readOnly rows={5} value={loginUrl} />
+                        </label>
+                      </div>
+                    ) : null}
                   </div>
                 ) : null}
 
