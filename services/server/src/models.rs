@@ -344,7 +344,7 @@ pub struct BrowserTaskRequest {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenAiLoginStartRequest {
-    pub tenant_id: Uuid,
+    pub tenant_id: Option<Uuid>,
     pub label: Option<String>,
     pub note: Option<String>,
     pub redirect_uri: String,

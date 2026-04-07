@@ -408,15 +408,12 @@ export async function startOpenAiLoginAction(formData: FormData) {
     const tenantId = readString(formData, "tenantId");
     const redirectUri = readString(formData, "redirectUri");
 
-    if (!tenantId) {
-      throw new Error("请先选择租户。");
-    }
     if (!redirectUri) {
       throw new Error("缺少回调地址。");
     }
 
     const result = await startOpenAiLogin({
-      tenantId,
+      tenantId: tenantId || undefined,
       label: readOptionalString(formData, "label"),
       note: readOptionalString(formData, "notes"),
       redirectUri,

@@ -652,6 +652,59 @@ impl AppState {
         tenant
     }
 
+    async fn ensure_default_tenant(&self) -> Uuid {
+        if let Some(existing_id) = self
+            .runtime
+            .tenants
+            .read()
+            .await
+            .values()
+            .min_by_key(|tenant| tenant.created_at)
+            .map(|tenant| tenant.id)
+        {
+            return existing_id;
+        }
+
+        let (tenant, inserted) = {
+            let mut tenants = self.runtime.tenants.write().await;
+            if let Some(existing) = tenants
+                .values()
+                .min_by_key(|tenant| tenant.created_at)
+                .cloned()
+            {
+                (existing, false)
+            } else {
+                let tenant = Tenant {
+                    id: Uuid::new_v4(),
+                    slug: "default".to_string(),
+                    name: "默认租户".to_string(),
+                    created_at: Utc::now(),
+                };
+                tenants.insert(tenant.id, tenant.clone());
+                (tenant, true)
+            }
+        };
+
+        if inserted {
+            self.enqueue(PersistenceMessage::TenantUpsert(tenant.clone()))
+                .await;
+        }
+
+        tenant.id
+    }
+
+    async fn resolve_openai_login_tenant(&self, requested: Option<Uuid>) -> Result<Uuid, String> {
+        if let Some(tenant_id) = requested {
+            let exists = self.runtime.tenants.read().await.contains_key(&tenant_id);
+            if !exists {
+                return Err("指定租户不存在。".to_string());
+            }
+            return Ok(tenant_id);
+        }
+
+        Ok(self.ensure_default_tenant().await)
+    }
+
     pub async fn create_api_key(
         &self,
         request: CreateGatewayApiKeyRequest,
@@ -693,17 +746,16 @@ impl AppState {
         &self,
         request: OpenAiLoginStartRequest,
     ) -> Result<OpenAiLoginStartResponse, String> {
-        let tenant_exists = self
-            .runtime
-            .tenants
-            .read()
-            .await
-            .contains_key(&request.tenant_id);
-        if !tenant_exists {
-            return Err("Tenant not found.".to_string());
-        }
-
-        let redirect_uri = reqwest::Url::parse(&request.redirect_uri)
+        let OpenAiLoginStartRequest {
+            tenant_id,
+            label,
+            note,
+            redirect_uri,
+            models,
+            base_url,
+        } = request;
+        let tenant_id = self.resolve_openai_login_tenant(tenant_id).await?;
+        let redirect_uri = reqwest::Url::parse(&redirect_uri)
             .map_err(|error| format!("redirectUri 无效: {error}"))?
             .to_string();
         let pkce = openai_auth::generate_pkce();
@@ -713,9 +765,9 @@ impl AppState {
         let now = Utc::now();
         let session = OpenAiLoginSessionState {
             login_id: login_id.clone(),
-            tenant_id: request.tenant_id,
-            label: request.label.filter(|value| !value.trim().is_empty()),
-            note: request.note.filter(|value| !value.trim().is_empty()),
+            tenant_id,
+            label: label.filter(|value| !value.trim().is_empty()),
+            note: note.filter(|value| !value.trim().is_empty()),
             redirect_uri: redirect_uri.clone(),
             auth_url: auth_url.clone(),
             code_verifier: pkce.code_verifier,
@@ -723,9 +775,8 @@ impl AppState {
             error: None,
             imported_account_id: None,
             imported_account_label: None,
-            models: request.models.unwrap_or_else(default_oauth_models),
-            base_url: request
-                .base_url
+            models: models.unwrap_or_else(default_oauth_models),
+            base_url: base_url
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(default_oauth_base_url),
             created_at: now,

@@ -185,7 +185,7 @@ export async function submitBrowserTask(
 }
 
 export async function startOpenAiLogin(payload: {
-  tenantId: string;
+  tenantId?: string;
   label?: string;
   note?: string;
   redirectUri: string;
