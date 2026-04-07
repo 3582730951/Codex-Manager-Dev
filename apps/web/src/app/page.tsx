@@ -1,18 +1,10 @@
 import type { CSSProperties, ReactNode } from "react";
 import { headers } from "next/headers";
 import {
-  browserRecoverAction,
-  bulkImportAccountsAction,
-  createTenantAction,
-  importAccountAction,
-  parseOpenAiCallbackAction
+  browserRecoverAction
 } from "@/app/actions";
+import { AddAccountLauncher } from "@/components/account/AddAccountLauncher";
 import { BrowserRecoverButton } from "@/components/buttons/BrowserRecoverButton";
-import { BulkImportButton } from "@/components/buttons/BulkImportButton";
-import { CreateTenantButton } from "@/components/buttons/CreateTenantButton";
-import { ImportAccountButton } from "@/components/buttons/ImportAccountButton";
-import { OpenAiAuthorizeButton } from "@/components/buttons/OpenAiAuthorizeButton";
-import { ParseCallbackButton } from "@/components/buttons/ParseCallbackButton";
 import {
   getAdminHealth,
   getDashboardSnapshot,
@@ -412,10 +404,6 @@ export default async function Page({
       ? `${forwardedProto ?? "http"}://${forwardedHost}`
       : "http://127.0.0.1:3000";
   const oauthCallbackUrl = `${webOrigin}/oauth/callback`;
-  const defaultModelText = "gpt-5.4, gpt-5.3-codex, gpt-5.2";
-  const defaultBaseUrl = "https://chatgpt.com/backend-api/codex";
-  const hasTenants = tenants.length > 0;
-  const primaryTenantId = tenants[0]?.id ?? "";
 
   const surfaceTitle =
     data.title === "Codex Manager 2.0" ? "Codex 管理台" : data.title;
@@ -696,459 +684,95 @@ export default async function Page({
               </p>
             </header>
 
-            <div className="flow-rail">
+            <div className="flow-rail compact">
               <div className="flow-step">
                 <span>01</span>
-                <strong>Tenant</strong>
-                <small>建立租户</small>
+                <strong>Login</strong>
+                <small>登录导入</small>
               </div>
               <div className="flow-step">
                 <span>02</span>
-                <strong>Token</strong>
-                <small>导入网关凭证</small>
+                <strong>Callback</strong>
+                <small>回调解析</small>
               </div>
               <div className="flow-step">
                 <span>03</span>
-                <strong>Bulk</strong>
-                <small>批量归档</small>
-              </div>
-              <div className="flow-step">
-                <span>04</span>
-                <strong>Browser</strong>
-                <small>登录与恢复</small>
+                <strong>Import</strong>
+                <small>文件导入</small>
               </div>
             </div>
 
-            <div className="form-stack">
-              <form action={createTenantAction} className="form-card slim">
-                <div className="form-head">
-                  <strong>
-                    <Glyph kind="tenant" className="glyph inline-glyph" />
-                    创建租户
-                  </strong>
-                  <span>可选，仅在需要多租户隔离时手动建立</span>
-                </div>
-                <div className="field-grid compact">
-                  <label className="field">
-                    <span>标识</span>
-                    <input
-                      autoComplete="off"
-                      name="slug"
-                      placeholder="demo-team"
-                      type="text"
-                    />
-                  </label>
-                  <label className="field">
-                    <span>名称</span>
-                    <input
-                      autoComplete="off"
-                      name="name"
-                      placeholder="演示租户"
-                      type="text"
-                    />
-                  </label>
-                </div>
-                <div className="form-actions">
-                  <CreateTenantButton />
-                </div>
-              </form>
+            <AddAccountLauncher
+              accountCount={data.accounts.length}
+              callbackUrl={oauthCallbackUrl}
+              tenantCount={tenants.length}
+            />
 
-              <form action={importAccountAction} className="form-card">
-                <div className="form-head">
-                  <strong>
-                    <Glyph kind="key" className="glyph inline-glyph" />
-                    Token 导入
-                  </strong>
-                  <span>这里负责网关真实转发所需的账号与凭证</span>
-                </div>
+            <form className="form-card recover-card" action={browserRecoverAction}>
+              <div className="form-head">
+                <strong>
+                  <Glyph kind="tasks" className="glyph inline-glyph" />
+                  浏览器辅助恢复
+                </strong>
+                <span>保留 browser-assist 恢复入口，用于已有本地会话的恢复和截图校验。</span>
+              </div>
 
-                {!hasTenants ? (
-                  <div className="inline-note">
-                    <strong>当前没有租户</strong>
-                    <span>先用 OpenAI 授权自动创建默认租户，或手动创建后再导入。</span>
-                  </div>
-                ) : null}
-
-                <div className="field-grid">
-                  <label className="field">
-                    <span>租户</span>
-                    <select
-                      defaultValue={primaryTenantId}
-                      disabled={!hasTenants}
-                      name="tenantId"
-                    >
-                      {!hasTenants ? (
-                        <option value="">暂无租户</option>
-                      ) : (
-                        tenants.map((tenant) => (
-                          <option key={tenant.id} value={tenant.id}>
-                            {tenant.name} / {tenant.slug}
-                          </option>
-                        ))
-                      )}
-                    </select>
-                  </label>
-                  <label className="field">
-                    <span>账号名</span>
-                    <input
-                      autoComplete="off"
-                      name="label"
-                      placeholder="OpenAI 主账号"
-                      type="text"
-                    />
-                  </label>
-                  <label className="field span-2">
-                    <span>模型</span>
-                    <input
-                      autoComplete="off"
-                      defaultValue="gpt-5.4, gpt-5.3-codex, gpt-5.2"
-                      name="models"
-                      type="text"
-                    />
-                  </label>
-                  <label className="field span-2">
-                    <span>Base URL</span>
-                    <input
-                      autoComplete="off"
-                      defaultValue="https://chatgpt.com/backend-api/codex"
-                      name="baseUrl"
-                      type="text"
-                    />
-                  </label>
-                  <label className="field span-2">
-                    <span>Bearer Token</span>
-                    <input
-                      autoComplete="off"
-                      name="bearerToken"
-                      placeholder="sk-... / session token"
-                      type="password"
-                    />
-                  </label>
-                  <label className="field">
-                    <span>Account ID</span>
-                    <input
-                      autoComplete="off"
-                      name="chatgptAccountId"
-                      placeholder="acct_..."
-                      type="text"
-                    />
-                  </label>
-                  <label className="field">
-                    <span>Health</span>
-                    <input
-                      inputMode="decimal"
-                      name="healthScore"
-                      placeholder="0.90"
-                      type="text"
-                    />
-                  </label>
-                  <label className="field">
-                    <span>Quota</span>
-                    <input
-                      inputMode="decimal"
-                      name="quotaHeadroom"
-                      placeholder="0.95"
-                      type="text"
-                    />
-                  </label>
-                  <label className="field">
-                    <span>Egress</span>
-                    <input
-                      inputMode="decimal"
-                      name="egressStability"
-                      placeholder="0.88"
-                      type="text"
-                    />
-                  </label>
-                  <label className="field span-2">
-                    <span>额外请求头</span>
-                    <textarea
-                      name="extraHeaders"
-                      placeholder={"Header-Name: value\nAnother-Header: value"}
-                      rows={3}
-                    />
-                  </label>
-                </div>
-
-                <div className="form-actions">
-                  <ImportAccountButton disabled={!hasTenants} />
-                </div>
-              </form>
-
-              <form action={bulkImportAccountsAction} className="form-card">
-                <div className="form-head">
-                  <strong>
-                    <Glyph kind="accounts" className="glyph inline-glyph" />
-                    批量导入
-                  </strong>
-                  <span>支持 JSON / JSON 数组 / 每行一个 token</span>
-                </div>
-
-                {!hasTenants ? (
-                  <div className="inline-note">
-                    <strong>当前没有租户</strong>
-                    <span>先用 OpenAI 授权自动创建默认租户，或手动创建后再批量导入。</span>
-                  </div>
-                ) : null}
-
-                <div className="field-grid">
-                  <label className="field">
-                    <span>租户</span>
-                    <select
-                      defaultValue={primaryTenantId}
-                      disabled={!hasTenants}
-                      name="tenantId"
-                    >
-                      {!hasTenants ? (
-                        <option value="">暂无租户</option>
-                      ) : (
-                        tenants.map((tenant) => (
-                          <option key={tenant.id} value={tenant.id}>
-                            {tenant.name} / {tenant.slug}
-                          </option>
-                        ))
-                      )}
-                    </select>
-                  </label>
-                  <label className="field span-2">
-                    <span>默认模型</span>
-                    <input
-                      autoComplete="off"
-                      defaultValue="gpt-5.4, gpt-5.3-codex, gpt-5.2"
-                      name="models"
-                      type="text"
-                    />
-                  </label>
-                  <label className="field span-2">
-                    <span>默认 Base URL</span>
-                    <input
-                      autoComplete="off"
-                      defaultValue="https://chatgpt.com/backend-api/codex"
-                      name="baseUrl"
-                      type="text"
-                    />
-                  </label>
-                  <label className="field span-2">
-                    <span>账号数据</span>
-                    <textarea
-                      name="bulkContent"
-                      placeholder={
-                        '支持 `{"label":"主号","bearerToken":"..."}`、JSON 数组，或每行一个 bearer token'
-                      }
-                      rows={7}
-                    />
-                  </label>
-                </div>
-
-                <div className="form-actions">
-                  <BulkImportButton disabled={!hasTenants} />
-                </div>
-              </form>
-
-              <form
-                action="/oauth/start"
-                className="form-card auth-card"
-                id="login"
-                method="GET"
-                target="_blank"
-              >
-                <div className="form-head">
-                  <strong>
-                    <Glyph kind="login" className="glyph inline-glyph" />
-                    OpenAI 授权接入
-                  </strong>
-                  <span>点击后会在新标签页打开 OpenAI 官方授权页。</span>
-                </div>
-
-                <p className="auth-summary">
-                  会先生成 PKCE 登录会话，再跳到 OpenAI。登录成功后会回到当前站点的回调页自动解析；如果没有自动解析，也可以把最终地址粘贴到下方手动导入。
-                </p>
-
-                <div className="badge-strip auth-badges">
-                  <span className="badge">PKCE</span>
-                  <span className="badge">新窗口</span>
-                  <span className="badge">自动回调</span>
-                  <span className="badge">手动兜底</span>
-                </div>
-
-                <div className="field-grid compact">
-                  <label className="field">
-                    <span>导入账号名</span>
-                    <input
-                      autoComplete="off"
-                      name="label"
-                      placeholder="OpenAI 授权账号"
-                      type="text"
-                    />
-                  </label>
-                  <label className="field">
-                    <span>备注</span>
-                    <input
-                      autoComplete="off"
-                      name="notes"
-                      placeholder="例如：主账号授权、团队工作区"
-                      type="text"
-                    />
-                  </label>
-                </div>
-
-                <details className="detail-panel">
-                  <summary>高级选项</summary>
-                  <div className="detail-grid">
-                    {hasTenants ? (
-                      <label className="field">
-                        <span>归属租户</span>
-                        <select defaultValue="" name="tenantId">
-                          <option value="">自动选择当前租户</option>
-                          {tenants.map((tenant) => (
-                            <option key={tenant.id} value={tenant.id}>
-                              {tenant.name} / {tenant.slug}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                    ) : (
-                      <div className="inline-note span-2">
-                        <strong>未检测到租户</strong>
-                        <span>首次授权会自动创建“默认租户”，不需要先手动创建。</span>
-                      </div>
-                    )}
-                    <label className="field span-2">
-                      <span>回调地址</span>
-                      <input
-                        autoComplete="off"
-                        defaultValue={oauthCallbackUrl}
-                        name="redirectUri"
-                        type="text"
-                      />
-                    </label>
-                    <label className="field span-2">
-                      <span>默认模型</span>
-                      <input
-                        autoComplete="off"
-                        defaultValue={defaultModelText}
-                        name="models"
-                        type="text"
-                      />
-                    </label>
-                    <label className="field span-2">
-                      <span>导入 Base URL</span>
-                      <input
-                        autoComplete="off"
-                        defaultValue={defaultBaseUrl}
-                        name="baseUrl"
-                        type="text"
-                      />
-                    </label>
-                  </div>
-                </details>
-
-                <div className="form-actions dual">
-                  <OpenAiAuthorizeButton />
-                  <a
-                    className="button ghost"
-                    href="/oauth/callback"
-                    rel="noreferrer"
-                    target="_blank"
+              <div className="field-grid">
+                <label className="field">
+                  <span>账号</span>
+                  <select
+                    defaultValue={data.accounts[0]?.id ?? ""}
+                    disabled={data.accounts.length === 0}
+                    name="accountId"
                   >
-                    <span>打开回调页</span>
-                  </a>
-                </div>
-              </form>
+                    {data.accounts.length === 0 ? (
+                      <option value="">暂无账号</option>
+                    ) : (
+                      data.accounts.map((account) => (
+                        <option key={account.id} value={account.id}>
+                          {account.label} / {account.id}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                </label>
+                <label className="field">
+                  <span>路由</span>
+                  <select defaultValue="direct" name="routeMode">
+                    <option value="direct">Direct</option>
+                    <option value="warp">Warp</option>
+                  </select>
+                </label>
+                <label className="field">
+                  <span>模式</span>
+                  <select defaultValue="true" name="headless">
+                    <option value="true">无头</option>
+                    <option value="false">带界面</option>
+                  </select>
+                </label>
+                <label className="field span-2">
+                  <span>登录地址</span>
+                  <input
+                    autoComplete="off"
+                    defaultValue="https://chatgpt.com/auth/login"
+                    name="loginUrl"
+                    type="text"
+                  />
+                </label>
+                <label className="field span-2">
+                  <span>备注</span>
+                  <textarea
+                    name="notes"
+                    placeholder="例如：恢复本地浏览器状态并截图验证"
+                    rows={3}
+                  />
+                </label>
+              </div>
 
-              <form className="form-card" action={parseOpenAiCallbackAction}>
-                <div className="form-head">
-                  <strong>
-                    <Glyph kind="key" className="glyph inline-glyph" />
-                    粘贴回调解析
-                  </strong>
-                  <span>和参考项目一致，支持手动粘贴授权成功后的完整地址进行解析。</span>
-                </div>
-
-                <div className="field-grid">
-                  <label className="field span-2">
-                    <span>登录后浏览器地址</span>
-                    <textarea
-                      name="callbackUrl"
-                      placeholder="粘贴包含 state 和 code 的完整回调 URL"
-                      rows={4}
-                    />
-                  </label>
-                </div>
-
-                <div className="form-actions">
-                  <ParseCallbackButton />
-                </div>
-              </form>
-
-              <form className="form-card" action={browserRecoverAction}>
-                <div className="form-head">
-                  <strong>
-                    <Glyph kind="tasks" className="glyph inline-glyph" />
-                    浏览器辅助恢复
-                  </strong>
-                  <span>
-                    保留原有 browser-assist 恢复入口，用于已有本地会话的恢复和截图校验。
-                  </span>
-                </div>
-
-                <div className="field-grid">
-                  <label className="field">
-                    <span>账号</span>
-                    <select
-                      defaultValue={data.accounts[0]?.id ?? ""}
-                      disabled={data.accounts.length === 0}
-                      name="accountId"
-                    >
-                      {data.accounts.length === 0 ? (
-                        <option value="">暂无账号</option>
-                      ) : (
-                        data.accounts.map((account) => (
-                          <option key={account.id} value={account.id}>
-                            {account.label} / {account.id}
-                          </option>
-                        ))
-                      )}
-                    </select>
-                  </label>
-                  <label className="field">
-                    <span>路由</span>
-                    <select defaultValue="direct" name="routeMode">
-                      <option value="direct">Direct</option>
-                      <option value="warp">Warp</option>
-                    </select>
-                  </label>
-                  <label className="field">
-                    <span>模式</span>
-                    <select defaultValue="true" name="headless">
-                      <option value="true">无头</option>
-                      <option value="false">带界面</option>
-                    </select>
-                  </label>
-                  <label className="field span-2">
-                    <span>登录地址</span>
-                    <input
-                      autoComplete="off"
-                      defaultValue="https://chatgpt.com/auth/login"
-                      name="loginUrl"
-                      type="text"
-                    />
-                  </label>
-                  <label className="field span-2">
-                    <span>备注</span>
-                    <textarea
-                      name="notes"
-                      placeholder="例如：恢复本地浏览器状态并截图验证"
-                      rows={3}
-                    />
-                  </label>
-                </div>
-
-                <div className="form-actions">
-                  <BrowserRecoverButton disabled={data.accounts.length === 0} />
-                </div>
-              </form>
-            </div>
+              <div className="form-actions">
+                <BrowserRecoverButton disabled={data.accounts.length === 0} />
+              </div>
+            </form>
           </article>
 
           <article className="glass-card ledger-panel" id="accounts-ledger">

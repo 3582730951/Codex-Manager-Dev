@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { headers } from "next/headers";
 import { parseOpenAiCallbackAction } from "@/app/actions";
+import { OAuthCallbackSignal } from "@/components/account/OAuthCallbackSignal";
 import { getOpenAiLoginStatus, completeOpenAiLogin } from "@/lib/dashboard";
 import { ParseCallbackButton } from "@/components/buttons/ParseCallbackButton";
 
@@ -66,6 +67,13 @@ export default async function OAuthCallbackPage({
 
   return (
     <main className="console-shell callback-shell">
+      {noticeMessage ? (
+        <OAuthCallbackSignal
+          importedLabel={importedLabel}
+          message={noticeMessage}
+          tone={noticeTone}
+        />
+      ) : null}
       <div className="chrome-main">
         <section className="glass-card callback-stage">
           <header className="panel-head">
@@ -74,7 +82,7 @@ export default async function OAuthCallbackPage({
               <h2>OpenAI 授权回调</h2>
             </div>
             <p className="panel-note">
-              如果浏览器已经跳转回本页，系统会自动尝试解析；如果失败，你也可以手动粘贴完整地址。
+              如果这是从弹出的登录窗口返回，成功后会自动通知主页面；如果失败，你也可以手动粘贴完整地址。
             </p>
           </header>
 
