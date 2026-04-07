@@ -815,6 +815,10 @@ code {
 }
 
 .button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
   min-width: 124px;
   padding: 12px 18px;
   border-radius: 999px;
@@ -848,6 +852,30 @@ code {
   background: rgba(255, 255, 255, 0.04);
   border-color: var(--line);
   color: var(--ink);
+}
+
+.button-create-tenant {
+  min-width: 132px;
+}
+
+.button-import-account {
+  min-width: 148px;
+}
+
+.button-bulk-import {
+  min-width: 132px;
+}
+
+.button-openai-authorize {
+  min-width: 178px;
+}
+
+.button-parse-callback {
+  min-width: 160px;
+}
+
+.button-browser-recover {
+  min-width: 136px;
 }
 
 .table-wrap {
@@ -993,6 +1021,27 @@ code {
   min-width: 960px;
 }
 
+.callback-shell {
+  grid-template-columns: 1fr;
+  max-width: 980px;
+}
+
+.callback-stage {
+  display: grid;
+  gap: 16px;
+  margin-top: 32px;
+}
+
+.callback-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.callback-back {
+  text-decoration: none;
+}
+
 @media (max-width: 1320px) {
   .console-shell {
     grid-template-columns: 1fr;
@@ -1066,5 +1115,9 @@ code {
 
   .header-copy h1 {
     font-size: clamp(2.2rem, 14vw, 3.4rem);
+  }
+
+  .callback-grid {
+    grid-template-columns: 1fr;
   }
 }

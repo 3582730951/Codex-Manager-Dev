@@ -246,9 +246,11 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "axum",
+ "base64",
  "chrono",
  "futures-util",
  "http",
+ "rand 0.8.5",
  "redis",
  "reqwest",
  "serde",

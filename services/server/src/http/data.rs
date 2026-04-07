@@ -1094,10 +1094,7 @@ fn model_matches_expected(actual: &str, expected: &str) -> bool {
             .strip_prefix(expected)
             .and_then(|suffix| suffix.strip_prefix('-'))
             .is_some_and(|suffix| {
-                !suffix.is_empty()
-                    && suffix
-                        .chars()
-                        .all(|ch| ch.is_ascii_digit() || ch == '-')
+                !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit() || ch == '-')
             })
 }
 
@@ -1274,9 +1271,7 @@ fn copy_upstream_headers_to_response(out: &mut HeaderMap, headers: &reqwest::hea
 }
 
 fn is_codex_chatgpt_backend(base_url: &str) -> bool {
-    base_url
-        .to_ascii_lowercase()
-        .contains("/backend-api/codex")
+    base_url.to_ascii_lowercase().contains("/backend-api/codex")
 }
 
 fn responses_payload_for_upstream(
@@ -1294,8 +1289,10 @@ fn responses_payload_for_upstream(
         upstream_payload.prompt_cache_key = Some(cache_key);
     }
     if let Some(replay_context) = replay_context {
-        upstream_payload.input =
-            attach_replay_context_to_responses_input(upstream_payload.input.clone(), replay_context);
+        upstream_payload.input = attach_replay_context_to_responses_input(
+            upstream_payload.input.clone(),
+            replay_context,
+        );
     }
     serde_json::to_value(&upstream_payload).unwrap_or_else(|_| {
         json!({
@@ -1325,12 +1322,7 @@ fn codex_responses_payload(
     object.insert("store".to_string(), Value::Bool(false));
     object.insert(
         "prompt_cache_key".to_string(),
-        Value::String(
-            payload
-                .prompt_cache_key
-                .clone()
-                .unwrap_or(cache_key),
-        ),
+        Value::String(payload.prompt_cache_key.clone().unwrap_or(cache_key)),
     );
     if let Some(reasoning) = payload.reasoning.clone() {
         object.insert("reasoning".to_string(), reasoning);
@@ -2501,11 +2493,8 @@ mod tests {
             }
         });
 
-        let kind = hidden_failure_kind_from_json(
-            &payload,
-            "gpt-5.4",
-            &reqwest::header::HeaderMap::new(),
-        );
+        let kind =
+            hidden_failure_kind_from_json(&payload, "gpt-5.4", &reqwest::header::HeaderMap::new());
         assert_eq!(kind, Some(UpstreamFailureKind::Quota));
     }
 
@@ -2517,11 +2506,8 @@ mod tests {
             "model": "gpt-4.1-mini"
         });
 
-        let kind = hidden_failure_kind_from_json(
-            &payload,
-            "gpt-5.4",
-            &reqwest::header::HeaderMap::new(),
-        );
+        let kind =
+            hidden_failure_kind_from_json(&payload, "gpt-5.4", &reqwest::header::HeaderMap::new());
         assert_eq!(kind, Some(UpstreamFailureKind::Capability));
     }
 
@@ -2533,13 +2519,13 @@ mod tests {
             "model": "gpt-5.2-2025-12-11"
         });
 
-        let kind = hidden_failure_kind_from_json(
-            &payload,
-            "gpt-5.2",
-            &reqwest::header::HeaderMap::new(),
-        );
+        let kind =
+            hidden_failure_kind_from_json(&payload, "gpt-5.2", &reqwest::header::HeaderMap::new());
         assert_eq!(kind, None);
-        assert!(model_matches_expected("gpt-5.3-codex-2025-12-11", "gpt-5.3-codex"));
+        assert!(model_matches_expected(
+            "gpt-5.3-codex-2025-12-11",
+            "gpt-5.3-codex"
+        ));
     }
 
     #[test]

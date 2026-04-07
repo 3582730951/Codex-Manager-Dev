@@ -13,9 +13,11 @@ use crate::models::{
     AccountRouteState, AccountSummary, CacheMetrics, CfIncident, CliLease, ContextTurn,
     ConversationContext, CreateGatewayApiKeyRequest, CreateTenantRequest, CreatedGatewayApiKey,
     DashboardCounts, DashboardSnapshot, EgressSlot, GatewayApiKey, GatewayApiKeyView,
-    ImportAccountRequest, LeaseSelectionRequest, RouteEventRequest, RouteMode, SchedulingSignals,
-    Tenant, TopologyNode, UpstreamAccount, UpstreamCredential,
+    ImportAccountRequest, LeaseSelectionRequest, OpenAiLoginCompleteRequest,
+    OpenAiLoginSessionView, OpenAiLoginStartRequest, OpenAiLoginStartResponse, RouteEventRequest,
+    RouteMode, SchedulingSignals, Tenant, TopologyNode, UpstreamAccount, UpstreamCredential,
 };
+use crate::openai_auth;
 use crate::scheduler::cf_state::{
     is_in_cooldown, reconcile_route_mode, register_cf_hit, register_success,
 };
@@ -25,6 +27,44 @@ use crate::scheduler::token_optimizer::{WarmupDecision, evaluate_prefix_warmup};
 use crate::storage::{Persistence, PersistenceMessage, PersistenceSnapshot};
 use crate::upstream::UpstreamClient;
 use crate::{browser_assist, bus, config::Config};
+
+#[derive(Debug, Clone)]
+struct OpenAiLoginSessionState {
+    login_id: String,
+    tenant_id: Uuid,
+    label: Option<String>,
+    note: Option<String>,
+    redirect_uri: String,
+    auth_url: String,
+    code_verifier: String,
+    status: String,
+    error: Option<String>,
+    imported_account_id: Option<String>,
+    imported_account_label: Option<String>,
+    models: Vec<String>,
+    base_url: String,
+    created_at: chrono::DateTime<Utc>,
+    updated_at: chrono::DateTime<Utc>,
+}
+
+impl OpenAiLoginSessionState {
+    fn view(&self) -> OpenAiLoginSessionView {
+        OpenAiLoginSessionView {
+            login_id: self.login_id.clone(),
+            tenant_id: self.tenant_id,
+            label: self.label.clone(),
+            note: self.note.clone(),
+            redirect_uri: self.redirect_uri.clone(),
+            auth_url: self.auth_url.clone(),
+            status: self.status.clone(),
+            error: self.error.clone(),
+            imported_account_id: self.imported_account_id.clone(),
+            imported_account_label: self.imported_account_label.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct RuntimeState {
@@ -37,6 +77,7 @@ pub struct RuntimeState {
     pub cf_incidents: RwLock<Vec<CfIncident>>,
     pub cache_metrics: RwLock<CacheMetrics>,
     pub conversation_contexts: RwLock<HashMap<String, ConversationContext>>,
+    openai_login_sessions: RwLock<HashMap<String, OpenAiLoginSessionState>>,
 }
 
 #[derive(Clone)]
@@ -646,6 +687,164 @@ impl AppState {
             token: api_key.token,
             created_at: api_key.created_at,
         })
+    }
+
+    pub async fn start_openai_login(
+        &self,
+        request: OpenAiLoginStartRequest,
+    ) -> Result<OpenAiLoginStartResponse, String> {
+        let tenant_exists = self
+            .runtime
+            .tenants
+            .read()
+            .await
+            .contains_key(&request.tenant_id);
+        if !tenant_exists {
+            return Err("Tenant not found.".to_string());
+        }
+
+        let redirect_uri = reqwest::Url::parse(&request.redirect_uri)
+            .map_err(|error| format!("redirectUri 无效: {error}"))?
+            .to_string();
+        let pkce = openai_auth::generate_pkce();
+        let login_id = openai_auth::generate_state();
+        let auth_url =
+            openai_auth::build_authorize_url(&redirect_uri, &pkce.code_challenge, &login_id)?;
+        let now = Utc::now();
+        let session = OpenAiLoginSessionState {
+            login_id: login_id.clone(),
+            tenant_id: request.tenant_id,
+            label: request.label.filter(|value| !value.trim().is_empty()),
+            note: request.note.filter(|value| !value.trim().is_empty()),
+            redirect_uri: redirect_uri.clone(),
+            auth_url: auth_url.clone(),
+            code_verifier: pkce.code_verifier,
+            status: "pending".to_string(),
+            error: None,
+            imported_account_id: None,
+            imported_account_label: None,
+            models: request.models.unwrap_or_else(default_oauth_models),
+            base_url: request
+                .base_url
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(default_oauth_base_url),
+            created_at: now,
+            updated_at: now,
+        };
+        self.runtime
+            .openai_login_sessions
+            .write()
+            .await
+            .insert(login_id.clone(), session);
+
+        Ok(OpenAiLoginStartResponse {
+            login_id,
+            auth_url,
+            redirect_uri,
+        })
+    }
+
+    pub async fn openai_login_status(&self, login_id: &str) -> Option<OpenAiLoginSessionView> {
+        self.runtime
+            .openai_login_sessions
+            .read()
+            .await
+            .get(login_id)
+            .cloned()
+            .map(|session| session.view())
+    }
+
+    pub async fn complete_openai_login(
+        &self,
+        request: OpenAiLoginCompleteRequest,
+    ) -> Result<UpstreamAccount, String> {
+        let session = self
+            .runtime
+            .openai_login_sessions
+            .read()
+            .await
+            .get(&request.state)
+            .cloned()
+            .ok_or_else(|| "未知登录会话。".to_string())?;
+        if session.status == "success" {
+            if let Some(account_id) = session.imported_account_id.as_deref() {
+                if let Some(existing) = self.runtime.accounts.read().await.get(account_id).cloned()
+                {
+                    return Ok(existing);
+                }
+            }
+        }
+        let redirect_uri = request
+            .redirect_uri
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| session.redirect_uri.clone());
+
+        {
+            let mut sessions = self.runtime.openai_login_sessions.write().await;
+            if let Some(active) = sessions.get_mut(&request.state) {
+                active.status = "exchanging".to_string();
+                active.error = None;
+                active.updated_at = Utc::now();
+            }
+        }
+
+        let result = async {
+            let tokens = openai_auth::exchange_code_for_tokens(
+                &redirect_uri,
+                &session.code_verifier,
+                &request.code,
+            )
+            .await?;
+            let claims = openai_auth::parse_id_token_claims(&tokens.id_token)?;
+            let account_label = session
+                .label
+                .clone()
+                .or_else(|| claims.email.clone())
+                .or_else(|| session.note.clone())
+                .unwrap_or_else(|| format!("OpenAI {}", claims.sub));
+            let chatgpt_account_id = openai_auth::extract_chatgpt_account_id(&tokens.id_token)
+                .or_else(|| claims.auth.clone().and_then(|auth| auth.chatgpt_account_id))
+                .or_else(|| openai_auth::extract_chatgpt_account_id(&tokens.access_token))
+                .or(claims.workspace_id.clone());
+
+            let account = self
+                .import_account(ImportAccountRequest {
+                    tenant_id: session.tenant_id,
+                    label: account_label,
+                    models: session.models.clone(),
+                    quota_headroom: Some(0.8),
+                    quota_headroom_5h: Some(0.8),
+                    quota_headroom_7d: Some(0.8),
+                    health_score: Some(0.9),
+                    egress_stability: Some(0.85),
+                    base_url: Some(session.base_url.clone()),
+                    bearer_token: Some(tokens.access_token),
+                    chatgpt_account_id,
+                    extra_headers: None,
+                })
+                .await;
+            Ok::<UpstreamAccount, String>(account)
+        }
+        .await;
+
+        let mut sessions = self.runtime.openai_login_sessions.write().await;
+        if let Some(active) = sessions.get_mut(&request.state) {
+            active.updated_at = Utc::now();
+            match &result {
+                Ok(account) => {
+                    active.status = "success".to_string();
+                    active.error = None;
+                    active.imported_account_id = Some(account.id.clone());
+                    active.imported_account_label = Some(account.label.clone());
+                }
+                Err(error) => {
+                    active.status = "failed".to_string();
+                    active.error = Some(error.clone());
+                }
+            }
+        }
+
+        result
     }
 
     pub async fn import_account(&self, request: ImportAccountRequest) -> UpstreamAccount {
@@ -1400,6 +1599,18 @@ fn default_cache_metrics() -> CacheMetrics {
         warmup_roi: 2.14,
         static_prefix_tokens: 4_096,
     }
+}
+
+fn default_oauth_models() -> Vec<String> {
+    vec![
+        "gpt-5.4".to_string(),
+        "gpt-5.3-codex".to_string(),
+        "gpt-5.2".to_string(),
+    ]
+}
+
+fn default_oauth_base_url() -> String {
+    "https://chatgpt.com/backend-api/codex".to_string()
 }
 
 fn demo_account(

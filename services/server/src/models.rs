@@ -237,6 +237,23 @@ pub struct BrowserTask {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OpenAiLoginSessionView {
+    pub login_id: String,
+    pub tenant_id: Uuid,
+    pub label: Option<String>,
+    pub note: Option<String>,
+    pub redirect_uri: String,
+    pub auth_url: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub imported_account_id: Option<String>,
+    pub imported_account_label: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EgressSlot {
     pub id: String,
     pub route_mode: RouteMode,
@@ -322,6 +339,33 @@ pub struct BrowserTaskRequest {
     pub password: Option<String>,
     pub otp_code: Option<String>,
     pub route_mode: Option<RouteMode>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenAiLoginStartRequest {
+    pub tenant_id: Uuid,
+    pub label: Option<String>,
+    pub note: Option<String>,
+    pub redirect_uri: String,
+    pub models: Option<Vec<String>>,
+    pub base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenAiLoginStartResponse {
+    pub login_id: String,
+    pub auth_url: String,
+    pub redirect_uri: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenAiLoginCompleteRequest {
+    pub state: String,
+    pub code: String,
+    pub redirect_uri: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

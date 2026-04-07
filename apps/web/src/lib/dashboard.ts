@@ -31,6 +31,27 @@ export interface AdminHealthSnapshot {
   browserAssistWarpProxyConfigured: boolean;
 }
 
+export interface OpenAiLoginStartResult {
+  loginId: string;
+  authUrl: string;
+  redirectUri: string;
+}
+
+export interface OpenAiLoginSession {
+  loginId: string;
+  tenantId: string;
+  label: string | null;
+  note: string | null;
+  redirectUri: string;
+  authUrl: string;
+  status: string;
+  error: string | null;
+  importedAccountId: string | null;
+  importedAccountLabel: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 const healthFallback: AdminHealthSnapshot = {
   service: "server-admin",
   status: "offline",
@@ -158,6 +179,35 @@ export async function submitBrowserTask(
   }
 ) {
   return fetchAdmin<BrowserTask>(`/api/v1/browser/tasks/${kind}`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function startOpenAiLogin(payload: {
+  tenantId: string;
+  label?: string;
+  note?: string;
+  redirectUri: string;
+  models?: string[];
+  baseUrl?: string;
+}) {
+  return fetchAdmin<OpenAiLoginStartResult>("/api/v1/openai/login/start", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function getOpenAiLoginStatus(loginId: string) {
+  return fetchAdmin<OpenAiLoginSession>(`/api/v1/openai/login/${loginId}`);
+}
+
+export async function completeOpenAiLogin(payload: {
+  state: string;
+  code: string;
+  redirectUri?: string;
+}) {
+  return fetchAdmin<Record<string, unknown>>("/api/v1/openai/login/complete", {
     method: "POST",
     body: JSON.stringify(payload)
   });

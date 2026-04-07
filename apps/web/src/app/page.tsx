@@ -1,11 +1,19 @@
 import type { CSSProperties, ReactNode } from "react";
+import { headers } from "next/headers";
 import {
-  browserLoginAction,
   browserRecoverAction,
   bulkImportAccountsAction,
   createTenantAction,
-  importAccountAction
+  importAccountAction,
+  parseOpenAiCallbackAction,
+  startOpenAiLoginAction
 } from "@/app/actions";
+import { BrowserRecoverButton } from "@/components/buttons/BrowserRecoverButton";
+import { BulkImportButton } from "@/components/buttons/BulkImportButton";
+import { CreateTenantButton } from "@/components/buttons/CreateTenantButton";
+import { ImportAccountButton } from "@/components/buttons/ImportAccountButton";
+import { OpenAiAuthorizeButton } from "@/components/buttons/OpenAiAuthorizeButton";
+import { ParseCallbackButton } from "@/components/buttons/ParseCallbackButton";
 import {
   getAdminHealth,
   getDashboardSnapshot,
@@ -396,6 +404,15 @@ export default async function Page({
     getTenants(),
     getAdminHealth()
   ]);
+  const requestHeaders = await headers();
+  const forwardedProto = requestHeaders.get("x-forwarded-proto");
+  const forwardedHost =
+    requestHeaders.get("x-forwarded-host") ?? requestHeaders.get("host");
+  const webOrigin =
+    forwardedHost
+      ? `${forwardedProto ?? "http"}://${forwardedHost}`
+      : "http://127.0.0.1:3000";
+  const oauthCallbackUrl = `${webOrigin}/oauth/callback`;
 
   const surfaceTitle =
     data.title === "Codex Manager 2.0" ? "Codex 管理台" : data.title;
@@ -729,9 +746,7 @@ export default async function Page({
                   </label>
                 </div>
                 <div className="form-actions">
-                  <button className="button primary" type="submit">
-                    创建租户
-                  </button>
+                  <CreateTenantButton />
                 </div>
               </form>
 
@@ -846,13 +861,7 @@ export default async function Page({
                 </div>
 
                 <div className="form-actions">
-                  <button
-                    className="button primary"
-                    disabled={tenants.length === 0}
-                    type="submit"
-                  >
-                    导入到控制面
-                  </button>
+                  <ImportAccountButton disabled={tenants.length === 0} />
                 </div>
               </form>
 
@@ -915,24 +924,128 @@ export default async function Page({
                 </div>
 
                 <div className="form-actions">
-                  <button
-                    className="button primary"
-                    disabled={tenants.length === 0}
-                    type="submit"
-                  >
-                    批量归档
-                  </button>
+                  <BulkImportButton disabled={tenants.length === 0} />
                 </div>
               </form>
 
-              <form className="form-card" action={browserLoginAction}>
+              <form className="form-card" action={startOpenAiLoginAction}>
                 <div className="form-head">
                   <strong>
                     <Glyph kind="login" className="glyph inline-glyph" />
                     OpenAI 登录
                   </strong>
                   <span>
-                    Browser Assist: {health.browserAssistUrl === "n/a" ? "未挂接" : "已挂接"}
+                    点击后会直接跳转到 OpenAI 授权界面；回调可自动落到当前 Web 页面。
+                  </span>
+                </div>
+
+                <div className="field-grid">
+                  <label className="field">
+                    <span>租户</span>
+                    <select
+                      defaultValue={tenants[0]?.id ?? ""}
+                      disabled={tenants.length === 0}
+                      name="tenantId"
+                    >
+                      {tenants.length === 0 ? (
+                        <option value="">暂无租户</option>
+                      ) : (
+                        tenants.map((tenant) => (
+                          <option key={tenant.id} value={tenant.id}>
+                            {tenant.name} / {tenant.slug}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span>导入账号名</span>
+                    <input
+                      autoComplete="off"
+                      name="label"
+                      placeholder="OpenAI 授权账号"
+                      type="text"
+                    />
+                  </label>
+                  <label className="field">
+                    <span>默认模型</span>
+                    <input
+                      autoComplete="off"
+                      defaultValue="gpt-5.4, gpt-5.3-codex, gpt-5.2"
+                      name="models"
+                      type="text"
+                    />
+                  </label>
+                  <label className="field span-2">
+                    <span>回调地址</span>
+                    <input
+                      autoComplete="off"
+                      defaultValue={oauthCallbackUrl}
+                      name="redirectUri"
+                      type="text"
+                    />
+                  </label>
+                  <label className="field span-2">
+                    <span>备注</span>
+                    <textarea
+                      name="notes"
+                      placeholder="例如：主账号授权、团队工作区"
+                      rows={3}
+                    />
+                  </label>
+                  <label className="field span-2">
+                    <span>导入 Base URL</span>
+                    <input
+                      autoComplete="off"
+                      defaultValue="https://chatgpt.com/backend-api/codex"
+                      name="baseUrl"
+                      type="text"
+                    />
+                  </label>
+                </div>
+
+                <div className="callout-card">
+                  这条入口会生成 PKCE 授权地址并直接跳到 OpenAI。授权完成后如果没有自动解析，你可以把浏览器最终地址粘贴到下方进行解析。
+                </div>
+
+                <div className="form-actions dual">
+                  <OpenAiAuthorizeButton disabled={tenants.length === 0} />
+                </div>
+              </form>
+
+              <form className="form-card" action={parseOpenAiCallbackAction}>
+                <div className="form-head">
+                  <strong>
+                    <Glyph kind="key" className="glyph inline-glyph" />
+                    粘贴回调解析
+                  </strong>
+                  <span>和参考项目一致，支持手动粘贴授权成功后的完整地址进行解析。</span>
+                </div>
+
+                <div className="field-grid">
+                  <label className="field span-2">
+                    <span>登录后浏览器地址</span>
+                    <textarea
+                      name="callbackUrl"
+                      placeholder="粘贴包含 state 和 code 的完整回调 URL"
+                      rows={4}
+                    />
+                  </label>
+                </div>
+
+                <div className="form-actions">
+                  <ParseCallbackButton />
+                </div>
+              </form>
+
+              <form className="form-card" action={browserRecoverAction}>
+                <div className="form-head">
+                  <strong>
+                    <Glyph kind="tasks" className="glyph inline-glyph" />
+                    浏览器辅助恢复
+                  </strong>
+                  <span>
+                    保留原有 browser-assist 恢复入口，用于已有本地会话的恢复和截图校验。
                   </span>
                 </div>
 
@@ -978,48 +1091,18 @@ export default async function Page({
                       type="text"
                     />
                   </label>
-                  <label className="field">
-                    <span>邮箱</span>
-                    <input autoComplete="username" name="email" type="text" />
-                  </label>
-                  <label className="field">
-                    <span>密码</span>
-                    <input autoComplete="current-password" name="password" type="password" />
-                  </label>
-                  <label className="field">
-                    <span>OTP</span>
-                    <input autoComplete="one-time-code" name="otpCode" type="text" />
-                  </label>
                   <label className="field span-2">
                     <span>备注</span>
                     <textarea
                       name="notes"
-                      placeholder="例如：首次登录、验证 Warp 会话"
+                      placeholder="例如：恢复本地浏览器状态并截图验证"
                       rows={3}
                     />
                   </label>
                 </div>
 
-                <div className="callout-card">
-                  浏览器登录用于建立或恢复浏览器会话；网关真实转发仍然以 Token 导入为准。
-                </div>
-
-                <div className="form-actions dual">
-                  <button
-                    className="button primary"
-                    disabled={data.accounts.length === 0}
-                    type="submit"
-                  >
-                    启动登录
-                  </button>
-                  <button
-                    className="button ghost"
-                    disabled={data.accounts.length === 0}
-                    formAction={browserRecoverAction}
-                    type="submit"
-                  >
-                    恢复已有会话
-                  </button>
+                <div className="form-actions">
+                  <BrowserRecoverButton disabled={data.accounts.length === 0} />
                 </div>
               </form>
             </div>

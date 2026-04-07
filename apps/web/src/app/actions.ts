@@ -3,8 +3,10 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import {
+  completeOpenAiLogin,
   createTenant,
   importAccount,
+  startOpenAiLogin,
   submitBrowserTask
 } from "@/lib/dashboard";
 
@@ -276,6 +278,27 @@ function routeModeFromForm(formData: FormData) {
   return "direct" as const;
 }
 
+function readCallbackPayload(raw: string) {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("回调地址格式无效。");
+  }
+
+  const state = url.searchParams.get("state")?.trim() ?? "";
+  const code = url.searchParams.get("code")?.trim() ?? "";
+  if (!state || !code) {
+    throw new Error("回调地址缺少 state 或 code。");
+  }
+
+  return {
+    state,
+    code,
+    redirectUri: `${url.origin}${url.pathname}`
+  };
+}
+
 function redirectWithNotice(
   tone: "ok" | "error",
   message: string,
@@ -377,6 +400,63 @@ export async function bulkImportAccountsAction(formData: FormData) {
   } catch (error) {
     finishError(error, "connect");
   }
+}
+
+export async function startOpenAiLoginAction(formData: FormData) {
+  try {
+    const tenantId = readString(formData, "tenantId");
+    const redirectUri = readString(formData, "redirectUri");
+
+    if (!tenantId) {
+      throw new Error("请先选择租户。");
+    }
+    if (!redirectUri) {
+      throw new Error("缺少回调地址。");
+    }
+
+    const result = await startOpenAiLogin({
+      tenantId,
+      label: readOptionalString(formData, "label"),
+      note: readOptionalString(formData, "notes"),
+      redirectUri,
+      models: parseModels(readString(formData, "models")),
+      baseUrl: readOptionalString(formData, "baseUrl")
+    });
+
+    redirect(result.authUrl);
+  } catch (error) {
+    finishError(error, "login");
+  }
+}
+
+export async function parseOpenAiCallbackAction(formData: FormData) {
+  try {
+    const callbackUrl = readString(formData, "callbackUrl");
+    const target = readOptionalString(formData, "returnTo") ?? "main";
+    const payload = readCallbackPayload(callbackUrl);
+
+    await completeOpenAiLogin(payload);
+    revalidatePath("/");
+    revalidatePath("/oauth/callback");
+
+    if (target === "callback") {
+      redirect(
+        `/oauth/callback?noticeTone=ok&noticeMessage=${encodeURIComponent("OpenAI 授权已解析并导入账号。")}`
+      );
+    }
+  } catch (error) {
+    const target = readOptionalString(formData, "returnTo") ?? "main";
+    if (target === "callback") {
+      const message =
+        error instanceof Error ? error.message : "授权回调解析失败。";
+      redirect(
+        `/oauth/callback?noticeTone=error&noticeMessage=${encodeURIComponent(message)}`
+      );
+    }
+    finishError(error, "login");
+  }
+
+  finishSuccess("OpenAI 授权已解析并导入账号。", "login");
 }
 
 async function submitTaskAction(

@@ -3,6 +3,7 @@ mod bus;
 mod config;
 mod http;
 mod models;
+mod openai_auth;
 mod scheduler;
 mod state;
 mod storage;

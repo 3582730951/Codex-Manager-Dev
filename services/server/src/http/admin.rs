@@ -9,7 +9,7 @@ use crate::{
     browser_assist,
     models::{
         BrowserTaskRequest, CreateGatewayApiKeyRequest, CreateTenantRequest, ImportAccountRequest,
-        RouteEventRequest,
+        OpenAiLoginCompleteRequest, OpenAiLoginStartRequest, RouteEventRequest,
     },
     state::AppState,
 };
@@ -32,6 +32,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/browser/tasks", get(browser_tasks))
         .route("/api/v1/browser/tasks/login", post(browser_login))
         .route("/api/v1/browser/tasks/recover", post(browser_recover))
+        .route("/api/v1/openai/login/start", post(openai_login_start))
+        .route("/api/v1/openai/login/{login_id}", get(openai_login_status))
+        .route("/api/v1/openai/login/complete", post(openai_login_complete))
         .route(
             "/api/v1/accounts/{account_id}/route-events",
             post(route_event),
@@ -203,6 +206,60 @@ async fn browser_recover(
                 "error": {
                     "message": "Browser assist unavailable.",
                     "type": "browser_assist_unavailable"
+                }
+            })),
+        )),
+    }
+}
+
+async fn openai_login_start(
+    State(state): State<AppState>,
+    Json(payload): Json<OpenAiLoginStartRequest>,
+) -> Result<Json<crate::models::OpenAiLoginStartResponse>, (StatusCode, Json<serde_json::Value>)> {
+    match state.start_openai_login(payload).await {
+        Ok(response) => Ok(Json(response)),
+        Err(message) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "openai_login_start_failed"
+                }
+            })),
+        )),
+    }
+}
+
+async fn openai_login_status(
+    State(state): State<AppState>,
+    Path(login_id): Path<String>,
+) -> Result<Json<crate::models::OpenAiLoginSessionView>, (StatusCode, Json<serde_json::Value>)> {
+    match state.openai_login_status(&login_id).await {
+        Some(session) => Ok(Json(session)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "Login session not found.",
+                    "type": "not_found"
+                }
+            })),
+        )),
+    }
+}
+
+async fn openai_login_complete(
+    State(state): State<AppState>,
+    Json(payload): Json<OpenAiLoginCompleteRequest>,
+) -> Result<Json<crate::models::UpstreamAccount>, (StatusCode, Json<serde_json::Value>)> {
+    match state.complete_openai_login(payload).await {
+        Ok(account) => Ok(Json(account)),
+        Err(message) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "openai_login_complete_failed"
                 }
             })),
         )),
