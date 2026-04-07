@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "codex-manager.fullname" . }}-redis
+  labels:
+    {{- include "codex-manager.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: redis
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "codex-manager.labels" . | nindent 8 }}
+        app.kubernetes.io/component: redis
+    spec:
+      containers:
+        - name: redis
+          image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          command: ["redis-server", "--save", "", "--appendonly", "no"]
+          ports:
+            - containerPort: {{ .Values.redis.port }}
+              name: redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "codex-manager.fullname" . }}-redis
+  labels:
+    {{- include "codex-manager.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/component: redis
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: redis
+      port: {{ .Values.redis.port }}
+      targetPort: redis

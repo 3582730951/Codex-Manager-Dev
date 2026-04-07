@@ -1,0 +1,55 @@
+nameOverride: ""
+fullnameOverride: ""
+
+imagePullPolicy: IfNotPresent
+
+web:
+  replicas: 1
+  image:
+    repository: codex-manager/web
+    tag: latest
+  service:
+    port: 3000
+
+server:
+  replicas: 1
+  image:
+    repository: codex-manager/server
+    tag: latest
+  dataPort: 8080
+  adminPort: 8081
+  heartbeatSeconds: 5
+  enableDemoSeed: false
+  directProxyUrl: ""
+  warpProxyUrl: ""
+  browserAssistDirectProxyUrl: ""
+  browserAssistWarpProxyUrl: ""
+
+browserAssist:
+  replicas: 1
+  image:
+    repository: codex-manager/browser-assist
+    tag: latest
+  port: 8090
+  idleTtlMs: 180000
+  chromiumPath: /usr/bin/chromium-browser
+  directProxyUrl: ""
+  warpProxyUrl: ""
+
+postgres:
+  image:
+    repository: postgres
+    tag: "16-alpine"
+  database: codex_manager
+  username: codex_manager
+  password: codex_manager
+  storage:
+    size: 10Gi
+
+redis:
+  image:
+    repository: redis
+    tag: "7-alpine"
+  port: 6379
+
+redisChannel: cmgr:control-events

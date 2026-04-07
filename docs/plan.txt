@@ -1,0 +1,501 @@
+Codex-Manager 2.0 Plan
+Date: 2026-04-06
+
+1. 目标
+
+- 从 0 开始重建新的 Codex-Manager。
+- Web 和 Server 默认独立部署在两个不同 Docker 容器。
+- Browser Assist 单独容器，隔离冷路径登录和恢复逻辑。
+- 下游采用单 CLI + 单账号粘连。
+- 上游额度不足、账号失效、模型漂移、能力不支持，这些都不能透传给下游。
+- 发生硬失败时，优先无感切换到新的健康账号；没有健康账号时进入隐藏等待。
+- 尽量降低切号后的降智，保留上下文重传能力。
+- 调度器优先保证缓存命中率、会话稳定性和硬件资源占用平衡。
+
+2. 已落地架构
+
+- apps/web
+  Node SSR 管理后台。
+- services/server
+  Rust 单二进制，内部同时承载 data plane 和 admin plane。
+- services/browser-assist
+  Playwright sidecar，负责登录、恢复、profile 持久化。
+- Postgres
+  持久化租约、账号、上下文、事件。
+- Redis
+  控制面 fanout 和跨实例同步。
+
+3. 已落地核心能力
+
+- OpenAI 兼容入口：
+  - /v1/responses
+  - /v1/chat/completions
+  - /v1/models
+- Responses-first 内核：
+  chat/completions 通过 responses-first 适配实现。
+- 单 CLI 粘连：
+  同一 principal 默认只绑定一个账号。
+- CF/WARP 状态机：
+  - direct 连续 3 次 CF 进入 warp
+  - warp 再次 CF 触发 failover 和 cooldown
+- 上下文重传：
+  切 generation 后回放有效上下文摘要。
+- 隐藏失败拦截：
+  - quota
+  - auth
+  - capability
+  - hidden JSON failure
+  - hidden SSE response.failed
+  - model drift via openai-model / response.model
+- 自动切换：
+  quota、auth、capability、CF 硬失败时，尝试切换到新的健康账号。
+
+4. 调度和资源策略
+
+4.1 调度算法
+
+- 调度以 single CLI affinity 为第一原则。
+- 调度键：
+  - principal_id = tenant + cli affinity id
+  - conversation generation = principal 当前线程世代
+- 复用优先级：
+  - 已有健康 lease 时，优先复用原账号
+  - 不因为普通负载波动打散同一个 CLI
+  - 同一 CLI 的多 agent 并发仍然共享同一个账号
+- 新租约选择算法：
+  - 先做 dual-candidate bounded selection
+  - 再在两个候选里按 cache-aware score 选最优
+- dual-candidate 生成方法：
+  - 使用 rendezvous hash / HRW 对 principal_id + model + account_id 计算分数
+  - 先取第一候选
+  - 再用第二个 salt 选第二候选
+  - 这样保证账号池变化时迁移范围较小
+- 候选评分方法：
+  - score = 0.35 * cache_affinity
+  -       + 0.20 * effective_quota_headroom
+  -       + 0.15 * health_score
+  -       + 0.10 * egress_stability
+  -       + 0.10 * fairness_bias
+  -       + 0.10 * runtime_headroom
+  -       + warp_bonus
+- effective_quota_headroom 取最保守窗口：
+  - min(quotaHeadroom, quotaHeadroom5h, quotaHeadroom7d)
+- cache_affinity 规则：
+  - 同 principal + 同账号 + 同 model，最高
+  - 已存在 lease 的账号得分更高
+  - 新账号只有在旧账号不可复用时才参与
+- 目标：
+  - 尽量保证单 CLI 单账号不漂移
+  - 降低账号切换范围
+  - 提高 prompt cache 命中概率
+  - 避免为了均衡而牺牲上下文稳定性
+
+4.2 切换逻辑
+
+- 默认原则：
+  - wait-before-switch
+  - hard-fail 才切
+  - soft-pressure 不切
+- 不切换的情况：
+  - 普通轻度拥塞
+  - 普通短时波动
+  - 健康账号正常返回
+- 会触发切换或剔除的情况：
+  - quota
+  - auth
+  - capability
+  - CF according to direct/warp state machine
+  - hidden failure in JSON body
+  - hidden failure in SSE response.failed
+  - hidden model drift via openai-model 或 response.model
+- direct / warp 状态机：
+  - direct 连续 3 次 CF -> route_mode 切到 warp
+  - warp 再次 CF -> cooldown 升级 + failover_required
+  - cooldown 梯度：
+    5s -> 1m -> 5m -> 10m -> 15m -> 30m -> 1h -> 12h
+- quota / capability / auth 处理方式：
+  - 当前账号 lease 被驱逐
+  - principal 重新解析 lease
+  - 如果有健康 exact-capability 账号则自动切换
+  - 如果没有，则进入 hidden wait / server_busy
+- SSE 切换策略：
+  - 对近配额账号启用首批事件预检
+  - 预检时如果首批事件就是 response.failed，则在同一请求内切到新账号
+  - 对健康账号不做全量重型预检，只保留轻量 header/model 检查
+- 下游可见行为：
+  - 不看到 raw insufficient_quota
+  - 不看到 raw usage_limit_reached
+  - 不看到 raw model drift
+  - 不看到内部账号失效原因
+
+4.3 资源使用策略
+
+- 热路径资源策略：
+  - server 为单 Rust 二进制，避免拆成多个高开销服务
+  - 成功路径不做同步 Postgres 查询
+  - 成功路径不做同步 Postgres 写入
+  - 状态通过内存热副本服务请求
+  - 持久化走异步 batch writer
+  - Redis fanout 为控制面同步，不阻塞成功转发
+- 流式路径资源策略：
+  - 健康账号走轻量 passthrough stream
+  - 只有 near-quota guard 账号才启用重型 SSE 预检
+  - 这样避免所有流式请求都做事件级 JSON 解析
+- 冷路径隔离：
+  - browser-assist 单独容器
+  - Playwright 不进入正常 data plane 热路径
+  - 登录、恢复、challenge 处理与正常转发隔离
+- Web 资源策略：
+  - Web 和 Server 默认两个不同容器
+  - Web 仅做 SSR 管理面，不参与模型转发热路径
+- quota guard 门控：
+  - 仅当 quotaHeadroom5h < 0.30 时启用重型近配额保护
+  - 仅当 quotaHeadroom7d < 0.30 时启用重型近配额保护
+  - 其余账号走更轻路径，以降低 CPU、内存、流式解析和上下文重放成本
+- 上下文和 token 资源策略：
+  - generation 切换后只重放必要上下文摘要
+  - 不做全历史重传
+  - 目标是降低 replay token 成本和切号后的降智
+
+4.4 Token 节约策略
+
+- 基本原则：
+  - 不降低模型
+  - 不降低 reasoning_effort
+  - 不降低工具能力
+  - 不用 semantic answer cache 直接拿旧答案顶替真实推理
+- token 节约的主方向不是“少想”，而是“少重复传、少破坏缓存、少无效回放”。
+- 已采用的核心策略：
+  - stable prefix layout
+    - 系统规则、租户规则、工具定义、静态策略放在更稳定的位置
+    - 动态用户轮次和最新 tail 放在后面
+    - 目标是提高 prompt cache 命中率
+  - canonical serialization
+    - 服务端注入的 JSON、tool schema、系统块做稳定序列化
+    - 避免字段顺序飘动导致缓存失效
+  - generation-based replay
+    - 切号后只重放当前 generation 真正需要的上下文摘要
+    - 不把整段历史全量重传
+  - dependency frontier replay
+    - 只保留未完成任务仍依赖的工具结果和状态摘要
+    - 已被后续结论吸收的中间结果不再回传
+  - shared root prefix for subagents
+    - 同一 CLI 下多 agent 尽量共享父级静态前缀
+    - 减少每个 agent 重复携带同一批系统/工具上下文
+  - responses-first unification
+    - 内核统一走 responses-first
+    - 避免 responses 和 chat 两套上下文表示各自膨胀
+  - prompt_cache_key stabilization
+    - cache key 尽量与 principal / generation 稳定绑定
+    - 不按每次请求生成全新随机 key
+  - lightweight healthy-stream path
+    - 健康账号不做重型 SSE 预检
+    - 既省 CPU，也减少为预检而做的额外事件解析和潜在重放
+- 当前具体如何省 token：
+  - 减少重复系统前缀
+  - 减少重复工具 schema
+  - 减少切号后的无效全历史 replay
+  - 提高同一 CLI 在同一账号上的缓存命中概率
+  - 把多 agent 的公共前缀尽量稳定化
+- 不允许采用的“伪优化”：
+  - 把 gpt-5.4 降成更便宜模型
+  - 把 high reasoning 改成 medium/low
+  - 把真实工具调用替换成假的缓存结果
+  - 用截断历史但丢失关键约束的方式硬省 token
+- 当前未完成的 token 验收：
+  - 还没有用真实 OpenAI cached_tokens 指标做线上统计
+  - 还没有完成切号前后 replay token 成本对比报表
+  - 还没有完成同 CLI 多 agent 的共享前缀命中率实测
+  - 还没有完成 prompt_cache_key 稳定性长期回归
+
+4.5 缓存算法设计
+
+- 详细设计见：
+  - docs/cache-design.md
+
+- 结论先行：
+  - 在你当前约束下，最强的缓存算法不是 semantic cache，也不是“多账号随便切再重传”。
+  - 当前最优实践是：
+    principal-sticky + generation-aware + prefix-cache-first + dual-candidate routing + dependency-frontier replay
+  - 这不是数学上全局最优，因为上游 provider 的 prompt cache 是黑箱，TTL、路由和 cache placement 都不可完全观测。
+  - 但在公开资料、论文结果和当前代码约束下，这是最强的工程化方案。
+
+4.5.1 缓存算法目标
+
+- 第一目标：
+  尽量让同一个 CLI、同一条任务链、同一批子 agent 的静态前缀保持稳定。
+- 第二目标：
+  在不牺牲单 CLI 粘连的前提下，提高 shared prefix 的命中概率。
+- 第三目标：
+  账号切换时尽量减少 replay token。
+- 第四目标：
+  不用语义缓存去替代真实推理结果，避免错误答案和工具副作用污染。
+
+4.5.2 缓存算法主体
+
+- Layer 1: Stable Prefix Packing
+  - 把最稳定、最高复用的内容固定在 prompt 前部：
+    - system rules
+    - tenant policy
+    - tool schema
+    - static workspace profile
+    - stable workflow spine
+  - 这是 cache 的主命中区。
+
+- Layer 2: Workflow Spine
+  - 把当前任务仍然有效的决策、目标、已知上下文摘要放在中间层。
+  - 只在任务状态真正变化时更新。
+  - 目标是让“任务骨架”比“每轮聊天文本”更稳定。
+
+- Layer 3: Live Tail
+  - 把最新轮次、最近工具结果、最后几条必要交互放在尾部。
+  - 这是最容易发生 cache break 的部分，所以必须压到最后。
+
+- Layer 4: Dependency-Frontier Replay
+  - 切号或切 generation 后，不重传全历史。
+  - 只重传当前未完成任务仍然依赖的最小上下文边界。
+  - 也就是：
+    - 保留仍被引用的工具结果
+    - 保留仍有效的决策
+    - 丢弃已经被后续总结吸收的中间输出
+
+- Layer 5: Shared Root Prefix for Subagents
+  - 同一 CLI 下的多 agent 不各自带一整份系统前缀。
+  - 共享 root prefix。
+  - 子 agent 只加自己的差异尾部。
+  - 这样能最大化同一个 principal 内的 cache 复用。
+
+- Layer 6: Sticky Placement
+  - 不把请求级别 round-robin 当调度。
+  - 把 principal 放在尽量稳定的账号上。
+  - 只有硬失败才切换。
+  - 这是 prompt cache 命中率能长期稳定的核心条件。
+
+- Layer 7: Dual-Candidate Cache-Aware Routing
+  - 用 dual-candidate HRW 先把 principal 映射到两个候选账号。
+  - 再结合 cache_affinity、headroom、health 做最终选择。
+  - 这样既保留粘连和 prefix locality，又避免热点过于极端。
+
+4.5.3 为什么不选其他“看起来更强”的缓存法
+
+- 不选 semantic answer cache：
+  - agent 工作流经常依赖外部工具、代码状态、网页状态、文件状态
+  - 语义相似不等于答案可复用
+  - 会把错误结果当成命中结果
+
+- 不选全历史缓存：
+  - 上下文越长，动态部分越多
+  - 越容易破坏 provider prefix cache
+  - 切号时 replay 成本会爆炸
+
+- 不选多账号并发乱切：
+  - 账号多次切换会直接破坏 prefix locality
+  - prompt cache 命中率会明显下降
+  - 同时还会加重 replay token 消耗
+
+4.5.4 真实依据
+
+- OpenAI Prompt Caching 官方依据：
+  - 官方说明 prompt caching 会缓存“longest previously computed prefix”
+  - 起点是 1024 tokens
+  - 之后按 128-token increments 增长
+  - 可以通过 usage.prompt_tokens_details.cached_tokens 观测命中
+  - cache 通常在 5-10 分钟不活跃后清理，最长不超过 1 小时
+  - 这直接支持：
+    - 静态前缀前置
+    - prompt_cache_key 稳定化
+    - principal 粘连
+    - 不要频繁重排系统块
+
+- Preble 论文依据：
+  - 论文指出分布式 serving 中，prompt sharing 需要和负载均衡联合优化
+  - Preble 的核心就是 co-optimize KV reuse 和 load balancing
+  - 论文在真实 workload 上报告：
+    - 1.5x 到 14.5x average latency 改善
+    - 2x 到 10x p99 latency 改善
+  - 这支持：
+    - cache-aware scheduling 不是可选项，而是主项
+    - 不能只做“纯均衡”
+
+- DualMap 论文依据：
+  - DualMap 的核心思想是双哈希映射 + 两候选选择
+  - 目标是在 cache affinity 和 load balancing 之间取得统一解
+  - 论文指出 same-prefix 请求应该更大概率落在同一实例
+  - 同时又能通过 power of two choices 避免严重热点
+  - 实验报告：
+    - 在相同 TTFT SLO 下，有效请求容量最高提升到 2.25x
+  - 这直接支持我们当前的：
+    - dual-candidate principal routing
+    - bounded remapping
+    - cache-aware + load-aware 组合评分
+
+- Don’t Break the Cache 论文依据：
+  - 这篇论文专门评估长链路 agent 任务中的 prompt caching
+  - 结论很关键：
+    - prompt caching 对 agent 任务确实有效
+    - 但 naive full-context caching 可能反而增加 latency
+    - 把动态内容放后面、排除动态工具结果，收益更稳定
+  - 文中报告：
+    - API cost 降低 41% 到 80%
+    - TTFT 改善 13% 到 31%
+  - 这直接支持我们当前的：
+    - dependency-frontier replay
+    - dynamic tool results 不全量重传
+    - stable prefix / live tail 分层
+
+- Helium 论文依据：
+  - 论文把 agentic workflow 看成跨调用的整体计划，而不是孤立请求
+  - 强调 overlapping prompts 和 intermediate results 的跨调用冗余
+  - 提出 workflow-aware proactive caching 和 cache-aware scheduling
+  - 报告最高 1.56x speedup
+  - 这支持：
+    - 我们不应只看单 request cache
+    - 应该把 principal / workflow / generation 作为缓存调度的基本单位
+
+- Ray Prefix-aware Routing 文档依据：
+  - 文档明确指出：
+    - shared prefix 多时，prefix-aware routing 能提升 cache locality
+    - 在负载平衡时优先走 prefix match
+    - 在负载不平衡时再退回 power-of-two-choices
+  - 这支持：
+    - 我们对健康账号和近配额账号做不同强度的缓存保护
+    - 调度不是只追求完美均衡，而是在均衡和 cache hit 之间做门控切换
+
+4.5.5 真实文章和论文列表
+
+- OpenAI, Prompt Caching in the API
+  - https://openai.com/index/api-prompt-caching/
+- Preble: Efficient Distributed Prompt Scheduling for LLM Serving
+  - https://arxiv.org/abs/2407.00023
+- DualMap: Enabling Both Cache Affinity and Load Balancing for Distributed LLM Serving
+  - https://arxiv.org/abs/2602.06502
+- Don't Break the Cache: An Evaluation of Prompt Caching for Long-Horizon Agentic Tasks
+  - https://arxiv.org/abs/2601.06007
+- Efficient LLM Serving for Agentic Workflows: A Data Systems Perspective
+  - https://arxiv.org/abs/2603.16104
+- Ray Prefix-aware routing docs
+  - https://docs.ray.io/en/latest/serve/llm/user-guides/prefix-aware-routing.html
+
+4.5.6 当前未完成的缓存验收
+
+- 还没有基于真实 OpenAI upstream 做 cached_tokens 长时间采样
+- 还没有对比：
+  - 单 CLI 单账号粘连 vs 普通轮询 的 cache hit 差异
+  - dependency-frontier replay vs 全历史 replay 的 token 成本差异
+  - shared-root subagent prefix vs 独立前缀 的 cache hit 差异
+- 还没有拿真实线上 workload 做：
+  - TTFT 改善统计
+  - replay token ratio 统计
+  - generation 切换前后缓存收益统计
+
+4.6 当前未完成的资源验收
+
+- 还没有在真实多用户高并发下完成：
+  - server RSS 压测
+  - stream 路径 CPU profile
+  - near-quota guard 开启前后资源对比
+  - browser-assist 常驻与任务运行时的资源曲线
+- 还没有在真实 Docker 容器运行态下完成：
+  - 五容器 memory baseline
+  - 五容器 CPU baseline
+  - Compose 启动后端到端资源统计
+- 因此当前资源策略已经实现，但资源指标的生产级实测验收还未完成
+
+5. 已完成验收
+
+- cargo test --workspace --quiet
+- npm run build:web
+- bash scripts/full_smoke.sh
+- bash scripts/cluster_smoke.sh
+- bash scripts/edge_smoke.sh
+
+6. 已覆盖的关键边界条件
+
+- 下游 CLI 发起 /v1/responses unary 请求，上游隐藏 quota failure，被拦截，不透传，自动切到健康账号。
+- 下游 CLI 发起 /v1/chat/completions unary 请求，上游隐藏 quota failure，被拦截，不透传，自动切到健康账号。
+- 下游 CLI 发起 /v1/responses SSE 请求，上游首批事件中出现 response.failed，被拦截，不透传，自动切到健康账号。
+- 没有备用账号时，不向下游返回额度不足原文，只返回通用 server_busy。
+- 上游偷偷返回错误模型，例如 openai-model 漂移，被拦截并切到健康账号。
+- account summary 已暴露：
+  - quotaHeadroom
+  - quotaHeadroom5h
+  - quotaHeadroom7d
+  - nearQuotaGuardEnabled
+
+7. 参考 Codex 后已纳入的识别信号
+
+- response.failed
+- error.code
+- error.type
+- rate_limit_exceeded
+- insufficient_quota
+- usage_limit_reached
+- openai-model
+- x-reasoning-included
+- X-Models-Etag
+- plan_type
+- resets_at
+
+8. 2026-04-07 实机验收更新
+
+- 已完成真实 OpenAI/Codex 线上账号首轮整链路验收：
+  - 2026-04-07 在新建 Docker 测试容器 `cmgrtest-helper` 内，使用从旧运行容器导出的真实可用凭证完成实测
+  - `/v1/models` 返回真实模型列表：
+    - `gpt-5.2`
+    - `gpt-5.3-codex`
+    - `gpt-5.4`
+  - `/v1/responses` 非流式真实成功，返回 `200`
+  - `/v1/chat/completions` 非流式真实成功，返回 `200`
+  - `/v1/responses` SSE 真实成功，收到：
+    - `response.created`
+    - `response.in_progress`
+    - `response.output_item.added`
+    - `response.output_text.delta`
+    - `response.completed`
+  - `/v1/chat/completions` SSE 真实成功，收到增量 chunk 和 `[DONE]`
+  - 真实上游返回版本化模型名，例如 `gpt-5.2-2025-12-11`，当前网关已兼容，不再误判为 model drift
+- 已完成真实 Docker 容器运行验收：
+  - 2026-04-07 在 WSL -> Ubuntu -> Docker 中新建测试容器 `cmgrtest-helper`
+  - 在该测试容器内驱动当前仓库 compose 启动新的五容器栈：
+    - `cmgrt-postgres`
+    - `cmgrt-redis`
+    - `cmgrt-browser-assist`
+    - `cmgrt-server`
+    - `cmgrt-web`
+  - `server` admin/data plane、Web SSR、browser-assist 健康检查均通过
+- 已完成首轮真实资源基线验收：
+  - 2026-04-07 五容器 `docker stats --no-stream` 已获取
+  - 一次实测基线：
+    - `cmgrt-postgres` 约 `50.23MiB`
+    - `cmgrt-redis` 约 `12.29MiB`
+    - `cmgrt-browser-assist` 约 `151.8MiB`
+    - `cmgrt-server` 约 `2.30MiB`
+    - `cmgrt-web` 约 `42.92MiB`
+  - 真实请求后再次采样，当前项目已拿到容器级资源统计
+- 已完成首轮真实 cache 指标观测：
+  - 2026-04-07 通过真实上游回包读取 `usage.input_tokens_details.cached_tokens`
+  - 同一 `prompt_cache_key` 连续两次样本均返回 `cached_tokens=0`
+  - 说明线上观测链路已打通，但还需要更长时间窗口样本
+
+9. 仍需长期或条件触发的验收
+
+- 真实 Cloudflare 线上验收仍待补完：
+  - 需要在真实 CF challenge 页面和真实风控环境中验证恢复策略
+  - 需要在真实 warp/direct 出口上完成 `direct -> warp -> cooldown -> recover`
+- 真实长期缓存与资源回归仍待补完：
+  - `cached_tokens` 长时间采样
+  - `principal-sticky vs round-robin` 量化对比
+  - `dependency-frontier replay vs full-history replay` 量化对比
+  - 多用户高并发 CPU / memory / latency 曲线
+  - quota 临界账号 5h / 7d guard 收益统计
+
+10. 当前结论
+
+- 当前仓库已经完成：
+  - 真实 Docker 运行态验收
+  - 真实 OpenAI/Codex 首轮整链路验收
+  - 真实五容器资源基线采样
+  - 真实 `cached_tokens` 观测链路打通
+- 当前剩余项已经收敛为两类：
+  - 需要真实 Cloudflare 风控条件触发的实网验收
+  - 需要更长时间窗口和更大流量样本的长期统计验收

@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "codex-manager.fullname" . }}-web
+  labels:
+    {{- include "codex-manager.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.web.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: web
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "codex-manager.labels" . | nindent 8 }}
+        app.kubernetes.io/component: web
+    spec:
+      containers:
+        - name: web
+          image: "{{ .Values.web.image.repository }}:{{ .Values.web.image.tag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          env:
+            - name: PORT
+              value: {{ .Values.web.service.port | quote }}
+            - name: SERVER_ADMIN_ORIGIN
+              value: "http://{{ include "codex-manager.fullname" . }}-server:{{ .Values.server.adminPort }}"
+          ports:
+            - containerPort: {{ .Values.web.service.port }}
+              name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "codex-manager.fullname" . }}-web
+  labels:
+    {{- include "codex-manager.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/component: web
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: {{ .Values.web.service.port }}
+      targetPort: http

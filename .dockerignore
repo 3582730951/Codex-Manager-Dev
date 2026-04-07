@@ -1,0 +1,10 @@
+node_modules
+target
+.next
+.git
+.env
+passwd.txt
+tmp
+dist
+coverage
+postgres-data

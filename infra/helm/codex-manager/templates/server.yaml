@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "codex-manager.fullname" . }}-server
+  labels:
+    {{- include "codex-manager.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.server.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: server
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "codex-manager.labels" . | nindent 8 }}
+        app.kubernetes.io/component: server
+    spec:
+      containers:
+        - name: server
+          image: "{{ .Values.server.image.repository }}:{{ .Values.server.image.tag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          env:
+            - name: CMGR_SERVER_BIND_ADDR
+              value: 0.0.0.0
+            - name: CMGR_SERVER_DATA_PORT
+              value: {{ .Values.server.dataPort | quote }}
+            - name: CMGR_SERVER_ADMIN_PORT
+              value: {{ .Values.server.adminPort | quote }}
+            - name: CMGR_POSTGRES_URL
+              value: "postgres://{{ .Values.postgres.username }}:{{ .Values.postgres.password }}@{{ include "codex-manager.fullname" . }}-postgres:5432/{{ .Values.postgres.database }}"
+            - name: CMGR_REDIS_URL
+              value: "redis://{{ include "codex-manager.fullname" . }}-redis:{{ .Values.redis.port }}"
+            - name: CMGR_REDIS_CHANNEL
+              value: {{ .Values.redisChannel | quote }}
+            - name: CMGR_BROWSER_ASSIST_URL
+              value: "http://{{ include "codex-manager.fullname" . }}-browser-assist:{{ .Values.browserAssist.port }}"
+            - name: CMGR_GATEWAY_HEARTBEAT_SECONDS
+              value: {{ .Values.server.heartbeatSeconds | quote }}
+            - name: CMGR_ENABLE_DEMO_SEED
+              value: {{ .Values.server.enableDemoSeed | quote }}
+            - name: CMGR_DIRECT_PROXY_URL
+              value: {{ .Values.server.directProxyUrl | quote }}
+            - name: CMGR_WARP_PROXY_URL
+              value: {{ .Values.server.warpProxyUrl | quote }}
+            - name: CMGR_BROWSER_ASSIST_DIRECT_PROXY_URL
+              value: {{ .Values.server.browserAssistDirectProxyUrl | quote }}
+            - name: CMGR_BROWSER_ASSIST_WARP_PROXY_URL
+              value: {{ .Values.server.browserAssistWarpProxyUrl | quote }}
+          ports:
+            - containerPort: {{ .Values.server.dataPort }}
+              name: data
+            - containerPort: {{ .Values.server.adminPort }}
+              name: admin
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "codex-manager.fullname" . }}-server
+  labels:
+    {{- include "codex-manager.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/component: server
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: data
+      port: {{ .Values.server.dataPort }}
+      targetPort: data
+    - name: admin
+      port: {{ .Values.server.adminPort }}
+      targetPort: admin

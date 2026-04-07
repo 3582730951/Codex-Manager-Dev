@@ -1,0 +1,26 @@
+services:
+  postgres:
+    network_mode: host
+    ports: []
+
+  redis:
+    network_mode: host
+    ports: []
+
+  browser-assist:
+    network_mode: host
+    ports: []
+
+  server:
+    network_mode: host
+    ports: []
+    environment:
+      CMGR_POSTGRES_URL: postgres://codex_manager:codex_manager@127.0.0.1:5432/codex_manager
+      CMGR_REDIS_URL: redis://127.0.0.1:6379
+      CMGR_BROWSER_ASSIST_URL: http://127.0.0.1:8090
+
+  web:
+    network_mode: host
+    ports: []
+    environment:
+      SERVER_ADMIN_ORIGIN: http://127.0.0.1:8081

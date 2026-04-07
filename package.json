@@ -1,0 +1,22 @@
+{
+  "name": "codex-manager-dev",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "services/browser-assist"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "build:web": "npm run build -w @codex-manager/web",
+    "browser-assist": "npm run dev -w @codex-manager/browser-assist",
+    "dev:web": "npm run dev -w @codex-manager/web",
+    "smoke:edge": "bash scripts/edge_smoke.sh",
+    "smoke:cluster": "bash scripts/cluster_smoke.sh",
+    "smoke:full": "bash scripts/full_smoke.sh",
+    "start:web": "npm run start -w @codex-manager/web",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  }
+}

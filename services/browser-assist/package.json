@@ -1,0 +1,13 @@
+{
+  "name": "@codex-manager/browser-assist",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server.mjs",
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.59.1"
+  }
+}

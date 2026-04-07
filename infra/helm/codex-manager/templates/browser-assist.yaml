@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "codex-manager.fullname" . }}-browser-assist
+  labels:
+    {{- include "codex-manager.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.browserAssist.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: browser-assist
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        {{- include "codex-manager.labels" . | nindent 8 }}
+        app.kubernetes.io/component: browser-assist
+    spec:
+      containers:
+        - name: browser-assist
+          image: "{{ .Values.browserAssist.image.repository }}:{{ .Values.browserAssist.image.tag }}"
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          env:
+            - name: PORT
+              value: {{ .Values.browserAssist.port | quote }}
+            - name: CMGR_BROWSER_ASSIST_IDLE_TTL_MS
+              value: {{ .Values.browserAssist.idleTtlMs | quote }}
+            - name: CMGR_BROWSER_ASSIST_CHROMIUM_PATH
+              value: {{ .Values.browserAssist.chromiumPath | quote }}
+            - name: CMGR_BROWSER_ASSIST_DIRECT_PROXY_URL
+              value: {{ .Values.browserAssist.directProxyUrl | quote }}
+            - name: CMGR_BROWSER_ASSIST_WARP_PROXY_URL
+              value: {{ .Values.browserAssist.warpProxyUrl | quote }}
+          ports:
+            - containerPort: {{ .Values.browserAssist.port }}
+              name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "codex-manager.fullname" . }}-browser-assist
+  labels:
+    {{- include "codex-manager.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/component: browser-assist
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: {{ .Values.browserAssist.port }}
+      targetPort: http
