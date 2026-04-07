@@ -24,11 +24,23 @@ function parseModels(raw: string | undefined) {
   return models.length > 0 ? models : defaultModels;
 }
 
+function resolveWebOrigin(request: NextRequest) {
+  const forwardedProto = request.headers.get("x-forwarded-proto");
+  const forwardedHost =
+    request.headers.get("x-forwarded-host") ?? request.headers.get("host");
+
+  if (forwardedHost) {
+    return `${forwardedProto ?? "http"}://${forwardedHost}`;
+  }
+
+  return request.nextUrl.origin;
+}
+
 export async function GET(request: NextRequest) {
   const { searchParams } = request.nextUrl;
   const redirectUri =
     readOptional(searchParams, "redirectUri") ??
-    `${request.nextUrl.origin}/oauth/callback`;
+    `${resolveWebOrigin(request)}/oauth/callback`;
 
   try {
     const result = await startOpenAiLogin({
