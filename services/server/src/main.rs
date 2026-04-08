@@ -4,6 +4,8 @@ mod config;
 mod http;
 mod models;
 mod openai_auth;
+mod pricing;
+mod reasoning;
 mod scheduler;
 mod state;
 mod storage;

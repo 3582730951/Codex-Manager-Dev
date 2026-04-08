@@ -155,6 +155,55 @@ impl UpstreamClient {
         })
     }
 
+    pub async fn list_models(
+        &self,
+        credential: &UpstreamCredential,
+        route_mode: RouteMode,
+    ) -> Result<Vec<String>, String> {
+        let url = endpoint_url(&credential.base_url, "v1/models");
+        let mut request = self
+            .client_for_route_mode(route_mode)
+            .get(url)
+            .bearer_auth(&credential.bearer_token);
+
+        if let Some(account_id) = credential.chatgpt_account_id.as_deref() {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        for (name, value) in &credential.extra_headers {
+            request = request.header(name, value);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|error| format!("upstream model catalog request failed: {error}"))?;
+        let status = response.status();
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| format!("invalid upstream model catalog payload: {error}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "upstream model catalog returned {}: {}",
+                status,
+                value
+            ));
+        }
+
+        let items = value
+            .get("data")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("id").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(items)
+    }
+
     fn client_for_route_mode(&self, route_mode: RouteMode) -> &Client {
         match route_mode {
             RouteMode::Direct => self.direct_client.as_ref().unwrap_or(&self.default_client),

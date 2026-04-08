@@ -11,13 +11,16 @@ use uuid::Uuid;
 
 use crate::models::{
     AccountRouteState, AccountSummary, CacheMetrics, CfIncident, CliLease, ContextTurn,
-    ConversationContext, CreateGatewayApiKeyRequest, CreateTenantRequest, CreatedGatewayApiKey,
-    DashboardCounts, DashboardSnapshot, EgressSlot, GatewayApiKey, GatewayApiKeyView,
-    ImportAccountRequest, LeaseSelectionRequest, OpenAiLoginCompleteRequest,
-    OpenAiLoginSessionView, OpenAiLoginStartRequest, OpenAiLoginStartResponse, RouteEventRequest,
-    RouteMode, SchedulingSignals, Tenant, TopologyNode, UpstreamAccount, UpstreamCredential,
+    ConversationContext, CreateGatewayApiKeyRequest, CreateGatewayUserRequest,
+    CreateTenantRequest, CreatedGatewayApiKey, CreatedGatewayUser, DashboardCounts,
+    DashboardSnapshot, EgressSlot, GatewayApiKey, GatewayApiKeyView, GatewayUserRole,
+    GatewayUserView, ImportAccountRequest, LeaseSelectionRequest, OpenAiLoginCompleteRequest,
+    OpenAiLoginSessionView, OpenAiLoginStartRequest, OpenAiLoginStartResponse, RequestLogEntry,
+    RouteEventRequest, RouteMode, SchedulingSignals, Tenant, TopologyNode,
+    UpdateGatewayUserRequest, UpstreamAccount, UpstreamCredential, BillingSummary,
 };
 use crate::openai_auth;
+use crate::reasoning::normalize_reasoning_effort;
 use crate::scheduler::cf_state::{
     is_in_cooldown, reconcile_route_mode, register_cf_hit, register_success,
 };
@@ -27,6 +30,12 @@ use crate::scheduler::token_optimizer::{WarmupDecision, evaluate_prefix_warmup};
 use crate::storage::{Persistence, PersistenceMessage, PersistenceSnapshot};
 use crate::upstream::UpstreamClient;
 use crate::{browser_assist, bus, config::Config};
+
+#[derive(Debug, Clone)]
+pub struct GatewayAuthContext {
+    pub tenant: Tenant,
+    pub api_key: GatewayApiKey,
+}
 
 #[derive(Debug, Clone)]
 struct OpenAiLoginSessionState {
@@ -77,6 +86,7 @@ pub struct RuntimeState {
     pub cf_incidents: RwLock<Vec<CfIncident>>,
     pub cache_metrics: RwLock<CacheMetrics>,
     pub conversation_contexts: RwLock<HashMap<String, ConversationContext>>,
+    pub request_logs: RwLock<Vec<RequestLogEntry>>,
     openai_login_sessions: RwLock<HashMap<String, OpenAiLoginSessionState>>,
 }
 
@@ -164,6 +174,7 @@ impl AppState {
             cf_incidents,
             cache_metrics,
             conversation_contexts,
+            request_logs,
         } = snapshot;
 
         {
@@ -218,6 +229,10 @@ impl AppState {
             for context in conversation_contexts {
                 contexts.insert(context.principal_id.clone(), context);
             }
+        }
+        {
+            let mut logs = self.runtime.request_logs.write().await;
+            *logs = request_logs;
         }
         if let Some(metrics) = cache_metrics {
             *self.runtime.cache_metrics.write().await = metrics;
@@ -316,6 +331,13 @@ impl AppState {
                 .map(PersistenceMessage::ConversationContextUpsert),
         );
 
+        let request_logs = self.runtime.request_logs.read().await.clone();
+        batch.extend(
+            request_logs
+                .into_iter()
+                .map(PersistenceMessage::RequestLogInsert),
+        );
+
         batch.push(PersistenceMessage::CacheMetricsUpsert(
             self.runtime.cache_metrics.read().await.clone(),
         ));
@@ -340,8 +362,15 @@ impl AppState {
                 id: Uuid::new_v4(),
                 tenant_id: tenant.id,
                 name: "Demo Gateway Key".to_string(),
+                email: "demo@codex.local".to_string(),
+                role: GatewayUserRole::Admin,
                 token: "cmgr_demo_key".to_string(),
+                default_model: Some("gpt-5.4".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                force_model_override: false,
+                force_reasoning_effort: false,
                 created_at: Utc::now(),
+                updated_at: Utc::now(),
             },
         );
 
@@ -489,6 +518,10 @@ impl AppState {
         let cf_incidents = self.runtime.cf_incidents.read().await.clone();
         let cache_metrics = self.runtime.cache_metrics.read().await.clone();
         let account_summaries = self.account_summaries().await;
+        let request_logs = self.list_request_logs().await;
+        let billing = self.billing_summary(&request_logs);
+        let users = self.gateway_user_views(&request_logs).await;
+        let model_catalog = build_model_catalog(&account_summaries);
         DashboardSnapshot {
             title: "Codex Manager 2.0".to_string(),
             subtitle:
@@ -525,9 +558,14 @@ impl AppState {
             leases: leases.clone(),
             cf_incidents,
             browser_tasks: Vec::new(),
+            users: users.clone(),
+            request_logs,
+            billing,
+            model_catalog,
             counts: DashboardCounts {
                 tenants: tenants.len(),
                 accounts: accounts.len(),
+                users: users.len(),
                 active_leases: leases.len(),
                 warp_accounts: route_states
                     .iter()
@@ -629,10 +667,26 @@ impl AppState {
                 id: api_key.id,
                 tenant_id: api_key.tenant_id,
                 name: api_key.name,
+                email: api_key.email,
+                role: api_key.role,
                 token_preview: mask_token(&api_key.token),
+                default_model: api_key.default_model,
+                reasoning_effort: api_key.reasoning_effort,
+                force_model_override: api_key.force_model_override,
+                force_reasoning_effort: api_key.force_reasoning_effort,
                 created_at: api_key.created_at,
+                updated_at: api_key.updated_at,
             })
             .collect()
+    }
+
+    pub async fn list_request_logs(&self) -> Vec<RequestLogEntry> {
+        self.runtime.request_logs.read().await.clone()
+    }
+
+    pub async fn list_gateway_users(&self) -> Vec<GatewayUserView> {
+        let logs = self.list_request_logs().await;
+        self.gateway_user_views(&logs).await
     }
 
     pub async fn create_tenant(&self, request: CreateTenantRequest) -> Tenant {
@@ -705,6 +759,10 @@ impl AppState {
         Ok(self.ensure_default_tenant().await)
     }
 
+    async fn resolve_gateway_user_tenant(&self, requested: Option<Uuid>) -> Result<Uuid, String> {
+        self.resolve_openai_login_tenant(requested).await
+    }
+
     pub async fn create_api_key(
         &self,
         request: CreateGatewayApiKeyRequest,
@@ -723,8 +781,15 @@ impl AppState {
             id: Uuid::new_v4(),
             tenant_id: request.tenant_id,
             name: request.name,
+            email: String::new(),
+            role: GatewayUserRole::Viewer,
             token: format!("cmgr_{}", Uuid::new_v4().simple()),
+            default_model: None,
+            reasoning_effort: None,
+            force_model_override: false,
+            force_reasoning_effort: false,
             created_at: Utc::now(),
+            updated_at: Utc::now(),
         };
         self.runtime
             .api_keys
@@ -737,9 +802,159 @@ impl AppState {
             id: api_key.id,
             tenant_id: api_key.tenant_id,
             name: api_key.name,
+            email: api_key.email,
+            role: api_key.role,
             token: api_key.token,
+            default_model: api_key.default_model,
+            reasoning_effort: api_key.reasoning_effort,
+            force_model_override: api_key.force_model_override,
+            force_reasoning_effort: api_key.force_reasoning_effort,
             created_at: api_key.created_at,
+            updated_at: api_key.updated_at,
         })
+    }
+
+    pub async fn create_gateway_user(
+        &self,
+        request: CreateGatewayUserRequest,
+    ) -> Result<CreatedGatewayUser, String> {
+        let tenant_id = self.resolve_gateway_user_tenant(request.tenant_id).await?;
+        let name = request.name.trim().to_string();
+        let email = request.email.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            return Err("用户名不能为空。".to_string());
+        }
+        if email.is_empty() {
+            return Err("邮箱不能为空。".to_string());
+        }
+        if !email.contains('@') {
+            return Err("邮箱格式无效。".to_string());
+        }
+
+        {
+            let exists = self.runtime.api_keys.read().await.values().any(|api_key| {
+                api_key.email.eq_ignore_ascii_case(&email) && api_key.tenant_id == tenant_id
+            });
+            if exists {
+                return Err("该邮箱已经存在。".to_string());
+            }
+        }
+
+        let now = Utc::now();
+        let api_key = GatewayApiKey {
+            id: Uuid::new_v4(),
+            tenant_id,
+            name,
+            email,
+            role: request.role,
+            token: format!("cmgr_{}", Uuid::new_v4().simple()),
+            default_model: request
+                .default_model
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            reasoning_effort: normalize_reasoning_effort(request.reasoning_effort.as_deref()),
+            force_model_override: request.force_model_override.unwrap_or(false),
+            force_reasoning_effort: request.force_reasoning_effort.unwrap_or(false),
+            created_at: now,
+            updated_at: now,
+        };
+
+        self.runtime
+            .api_keys
+            .write()
+            .await
+            .insert(api_key.token.clone(), api_key.clone());
+        self.enqueue(PersistenceMessage::ApiKeyUpsert(api_key.clone()))
+            .await;
+
+        let logs = self.list_request_logs().await;
+        let user = self
+            .gateway_user_views(&logs)
+            .await
+            .into_iter()
+            .find(|item| item.id == api_key.id)
+            .unwrap_or_else(|| gateway_user_view(&api_key, 0, 0.0, None));
+
+        Ok(CreatedGatewayUser {
+            user,
+            token: api_key.token,
+        })
+    }
+
+    pub async fn update_gateway_user(
+        &self,
+        user_id: Uuid,
+        request: UpdateGatewayUserRequest,
+    ) -> Result<GatewayUserView, String> {
+        let duplicate_email = request
+            .email
+            .as_ref()
+            .map(|value| value.trim().to_ascii_lowercase());
+        if let Some(email) = duplicate_email.as_deref() {
+            if email.is_empty() || !email.contains('@') {
+                return Err("邮箱格式无效。".to_string());
+            }
+            let api_keys = self.runtime.api_keys.read().await;
+            let Some(current) = api_keys.values().find(|api_key| api_key.id == user_id) else {
+                return Err("用户不存在。".to_string());
+            };
+            let duplicate = api_keys.values().any(|api_key| {
+                api_key.id != user_id
+                    && api_key.tenant_id == current.tenant_id
+                    && api_key.email.eq_ignore_ascii_case(email)
+            });
+            if duplicate {
+                return Err("该邮箱已经存在。".to_string());
+            }
+        }
+
+        let updated = {
+            let mut api_keys = self.runtime.api_keys.write().await;
+            let Some(existing) = api_keys.values_mut().find(|api_key| api_key.id == user_id)
+            else {
+                return Err("用户不存在。".to_string());
+            };
+
+            if let Some(name) = request.name {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return Err("用户名不能为空。".to_string());
+                }
+                existing.name = name;
+            }
+            if let Some(email) = duplicate_email {
+                existing.email = email;
+            }
+            if let Some(role) = request.role {
+                existing.role = role;
+            }
+            if let Some(default_model) = request.default_model {
+                existing.default_model = Some(default_model.trim().to_string())
+                    .filter(|value| !value.is_empty());
+            }
+            if request.reasoning_effort.is_some() {
+                existing.reasoning_effort =
+                    normalize_reasoning_effort(request.reasoning_effort.as_deref());
+            }
+            if let Some(force_model_override) = request.force_model_override {
+                existing.force_model_override = force_model_override;
+            }
+            if let Some(force_reasoning_effort) = request.force_reasoning_effort {
+                existing.force_reasoning_effort = force_reasoning_effort;
+            }
+            existing.updated_at = Utc::now();
+            existing.clone()
+        };
+
+        self.enqueue(PersistenceMessage::ApiKeyUpsert(updated.clone()))
+            .await;
+
+        let logs = self.list_request_logs().await;
+        self.gateway_user_views(&logs)
+            .await
+            .into_iter()
+            .find(|item| item.id == updated.id)
+            .ok_or_else(|| "用户不存在。".to_string())
     }
 
     pub async fn start_openai_login(
@@ -983,15 +1198,155 @@ impl AppState {
             .is_some_and(|account| account.signals.near_quota_guard_enabled())
     }
 
-    pub async fn tenant_for_bearer(&self, bearer_token: &str) -> Option<Tenant> {
-        let tenant_id = self
+    pub async fn auth_context_for_bearer(&self, bearer_token: &str) -> Option<GatewayAuthContext> {
+        let api_key = self
             .runtime
             .api_keys
             .read()
             .await
             .get(bearer_token)
-            .map(|api_key| api_key.tenant_id)?;
-        self.runtime.tenants.read().await.get(&tenant_id).cloned()
+            .cloned()?;
+        let tenant = self
+            .runtime
+            .tenants
+            .read()
+            .await
+            .get(&api_key.tenant_id)
+            .cloned()?;
+        Some(GatewayAuthContext { tenant, api_key })
+    }
+
+    pub async fn tenant_for_bearer(&self, bearer_token: &str) -> Option<Tenant> {
+        self.auth_context_for_bearer(bearer_token)
+            .await
+            .map(|context| context.tenant)
+    }
+
+    pub async fn refresh_account_models(&self) -> Result<Vec<AccountSummary>, String> {
+        let accounts = self
+            .runtime
+            .accounts
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let credentials = self.runtime.credentials.read().await.clone();
+        let mut updates = Vec::new();
+
+        for account in accounts {
+            let Some(credential) = credentials.get(account.id.as_str()).cloned() else {
+                continue;
+            };
+            match self.upstream.list_models(&credential, account.current_mode).await {
+                Ok(models) if !models.is_empty() => {
+                    let mut normalized = models
+                        .into_iter()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .collect::<Vec<_>>();
+                    normalized.sort();
+                    normalized.dedup();
+                    if normalized != account.models {
+                        updates.push((account.id.clone(), normalized));
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(account_id = %account.id, %error, "failed to refresh upstream model catalog");
+                }
+            }
+        }
+
+        if !updates.is_empty() {
+            let snapshots = {
+                let mut accounts = self.runtime.accounts.write().await;
+                let mut snapshots = Vec::new();
+                for (account_id, models) in updates {
+                    if let Some(account) = accounts.get_mut(account_id.as_str()) {
+                        account.models = models;
+                        snapshots.push(account.clone());
+                    }
+                }
+                snapshots
+            };
+            self.enqueue_many(
+                snapshots
+                    .into_iter()
+                    .map(PersistenceMessage::AccountUpsert)
+                    .collect(),
+            )
+            .await;
+        }
+
+        Ok(self.account_summaries().await)
+    }
+
+    pub async fn record_request_log(&self, entry: RequestLogEntry) {
+        {
+            let mut logs = self.runtime.request_logs.write().await;
+            logs.insert(0, entry.clone());
+            logs.truncate(512);
+        }
+        self.enqueue(PersistenceMessage::RequestLogInsert(entry)).await;
+    }
+
+    fn billing_summary(&self, logs: &[RequestLogEntry]) -> BillingSummary {
+        logs.iter().fold(
+            BillingSummary {
+                total_spend_usd: 0.0,
+                total_requests: logs.len(),
+                total_input_tokens: 0,
+                total_cached_input_tokens: 0,
+                total_output_tokens: 0,
+                total_tokens: 0,
+                priced_requests: 0,
+            },
+            |mut summary, log| {
+                summary.total_input_tokens += log.usage.input_tokens;
+                summary.total_cached_input_tokens += log.usage.cached_input_tokens;
+                summary.total_output_tokens += log.usage.output_tokens;
+                summary.total_tokens += log.usage.total_tokens;
+                if let Some(cost) = log.estimated_cost_usd {
+                    summary.total_spend_usd += cost;
+                    summary.priced_requests += 1;
+                }
+                summary
+            },
+        )
+    }
+
+    async fn gateway_user_views(&self, logs: &[RequestLogEntry]) -> Vec<GatewayUserView> {
+        let mut api_keys = self
+            .runtime
+            .api_keys
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        api_keys.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+
+        api_keys
+            .into_iter()
+            .map(|api_key| {
+                let request_count = logs
+                    .iter()
+                    .filter(|log| log.api_key_id == api_key.id)
+                    .count();
+                let estimated_spend_usd = logs
+                    .iter()
+                    .filter(|log| log.api_key_id == api_key.id)
+                    .filter_map(|log| log.estimated_cost_usd)
+                    .sum::<f64>();
+                let last_used_at = logs
+                    .iter()
+                    .filter(|log| log.api_key_id == api_key.id)
+                    .map(|log| log.created_at)
+                    .max();
+                gateway_user_view(&api_key, request_count, estimated_spend_usd, last_used_at)
+            })
+            .collect()
     }
 
     pub async fn record_route_event(
@@ -1608,6 +1963,41 @@ impl AppState {
             RouteMode::Warp => self.config.warp_proxy_url.is_some(),
         }
     }
+}
+
+fn gateway_user_view(
+    api_key: &GatewayApiKey,
+    request_count: usize,
+    estimated_spend_usd: f64,
+    last_used_at: Option<chrono::DateTime<Utc>>,
+) -> GatewayUserView {
+    GatewayUserView {
+        id: api_key.id,
+        tenant_id: api_key.tenant_id,
+        name: api_key.name.clone(),
+        email: api_key.email.clone(),
+        role: api_key.role,
+        token_preview: mask_token(&api_key.token),
+        default_model: api_key.default_model.clone(),
+        reasoning_effort: api_key.reasoning_effort.clone(),
+        force_model_override: api_key.force_model_override,
+        force_reasoning_effort: api_key.force_reasoning_effort,
+        request_count,
+        estimated_spend_usd,
+        last_used_at,
+        created_at: api_key.created_at,
+        updated_at: api_key.updated_at,
+    }
+}
+
+fn build_model_catalog(accounts: &[AccountSummary]) -> Vec<String> {
+    let mut models = accounts
+        .iter()
+        .flat_map(|account| account.models.clone())
+        .collect::<Vec<_>>();
+    models.sort();
+    models.dedup();
+    models
 }
 
 fn spawn_persistence_writer(

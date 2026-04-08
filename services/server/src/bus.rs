@@ -10,7 +10,7 @@ use crate::{
     config::Config,
     models::{
         AccountRouteState, CacheMetrics, CfIncident, CliLease, ConversationContext, GatewayApiKey,
-        Tenant, UpstreamAccount, UpstreamCredential,
+        RequestLogEntry, Tenant, UpstreamAccount, UpstreamCredential,
     },
     state::RuntimeState,
     storage::PersistenceMessage,
@@ -130,6 +130,7 @@ async fn apply_message(runtime: &Arc<RuntimeState>, message: PersistenceMessage)
         PersistenceMessage::CacheMetricsUpsert(metrics) => {
             replace_cache_metrics(runtime, metrics).await
         }
+        PersistenceMessage::RequestLogInsert(log) => insert_request_log(runtime, log).await,
     }
 }
 
@@ -210,6 +211,15 @@ async fn upsert_conversation_context(runtime: &Arc<RuntimeState>, context: Conve
         .write()
         .await
         .insert(context.principal_id.clone(), context);
+}
+
+async fn insert_request_log(runtime: &Arc<RuntimeState>, log: RequestLogEntry) {
+    let mut logs = runtime.request_logs.write().await;
+    if logs.iter().any(|existing| existing.id == log.id) {
+        return;
+    }
+    logs.insert(0, log);
+    logs.truncate(512);
 }
 
 #[cfg(test)]

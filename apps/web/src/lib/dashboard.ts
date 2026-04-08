@@ -1,5 +1,7 @@
 import {
   dashboardFallback,
+  type GatewayUserRole,
+  type GatewayUserView,
   type BrowserTask,
   type DashboardSnapshot
 } from "@codex-manager/contracts";
@@ -50,6 +52,11 @@ export interface OpenAiLoginSession {
   importedAccountLabel: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface CreatedGatewayUser {
+  user: GatewayUserView;
+  token: string;
 }
 
 const healthFallback: AdminHealthSnapshot = {
@@ -141,6 +148,50 @@ export async function createTenant(payload: {
   return fetchAdmin<TenantView>("/api/v1/tenants", {
     method: "POST",
     body: JSON.stringify(payload)
+  });
+}
+
+export async function listUsers() {
+  return fetchAdmin<GatewayUserView[]>("/api/v1/users");
+}
+
+export async function createUser(payload: {
+  tenantId?: string;
+  name: string;
+  email: string;
+  role: GatewayUserRole;
+  defaultModel?: string | null;
+  reasoningEffort?: string | null;
+  forceModelOverride?: boolean;
+  forceReasoningEffort?: boolean;
+}) {
+  return fetchAdmin<CreatedGatewayUser>("/api/v1/users", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function updateUser(
+  userId: string,
+  payload: {
+    name?: string;
+    email?: string;
+    role?: GatewayUserRole;
+    defaultModel?: string | null;
+    reasoningEffort?: string | null;
+    forceModelOverride?: boolean;
+    forceReasoningEffort?: boolean;
+  }
+) {
+  return fetchAdmin<GatewayUserView>(`/api/v1/users/${userId}`, {
+    method: "PUT",
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function refreshAccountModels() {
+  return fetchAdmin<DashboardSnapshot["accounts"]>("/api/v1/accounts/models/refresh", {
+    method: "POST"
   });
 }
 

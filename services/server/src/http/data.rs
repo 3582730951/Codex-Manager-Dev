@@ -13,20 +13,52 @@ use axum::{
     routing::{get, post},
 };
 use chrono::Utc;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::{
     models::{
-        ChatCompletionsRequest, ChatMessage, CliLease, LeaseSelectionRequest, ResponsesRequest,
-        RouteEventRequest,
+        ChatCompletionsRequest, ChatMessage, CliLease, GatewayApiKey, LeaseSelectionRequest,
+        RequestLogEntry, RequestLogUsage, ResponsesRequest, RouteEventRequest,
     },
-    state::AppState,
+    state::{AppState, GatewayAuthContext},
     upstream::{ForwardContext, UpstreamFailureKind, classify_failure_body},
 };
 
+#[derive(Debug)]
+struct ForwardSuccess {
+    response: Response<Body>,
+    output_summary: Option<String>,
+    usage: RequestLogUsage,
+    observed_model: Option<String>,
+}
+
+impl Default for ForwardSuccess {
+    fn default() -> Self {
+        Self {
+            response: Response::new(Body::empty()),
+            output_summary: None,
+            usage: RequestLogUsage::default(),
+            observed_model: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RequestLogSeed {
+    api_key: GatewayApiKey,
+    tenant_id: Uuid,
+    principal_id: String,
+    endpoint: &'static str,
+    method: &'static str,
+    requested_model: String,
+    effective_model: String,
+    reasoning_effort: Option<String>,
+}
+
 enum ForwardOutcome {
-    Response(Response<Body>, Option<String>),
+    Response(ForwardSuccess),
     HiddenFailure(UpstreamFailureKind),
 }
 
@@ -47,12 +79,12 @@ async fn health() -> Json<Value> {
 }
 
 async fn models(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    match authenticated_tenant(&state, &headers).await {
-        Some(tenant) => {
+    match authenticated_context(&state, &headers).await {
+        Some(context) => {
             let accounts = state.runtime.accounts.read().await;
             let mut items = accounts
                 .values()
-                .filter(|account| account.tenant_id == tenant.id)
+                .filter(|account| account.tenant_id == context.tenant.id)
                 .flat_map(|account| account.models.clone())
                 .collect::<Vec<_>>();
             items.sort();
@@ -72,18 +104,33 @@ async fn responses(
     headers: HeaderMap,
     Json(payload): Json<ResponsesRequest>,
 ) -> Response<Body> {
-    let Some(tenant) = authenticated_tenant(&state, &headers).await else {
+    let Some(auth) = authenticated_context(&state, &headers).await else {
         return unauthorized().into_response();
     };
-    let principal_id = derive_principal_id(&headers, tenant.slug.as_str());
+    let principal_id = derive_principal_id(&headers, auth.tenant.slug.as_str());
     let subagent_count = headers.get("x-openai-subagent").map(|_| 1_u32).unwrap_or(0);
+    let requested_model = payload.model.clone();
+    let effective_model = resolve_effective_model(&auth.api_key, &requested_model);
+    let effective_reasoning_effort =
+        resolve_effective_reasoning_for_responses(&auth.api_key, &payload);
+    let payload = apply_responses_policy(&payload, &effective_model, effective_reasoning_effort.as_deref());
     let model = payload.model.clone();
     let input_summary = summarize_value(&payload.input);
+    let request_log = RequestLogSeed {
+        api_key: auth.api_key.clone(),
+        tenant_id: auth.tenant.id,
+        principal_id: principal_id.clone(),
+        endpoint: "/v1/responses",
+        method: "POST",
+        requested_model,
+        effective_model: model.clone(),
+        reasoning_effort: effective_reasoning_effort.clone(),
+    };
     let selection_request = LeaseSelectionRequest {
-        tenant_id: tenant.id,
+        tenant_id: auth.tenant.id,
         principal_id: principal_id.clone(),
         model: model.clone(),
-        reasoning_effort: None,
+        reasoning_effort: effective_reasoning_effort.clone(),
         subagent_count,
     };
     let mut selection = state.resolve_lease(selection_request.clone()).await;
@@ -154,6 +201,7 @@ async fn responses(
                             response,
                             state.clone(),
                             lease.clone(),
+                            request_log.clone(),
                             principal_id.clone(),
                             &model,
                             state.config.heartbeat_seconds,
@@ -164,11 +212,12 @@ async fn responses(
                             response,
                             state.clone(),
                             lease.clone(),
+                            request_log.clone(),
                             principal_id.clone(),
                             &model,
                         )
                     } {
-                        ForwardOutcome::Response(response, _) => return response,
+                        ForwardOutcome::Response(success) => return success.response,
                         ForwardOutcome::HiddenFailure(kind) => {
                             handle_hidden_failure(&state, &lease, kind).await;
                             if attempt == 0 && kind.requires_failover() {
@@ -187,7 +236,7 @@ async fn responses(
                 } else {
                     upstream_json_response(response, &model).await
                 } {
-                    ForwardOutcome::Response(response, output_summary) => {
+                    ForwardOutcome::Response(success) => {
                         let _ = state
                             .record_route_event(
                                 &lease.account_id,
@@ -197,12 +246,21 @@ async fn responses(
                                 },
                             )
                             .await;
-                        if let Some(output_summary) = output_summary {
+                        if let Some(output_summary) = success.output_summary {
                             state
                                 .record_context_output(&principal_id, output_summary)
                                 .await;
                         }
-                        return response;
+                        state
+                            .record_request_log(build_request_log_entry(
+                                &request_log,
+                                &lease,
+                                success.response.status().as_u16(),
+                                success.usage,
+                                success.observed_model,
+                            ))
+                            .await;
+                        return success.response;
                     }
                     ForwardOutcome::HiddenFailure(kind) => {
                         handle_hidden_failure(&state, &lease, kind).await;
@@ -241,15 +299,30 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(payload): Json<ChatCompletionsRequest>,
 ) -> Response<Body> {
-    let Some(tenant) = authenticated_tenant(&state, &headers).await else {
+    let Some(auth) = authenticated_context(&state, &headers).await else {
         return unauthorized().into_response();
     };
-    let principal_id = derive_principal_id(&headers, tenant.slug.as_str());
+    let principal_id = derive_principal_id(&headers, auth.tenant.slug.as_str());
     let subagent_count = headers.get("x-openai-subagent").map(|_| 1_u32).unwrap_or(0);
+    let requested_model = payload.model.clone();
+    let effective_model = resolve_effective_model(&auth.api_key, &requested_model);
+    let effective_reasoning_effort =
+        resolve_effective_reasoning_for_chat(&auth.api_key, &payload);
+    let payload = apply_chat_policy(&payload, &effective_model, effective_reasoning_effort.as_deref());
     let model = payload.model.clone();
     let message_summary = summarize_messages(&payload.messages);
+    let request_log = RequestLogSeed {
+        api_key: auth.api_key.clone(),
+        tenant_id: auth.tenant.id,
+        principal_id: principal_id.clone(),
+        endpoint: "/v1/chat/completions",
+        method: "POST",
+        requested_model,
+        effective_model: model.clone(),
+        reasoning_effort: effective_reasoning_effort.clone(),
+    };
     let selection_request = LeaseSelectionRequest {
-        tenant_id: tenant.id,
+        tenant_id: auth.tenant.id,
         principal_id: principal_id.clone(),
         model: model.clone(),
         reasoning_effort: payload.reasoning_effort.clone(),
@@ -331,6 +404,7 @@ async fn chat_completions(
                         response,
                         state.clone(),
                         lease.clone(),
+                        request_log.clone(),
                         principal_id.clone(),
                         &payload.model,
                         near_quota_guard,
@@ -338,7 +412,7 @@ async fn chat_completions(
                     )
                     .await
                     {
-                        ForwardOutcome::Response(response, _) => return response,
+                        ForwardOutcome::Response(success) => return success.response,
                         ForwardOutcome::HiddenFailure(kind) => {
                             handle_hidden_failure(&state, &lease, kind).await;
                             if attempt == 0 && kind.requires_failover() {
@@ -358,7 +432,7 @@ async fn chat_completions(
                 } else {
                     upstream_responses_json_to_chat_response(response, &payload.model).await
                 } {
-                    ForwardOutcome::Response(response, output_summary) => {
+                    ForwardOutcome::Response(success) => {
                         let _ = state
                             .record_route_event(
                                 &lease.account_id,
@@ -368,12 +442,21 @@ async fn chat_completions(
                                 },
                             )
                             .await;
-                        if let Some(output_summary) = output_summary {
+                        if let Some(output_summary) = success.output_summary {
                             state
                                 .record_context_output(&principal_id, output_summary)
                                 .await;
                         }
-                        return response;
+                        state
+                            .record_request_log(build_request_log_entry(
+                                &request_log,
+                                &lease,
+                                success.response.status().as_u16(),
+                                success.usage,
+                                success.observed_model,
+                            ))
+                            .await;
+                        return success.response;
                     }
                     ForwardOutcome::HiddenFailure(kind) => {
                         handle_hidden_failure(&state, &lease, kind).await;
@@ -419,16 +502,169 @@ async fn chat_completions(
     )
 }
 
-async fn authenticated_tenant(
+async fn authenticated_context(
     state: &AppState,
     headers: &HeaderMap,
-) -> Option<crate::models::Tenant> {
+) -> Option<GatewayAuthContext> {
     let auth = headers
         .get(axum::http::header::AUTHORIZATION)?
         .to_str()
         .ok()?;
     let token = auth.strip_prefix("Bearer ")?;
-    state.tenant_for_bearer(token).await
+    state.auth_context_for_bearer(token).await
+}
+
+fn resolve_effective_model(api_key: &GatewayApiKey, requested_model: &str) -> String {
+    if api_key.force_model_override {
+        api_key
+            .default_model
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| requested_model.to_string())
+    } else {
+        requested_model.to_string()
+    }
+}
+
+fn resolve_effective_reasoning_for_chat(
+    api_key: &GatewayApiKey,
+    payload: &ChatCompletionsRequest,
+) -> Option<String> {
+    if api_key.force_reasoning_effort {
+        return api_key.reasoning_effort.clone();
+    }
+    payload.reasoning_effort.clone()
+}
+
+fn resolve_effective_reasoning_for_responses(
+    api_key: &GatewayApiKey,
+    payload: &ResponsesRequest,
+) -> Option<String> {
+    if api_key.force_reasoning_effort {
+        return api_key.reasoning_effort.clone();
+    }
+    payload
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn apply_chat_policy(
+    payload: &ChatCompletionsRequest,
+    effective_model: &str,
+    reasoning_effort: Option<&str>,
+) -> ChatCompletionsRequest {
+    let mut next = payload.clone();
+    next.model = effective_model.to_string();
+    next.reasoning_effort = reasoning_effort.map(str::to_string);
+    next
+}
+
+fn apply_responses_policy(
+    payload: &ResponsesRequest,
+    effective_model: &str,
+    reasoning_effort: Option<&str>,
+) -> ResponsesRequest {
+    let mut next = payload.clone();
+    next.model = effective_model.to_string();
+    if let Some(level) = reasoning_effort {
+        let mut reasoning = next
+            .reasoning
+            .take()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        reasoning.insert("effort".to_string(), Value::String(level.to_string()));
+        next.reasoning = Some(Value::Object(reasoning));
+    }
+    next
+}
+
+fn build_request_log_entry(
+    seed: &RequestLogSeed,
+    lease: &CliLease,
+    status_code: u16,
+    usage: RequestLogUsage,
+    observed_model: Option<String>,
+) -> RequestLogEntry {
+    let effective_model = observed_model.unwrap_or_else(|| seed.effective_model.clone());
+    let estimated_cost_usd = crate::pricing::estimate_cost_usd(&effective_model, &usage);
+    RequestLogEntry {
+        id: format!("log_{}", uuid::Uuid::new_v4().simple()),
+        api_key_id: seed.api_key.id,
+        tenant_id: seed.tenant_id,
+        user_name: seed.api_key.name.clone(),
+        user_email: seed.api_key.email.clone(),
+        principal_id: seed.principal_id.clone(),
+        account_id: lease.account_id.clone(),
+        account_label: lease.account_label.clone(),
+        method: seed.method.to_string(),
+        endpoint: seed.endpoint.to_string(),
+        requested_model: seed.requested_model.clone(),
+        effective_model,
+        reasoning_effort: seed.reasoning_effort.clone(),
+        route_mode: lease.route_mode,
+        status_code,
+        usage,
+        estimated_cost_usd,
+        created_at: Utc::now(),
+    }
+}
+
+fn merge_request_usage(target: &mut RequestLogUsage, next: RequestLogUsage) {
+    target.input_tokens = target.input_tokens.max(next.input_tokens);
+    target.cached_input_tokens = target.cached_input_tokens.max(next.cached_input_tokens);
+    target.output_tokens = target.output_tokens.max(next.output_tokens);
+    target.total_tokens = target.total_tokens.max(next.total_tokens);
+}
+
+fn request_usage_from_value(value: &Value) -> RequestLogUsage {
+    let input_tokens = usage_value(value, &["input_tokens", "prompt_tokens"]);
+    let output_tokens = usage_value(value, &["output_tokens", "completion_tokens"]);
+    let total_tokens = usage_value(value, &["total_tokens"]).max(input_tokens + output_tokens);
+    let cached_input_tokens = usage_object(value)
+        .and_then(|usage| {
+            usage
+                .get("input_tokens_details")
+                .and_then(Value::as_object)
+                .and_then(|details| {
+                    details
+                        .get("cached_tokens")
+                        .or_else(|| details.get("cached_input_tokens"))
+                })
+                .and_then(Value::as_u64)
+                .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64))
+        })
+        .unwrap_or_default();
+
+    RequestLogUsage {
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        total_tokens,
+    }
+}
+
+fn observed_model_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get("openai-model")
+        .or_else(|| headers.get("x-openai-model"))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+fn observed_model_from_value(value: &Value) -> Option<String> {
+    value
+        .get("model")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| response.get("model"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
 }
 
 fn waiting_response(stream_requested: bool, heartbeat_seconds: u64) -> Response<Body> {
@@ -563,12 +799,25 @@ async fn upstream_json_response(
         .as_ref()
         .map(extract_response_output_text)
         .filter(|summary| !summary.is_empty());
+    let usage = parsed
+        .as_ref()
+        .map(request_usage_from_value)
+        .unwrap_or_default();
+    let observed_model = parsed
+        .as_ref()
+        .and_then(observed_model_from_value)
+        .or_else(|| observed_model_from_headers(&headers));
     let mut builder = Response::builder().status(status);
     copy_upstream_headers(&mut builder, &headers);
     let response = builder
         .body(Body::from(bytes))
         .unwrap_or_else(|_| Response::new(Body::from("upstream response error")));
-    ForwardOutcome::Response(response, output_summary)
+    ForwardOutcome::Response(ForwardSuccess {
+        response,
+        output_summary,
+        usage,
+        observed_model,
+    })
 }
 
 async fn upstream_responses_json_to_chat_response(
@@ -585,6 +834,8 @@ async fn upstream_responses_json_to_chat_response(
         return ForwardOutcome::HiddenFailure(kind);
     }
     let output_summary = extract_response_output_text(&value);
+    let usage = request_usage_from_value(&value);
+    let observed_model = observed_model_from_value(&value).or_else(|| observed_model_from_headers(&headers));
     let payload = responses_json_to_chat_completion(&value, fallback_model);
     let bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
     let mut builder = Response::builder().status(status);
@@ -592,10 +843,12 @@ async fn upstream_responses_json_to_chat_response(
     let response = builder
         .body(Body::from(bytes))
         .unwrap_or_else(|_| Response::new(Body::from("upstream response error")));
-    ForwardOutcome::Response(
+    ForwardOutcome::Response(ForwardSuccess {
         response,
-        (!output_summary.is_empty()).then_some(output_summary),
-    )
+        output_summary: (!output_summary.is_empty()).then_some(output_summary),
+        usage,
+        observed_model,
+    })
 }
 
 async fn upstream_stream_to_json_response(
@@ -613,6 +866,8 @@ async fn upstream_stream_to_json_response(
     };
 
     let output_summary = extract_response_output_text(&value);
+    let usage = request_usage_from_value(&value);
+    let observed_model = observed_model_from_value(&value).or_else(|| observed_model_from_headers(&headers));
     let bytes = serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec());
     let mut builder = Response::builder().status(status);
     if let Some(out) = builder.headers_mut() {
@@ -622,10 +877,12 @@ async fn upstream_stream_to_json_response(
     let response = builder
         .body(Body::from(bytes))
         .unwrap_or_else(|_| Response::new(Body::from("upstream response error")));
-    ForwardOutcome::Response(
+    ForwardOutcome::Response(ForwardSuccess {
         response,
-        (!output_summary.is_empty()).then_some(output_summary),
-    )
+        output_summary: (!output_summary.is_empty()).then_some(output_summary),
+        usage,
+        observed_model,
+    })
 }
 
 async fn upstream_stream_to_chat_json_response(
@@ -643,6 +900,8 @@ async fn upstream_stream_to_chat_json_response(
     };
 
     let output_summary = extract_response_output_text(&value);
+    let usage = request_usage_from_value(&value);
+    let observed_model = observed_model_from_value(&value).or_else(|| observed_model_from_headers(&headers));
     let payload = responses_json_to_chat_completion(&value, fallback_model);
     let bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
     let mut builder = Response::builder().status(status);
@@ -653,16 +912,19 @@ async fn upstream_stream_to_chat_json_response(
     let response = builder
         .body(Body::from(bytes))
         .unwrap_or_else(|_| Response::new(Body::from("upstream response error")));
-    ForwardOutcome::Response(
+    ForwardOutcome::Response(ForwardSuccess {
         response,
-        (!output_summary.is_empty()).then_some(output_summary),
-    )
+        output_summary: (!output_summary.is_empty()).then_some(output_summary),
+        usage,
+        observed_model,
+    })
 }
 
 async fn upstream_stream_response(
     response: reqwest::Response,
     state: AppState,
     lease: CliLease,
+    request_log: RequestLogSeed,
     principal_id: String,
     expected_model: &str,
     _heartbeat_seconds: u64,
@@ -685,8 +947,16 @@ async fn upstream_stream_response(
         let mut buffer = initial_buffer;
         let mut had_hidden_failure = false;
         let mut output_summary = String::new();
+        let mut usage = RequestLogUsage::default();
+        let mut observed_model = observed_model_from_headers(&headers);
 
         for record in buffered_records {
+            if let Some(value) = response_value_from_sse_record(&record) {
+                merge_request_usage(&mut usage, request_usage_from_value(&value));
+                if observed_model.is_none() {
+                    observed_model = observed_model_from_value(&value);
+                }
+            }
             if let Some(delta) = response_delta_text(&record) {
                 output_summary.push_str(delta.as_str());
             }
@@ -705,6 +975,12 @@ async fn upstream_stream_response(
                     had_hidden_failure = true;
                     handle_hidden_failure(&state, &lease, kind).await;
                     break;
+                }
+                if let Some(value) = response_value_from_sse_record(&record) {
+                    merge_request_usage(&mut usage, request_usage_from_value(&value));
+                    if observed_model.is_none() {
+                        observed_model = observed_model_from_value(&value);
+                    }
                 }
                 if let Some(delta) = response_delta_text(&record) {
                     output_summary.push_str(delta.as_str());
@@ -732,18 +1008,31 @@ async fn upstream_stream_response(
                 truncate_text(output_summary, 240)
             };
             state.record_context_output(&principal_id, summary).await;
+            state
+                .record_request_log(build_request_log_entry(
+                    &request_log,
+                    &lease,
+                    status.as_u16(),
+                    usage,
+                    observed_model,
+                ))
+                .await;
         }
     };
     let response = builder
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| Response::new(Body::from("upstream stream error")));
-    ForwardOutcome::Response(response, None)
+    ForwardOutcome::Response(ForwardSuccess {
+        response,
+        ..ForwardSuccess::default()
+    })
 }
 
 fn passthrough_stream_response(
     response: reqwest::Response,
     state: AppState,
     lease: CliLease,
+    request_log: RequestLogSeed,
     principal_id: String,
     expected_model: &str,
 ) -> ForwardOutcome {
@@ -754,40 +1043,83 @@ fn passthrough_stream_response(
     }
     let mut builder = Response::builder().status(status);
     copy_upstream_headers(&mut builder, &headers);
-    let _ = tokio::spawn(async move {
-        let _ = state
-            .record_route_event(
-                &lease.account_id,
-                RouteEventRequest {
-                    mode: lease.route_mode,
-                    kind: "success".to_string(),
-                },
-            )
-            .await;
-        state
-            .record_context_output(
-                &principal_id,
-                "streamed assistant response delivered".to_string(),
-            )
-            .await;
-    });
     let response = builder
-        .body(Body::from_stream(
-            response.bytes_stream().map_err(std::io::Error::other),
-        ))
+        .body(Body::from_stream({
+            let headers = headers.clone();
+            stream! {
+                let mut upstream = response.bytes_stream();
+                let mut buffer = String::new();
+                let mut had_error = false;
+                let mut output_summary = String::new();
+                let mut usage = RequestLogUsage::default();
+                let mut observed_model = observed_model_from_headers(&headers);
+
+                while let Some(chunk) = upstream.next().await {
+                    let Ok(chunk) = chunk else {
+                        had_error = true;
+                        break;
+                    };
+                    buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()).replace("\r\n", "\n"));
+                    while let Some(record) = take_sse_record(&mut buffer) {
+                        if let Some(value) = response_value_from_sse_record(&record) {
+                            merge_request_usage(&mut usage, request_usage_from_value(&value));
+                            if observed_model.is_none() {
+                                observed_model = observed_model_from_value(&value);
+                            }
+                        }
+                        if let Some(delta) = response_delta_text(&record) {
+                            output_summary.push_str(delta.as_str());
+                        }
+                    }
+                    yield Ok::<Bytes, std::io::Error>(chunk);
+                }
+
+                if !had_error {
+                    let _ = state
+                        .record_route_event(
+                            &lease.account_id,
+                            RouteEventRequest {
+                                mode: lease.route_mode,
+                                kind: "success".to_string(),
+                            },
+                        )
+                        .await;
+                    let summary = if output_summary.trim().is_empty() {
+                        "streamed assistant response delivered".to_string()
+                    } else {
+                        truncate_text(output_summary, 240)
+                    };
+                    state.record_context_output(&principal_id, summary).await;
+                    state
+                        .record_request_log(build_request_log_entry(
+                            &request_log,
+                            &lease,
+                            status.as_u16(),
+                            usage,
+                            observed_model,
+                        ))
+                        .await;
+                }
+            }
+        }))
         .unwrap_or_else(|_| Response::new(Body::from("upstream stream error")));
-    ForwardOutcome::Response(response, None)
+    ForwardOutcome::Response(ForwardSuccess {
+        response,
+        ..ForwardSuccess::default()
+    })
 }
 
 async fn upstream_responses_stream_to_chat_response(
     response: reqwest::Response,
     state: AppState,
     lease: CliLease,
+    request_log: RequestLogSeed,
     principal_id: String,
     fallback_model: &str,
     near_quota_guard: bool,
     heartbeat_seconds: u64,
 ) -> ForwardOutcome {
+    let status = response.status();
     let headers = response.headers().clone();
     if let Some(kind) = hidden_failure_kind_from_headers(&headers, fallback_model) {
         return ForwardOutcome::HiddenFailure(kind);
@@ -807,13 +1139,22 @@ async fn upstream_responses_stream_to_chat_response(
     };
     let created = Utc::now().timestamp();
     let fallback_model = fallback_model.to_string();
+    let headers_for_usage = headers.clone();
     let events = stream! {
         let gateway_state = state.clone();
         let mut stream = upstream;
         let mut buffer = initial_buffer;
         let mut adapter_state = ChatStreamAdapterState::new(&fallback_model, created);
         let mut had_hidden_failure = false;
+        let mut usage = RequestLogUsage::default();
+        let mut observed_model = observed_model_from_headers(&headers_for_usage);
         for record in buffered_records {
+            if let Some(value) = response_value_from_sse_record(&record) {
+                merge_request_usage(&mut usage, request_usage_from_value(&value));
+                if observed_model.is_none() {
+                    observed_model = observed_model_from_value(&value);
+                }
+            }
             for event in translate_response_record_to_chat_events(&record, &mut adapter_state) {
                 yield Ok::<Event, Infallible>(event);
             }
@@ -830,6 +1171,12 @@ async fn upstream_responses_stream_to_chat_response(
                     had_hidden_failure = true;
                     handle_hidden_failure(&gateway_state, &lease, kind).await;
                     break;
+                }
+                if let Some(value) = response_value_from_sse_record(&record) {
+                    merge_request_usage(&mut usage, request_usage_from_value(&value));
+                    if observed_model.is_none() {
+                        observed_model = observed_model_from_value(&value);
+                    }
                 }
                 for event in translate_response_record_to_chat_events(&record, &mut adapter_state) {
                     yield Ok::<Event, Infallible>(event);
@@ -865,6 +1212,15 @@ async fn upstream_responses_stream_to_chat_response(
                 "streamed chat completion delivered".to_string()
             };
             gateway_state.record_context_output(&principal_id, summary).await;
+            gateway_state
+                .record_request_log(build_request_log_entry(
+                    &request_log,
+                    &lease,
+                    status.as_u16(),
+                    usage,
+                    observed_model.or_else(|| Some(adapter_state.model.clone())),
+                ))
+                .await;
         }
     };
 
@@ -876,7 +1232,10 @@ async fn upstream_responses_stream_to_chat_response(
         )
         .into_response();
     copy_upstream_headers_to_response(output.headers_mut(), &headers);
-    ForwardOutcome::Response(output, None)
+    ForwardOutcome::Response(ForwardSuccess {
+        response: output,
+        ..ForwardSuccess::default()
+    })
 }
 
 async fn preflight_response_stream(
@@ -2128,9 +2487,9 @@ fn forward_context(headers: &HeaderMap, principal_id: &str) -> ForwardContext {
 
 fn derive_principal_id(headers: &HeaderMap, tenant_slug: &str) -> String {
     let affinity = header_str(headers, "x-codex-cli-affinity-id")
-        .or_else(|| header_str(headers, "x-client-request-id"))
         .or_else(|| header_str(headers, "session_id"))
         .or_else(|| header_str(headers, "x-openai-subagent"))
+        .or_else(|| header_str(headers, "x-client-request-id"))
         .unwrap_or("anonymous");
     format!("tenant:{tenant_slug}/principal:{affinity}")
 }

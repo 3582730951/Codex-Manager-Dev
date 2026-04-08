@@ -26,6 +26,29 @@ impl RouteMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GatewayUserRole {
+    Admin,
+    Viewer,
+}
+
+impl GatewayUserRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::Viewer => "viewer",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "admin" => Self::Admin,
+            _ => Self::Viewer,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Tenant {
@@ -41,8 +64,15 @@ pub struct GatewayApiKey {
     pub id: Uuid,
     pub tenant_id: Uuid,
     pub name: String,
+    pub email: String,
+    pub role: GatewayUserRole,
     pub token: String,
+    pub default_model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub force_model_override: bool,
+    pub force_reasoning_effort: bool,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +210,7 @@ pub struct TopologyNode {
 pub struct DashboardCounts {
     pub tenants: usize,
     pub accounts: usize,
+    pub users: usize,
     pub active_leases: usize,
     pub warp_accounts: usize,
     pub browser_tasks: usize,
@@ -268,8 +299,15 @@ pub struct GatewayApiKeyView {
     pub id: Uuid,
     pub tenant_id: Uuid,
     pub name: String,
+    pub email: String,
+    pub role: GatewayUserRole,
     pub token_preview: String,
+    pub default_model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub force_model_override: bool,
+    pub force_reasoning_effort: bool,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,8 +316,86 @@ pub struct CreatedGatewayApiKey {
     pub id: Uuid,
     pub tenant_id: Uuid,
     pub name: String,
+    pub email: String,
+    pub role: GatewayUserRole,
     pub token: String,
+    pub default_model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub force_model_override: bool,
+    pub force_reasoning_effort: bool,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BillingSummary {
+    pub total_spend_usd: f64,
+    pub total_requests: usize,
+    pub total_input_tokens: u64,
+    pub total_cached_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_tokens: u64,
+    pub priced_requests: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestLogUsage {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestLogEntry {
+    pub id: String,
+    pub api_key_id: Uuid,
+    pub tenant_id: Uuid,
+    pub user_name: String,
+    pub user_email: String,
+    pub principal_id: String,
+    pub account_id: String,
+    pub account_label: String,
+    pub method: String,
+    pub endpoint: String,
+    pub requested_model: String,
+    pub effective_model: String,
+    pub reasoning_effort: Option<String>,
+    pub route_mode: RouteMode,
+    pub status_code: u16,
+    pub usage: RequestLogUsage,
+    pub estimated_cost_usd: Option<f64>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayUserView {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub name: String,
+    pub email: String,
+    pub role: GatewayUserRole,
+    pub token_preview: String,
+    pub default_model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub force_model_override: bool,
+    pub force_reasoning_effort: bool,
+    pub request_count: usize,
+    pub estimated_spend_usd: f64,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatedGatewayUser {
+    pub user: GatewayUserView,
+    pub token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,6 +409,10 @@ pub struct DashboardSnapshot {
     pub leases: Vec<CliLease>,
     pub cf_incidents: Vec<CfIncident>,
     pub browser_tasks: Vec<BrowserTask>,
+    pub users: Vec<GatewayUserView>,
+    pub request_logs: Vec<RequestLogEntry>,
+    pub billing: BillingSummary,
+    pub model_catalog: Vec<String>,
     pub counts: DashboardCounts,
 }
 
@@ -325,6 +445,31 @@ pub struct ImportAccountRequest {
 pub struct CreateGatewayApiKeyRequest {
     pub tenant_id: Uuid,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateGatewayUserRequest {
+    pub tenant_id: Option<Uuid>,
+    pub name: String,
+    pub email: String,
+    pub role: GatewayUserRole,
+    pub default_model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub force_model_override: Option<bool>,
+    pub force_reasoning_effort: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateGatewayUserRequest {
+    pub name: Option<String>,
+    pub email: Option<String>,
+    pub role: Option<GatewayUserRole>,
+    pub default_model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub force_model_override: Option<bool>,
+    pub force_reasoning_effort: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

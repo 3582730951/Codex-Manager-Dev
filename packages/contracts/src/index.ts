@@ -1,4 +1,5 @@
 export type AccountRouteMode = "direct" | "warp";
+export type GatewayUserRole = "admin" | "viewer";
 
 export interface CacheMetrics {
   cachedTokens: number;
@@ -82,6 +83,62 @@ export interface BrowserTask {
   stepCount: number;
 }
 
+export interface GatewayUserView {
+  id: string;
+  tenantId: string;
+  name: string;
+  email: string;
+  role: GatewayUserRole;
+  tokenPreview: string;
+  defaultModel: string | null;
+  reasoningEffort: string | null;
+  forceModelOverride: boolean;
+  forceReasoningEffort: boolean;
+  requestCount: number;
+  estimatedSpendUsd: number;
+  lastUsedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RequestLogUsage {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+export interface RequestLogEntry {
+  id: string;
+  apiKeyId: string;
+  tenantId: string;
+  userName: string;
+  userEmail: string;
+  principalId: string;
+  accountId: string;
+  accountLabel: string;
+  method: string;
+  endpoint: string;
+  requestedModel: string;
+  effectiveModel: string;
+  reasoningEffort: string | null;
+  routeMode: AccountRouteMode;
+  statusCode: number;
+  usage: RequestLogUsage;
+  estimatedCostUsd: number | null;
+  createdAt: string;
+}
+
+export interface BillingSummary {
+  totalSpendUsd: number;
+  totalRequests: number;
+  totalInputTokens: number;
+  totalCachedInputTokens: number;
+  totalOutputTokens: number;
+  totalTokens: number;
+  pricedRequests: number;
+}
+
 export interface DashboardSnapshot {
   title: string;
   subtitle: string;
@@ -91,9 +148,14 @@ export interface DashboardSnapshot {
   leases: LeaseView[];
   cfIncidents: CfIncident[];
   browserTasks: BrowserTask[];
+  users: GatewayUserView[];
+  requestLogs: RequestLogEntry[];
+  billing: BillingSummary;
+  modelCatalog: string[];
   counts: {
     tenants: number;
     accounts: number;
+    users: number;
     activeLeases: number;
     warpAccounts: number;
     browserTasks: number;
@@ -217,9 +279,66 @@ export const dashboardFallback: DashboardSnapshot = {
       stepCount: 3
     }
   ],
+  users: [
+    {
+      id: "usr-demo-key",
+      tenantId: "demo",
+      name: "Demo User",
+      email: "demo@codex.local",
+      role: "admin",
+      tokenPreview: "cmgr_d…key",
+      defaultModel: "gpt-5.4",
+      reasoningEffort: "high",
+      forceModelOverride: false,
+      forceReasoningEffort: false,
+      requestCount: 6,
+      estimatedSpendUsd: 0.42,
+      lastUsedAt: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    }
+  ],
+  requestLogs: [
+    {
+      id: "log_demo_1",
+      apiKeyId: "usr-demo-key",
+      tenantId: "demo",
+      userName: "Demo User",
+      userEmail: "demo@codex.local",
+      principalId: "tenant:demo/principal:atlas-shell",
+      accountId: "acc_demo_1",
+      accountLabel: "子午线",
+      method: "POST",
+      endpoint: "/v1/responses",
+      requestedModel: "gpt-5.4",
+      effectiveModel: "gpt-5.4",
+      reasoningEffort: "high",
+      routeMode: "direct",
+      statusCode: 200,
+      usage: {
+        inputTokens: 4200,
+        cachedInputTokens: 1200,
+        outputTokens: 980,
+        totalTokens: 5180
+      },
+      estimatedCostUsd: 0.0318,
+      createdAt: new Date().toISOString()
+    }
+  ],
+  billing: {
+    totalSpendUsd: 0.42,
+    totalRequests: 6,
+    totalInputTokens: 26000,
+    totalCachedInputTokens: 7000,
+    totalOutputTokens: 5400,
+    totalTokens: 31400,
+    pricedRequests: 6
+  },
+  modelCatalog: ["gpt-5.4", "gpt-5.3-codex", "gpt-5.2"],
   counts: {
     tenants: 1,
     accounts: 4,
+    users: 1,
     activeLeases: 2,
     warpAccounts: 1,
     browserTasks: 1

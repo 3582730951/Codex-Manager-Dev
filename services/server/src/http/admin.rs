@@ -2,14 +2,16 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{get, post, put},
 };
+use uuid::Uuid;
 
 use crate::{
     browser_assist,
     models::{
-        BrowserTaskRequest, CreateGatewayApiKeyRequest, CreateTenantRequest, ImportAccountRequest,
-        OpenAiLoginCompleteRequest, OpenAiLoginStartRequest, RouteEventRequest,
+        BrowserTaskRequest, CreateGatewayApiKeyRequest, CreateGatewayUserRequest,
+        CreateTenantRequest, ImportAccountRequest, OpenAiLoginCompleteRequest,
+        OpenAiLoginStartRequest, RouteEventRequest, UpdateGatewayUserRequest,
     },
     state::AppState,
 };
@@ -20,11 +22,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/dashboard", get(dashboard))
         .route("/api/v1/tenants", get(tenants).post(create_tenant))
         .route("/api/v1/accounts", get(accounts))
+        .route("/api/v1/accounts/models/refresh", post(refresh_account_models))
         .route("/api/v1/egress-slots", get(egress_slots))
         .route("/api/v1/leases", get(leases))
         .route("/api/v1/cache-metrics", get(cache_metrics))
         .route("/api/v1/cf-incidents", get(cf_incidents))
         .route("/api/v1/accounts/import", post(import_account))
+        .route("/api/v1/users", get(users).post(create_user))
+        .route("/api/v1/users/{user_id}", put(update_user))
         .route(
             "/api/v1/gateway/api-keys",
             get(api_keys).post(create_api_key),
@@ -77,6 +82,23 @@ async fn accounts(State(state): State<AppState>) -> Json<Vec<crate::models::Acco
     Json(state.list_accounts().await)
 }
 
+async fn refresh_account_models(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::models::AccountSummary>>, (StatusCode, Json<serde_json::Value>)> {
+    match state.refresh_account_models().await {
+        Ok(accounts) => Ok(Json(accounts)),
+        Err(message) => Err((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "model_refresh_failed"
+                }
+            })),
+        )),
+    }
+}
+
 async fn egress_slots(State(state): State<AppState>) -> Json<Vec<crate::models::EgressSlot>> {
     Json(state.list_egress_slots().await)
 }
@@ -105,6 +127,47 @@ async fn import_account(
     Json(payload): Json<ImportAccountRequest>,
 ) -> Json<crate::models::UpstreamAccount> {
     Json(state.import_account(payload).await)
+}
+
+async fn users(State(state): State<AppState>) -> Json<Vec<crate::models::GatewayUserView>> {
+    Json(state.list_gateway_users().await)
+}
+
+async fn create_user(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateGatewayUserRequest>,
+) -> Result<Json<crate::models::CreatedGatewayUser>, (StatusCode, Json<serde_json::Value>)> {
+    match state.create_gateway_user(payload).await {
+        Ok(user) => Ok(Json(user)),
+        Err(message) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "create_user_failed"
+                }
+            })),
+        )),
+    }
+}
+
+async fn update_user(
+    State(state): State<AppState>,
+    Path(user_id): Path<Uuid>,
+    Json(payload): Json<UpdateGatewayUserRequest>,
+) -> Result<Json<crate::models::GatewayUserView>, (StatusCode, Json<serde_json::Value>)> {
+    match state.update_gateway_user(user_id, payload).await {
+        Ok(user) => Ok(Json(user)),
+        Err(message) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "update_user_failed"
+                }
+            })),
+        )),
+    }
 }
 
 async fn api_keys(State(state): State<AppState>) -> Json<Vec<crate::models::GatewayApiKeyView>> {

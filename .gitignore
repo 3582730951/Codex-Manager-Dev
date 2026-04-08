@@ -11,5 +11,8 @@ target/
 .env.*.local
 passwd.txt
 dump.rdb
-sh/
+sh/*
+!sh/new/
+!sh/new/**
+sh/new/state/*
 .docker-deploy/

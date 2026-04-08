@@ -7,7 +7,7 @@ import {
   createTenant,
   importAccount,
   startOpenAiLogin,
-  submitBrowserTask
+  submitBrowserTask,
 } from "@/lib/dashboard";
 
 type ImportPayload = {
@@ -96,10 +96,7 @@ function readNumberFromUnknown(value: unknown) {
   return undefined;
 }
 
-function readStringFromRecord(
-  record: Record<string, unknown>,
-  keys: string[]
-) {
+function readStringFromRecord(record: Record<string, unknown>, keys: string[]) {
   for (const key of keys) {
     const value = record[key];
     if (typeof value === "string" && value.trim()) {
@@ -169,7 +166,7 @@ function normalizeBulkRecord(
   index: number,
   tenantId: string,
   fallbackModels: string[],
-  fallbackBaseUrl?: string
+  fallbackBaseUrl?: string,
 ): ImportPayload {
   if (typeof entry === "string") {
     const bearerToken = entry.trim();
@@ -181,7 +178,7 @@ function normalizeBulkRecord(
       label: `OpenAI 导入 ${String(index + 1).padStart(2, "0")}`,
       models: fallbackModels,
       baseUrl: fallbackBaseUrl,
-      bearerToken
+      bearerToken,
     };
   }
 
@@ -191,8 +188,12 @@ function normalizeBulkRecord(
 
   const record = entry as Record<string, unknown>;
   const label =
-    readStringFromRecord(record, ["label", "name", "accountName", "account_name"]) ??
-    `OpenAI 导入 ${String(index + 1).padStart(2, "0")}`;
+    readStringFromRecord(record, [
+      "label",
+      "name",
+      "accountName",
+      "account_name",
+    ]) ?? `OpenAI 导入 ${String(index + 1).padStart(2, "0")}`;
   const bearerToken = readStringFromRecord(record, [
     "bearerToken",
     "bearer_token",
@@ -200,16 +201,16 @@ function normalizeBulkRecord(
     "access_token",
     "token",
     "sessionToken",
-    "session_token"
+    "session_token",
   ]);
   const chatgptAccountId = readStringFromRecord(record, [
     "chatgptAccountId",
     "chatgpt_account_id",
     "accountId",
-    "account_id"
+    "account_id",
   ]);
   const extraHeaders = normalizeExtraHeadersValue(
-    record.extraHeaders ?? record.extra_headers ?? record.headers
+    record.extraHeaders ?? record.extra_headers ?? record.headers,
   );
 
   if (!bearerToken && !chatgptAccountId && !extraHeaders) {
@@ -219,17 +220,31 @@ function normalizeBulkRecord(
   return {
     tenantId,
     label,
-    models: normalizeModelsValue(record.models ?? record.model ?? record.modelIds, fallbackModels),
+    models: normalizeModelsValue(
+      record.models ?? record.model ?? record.modelIds,
+      fallbackModels,
+    ),
     baseUrl:
-      readStringFromRecord(record, ["baseUrl", "base_url", "endpoint"]) ?? fallbackBaseUrl,
+      readStringFromRecord(record, ["baseUrl", "base_url", "endpoint"]) ??
+      fallbackBaseUrl,
     bearerToken,
     chatgptAccountId,
     extraHeaders,
-    quotaHeadroom: readNumberFromUnknown(record.quotaHeadroom ?? record.quota_headroom),
-    quotaHeadroom5h: readNumberFromUnknown(record.quotaHeadroom5h ?? record.quota_headroom_5h),
-    quotaHeadroom7d: readNumberFromUnknown(record.quotaHeadroom7d ?? record.quota_headroom_7d),
-    healthScore: readNumberFromUnknown(record.healthScore ?? record.health_score),
-    egressStability: readNumberFromUnknown(record.egressStability ?? record.egress_stability)
+    quotaHeadroom: readNumberFromUnknown(
+      record.quotaHeadroom ?? record.quota_headroom,
+    ),
+    quotaHeadroom5h: readNumberFromUnknown(
+      record.quotaHeadroom5h ?? record.quota_headroom_5h,
+    ),
+    quotaHeadroom7d: readNumberFromUnknown(
+      record.quotaHeadroom7d ?? record.quota_headroom_7d,
+    ),
+    healthScore: readNumberFromUnknown(
+      record.healthScore ?? record.health_score,
+    ),
+    egressStability: readNumberFromUnknown(
+      record.egressStability ?? record.egress_stability,
+    ),
   };
 }
 
@@ -237,7 +252,7 @@ function parseBulkImportContent(
   raw: string,
   tenantId: string,
   fallbackModels: string[],
-  fallbackBaseUrl?: string
+  fallbackBaseUrl?: string,
 ) {
   const trimmed = raw.trim();
   if (!trimmed) {
@@ -254,7 +269,13 @@ function parseBulkImportContent(
         ? (parsed as { accounts: unknown[] }).accounts
         : [parsed];
     return source.map((entry, index) =>
-      normalizeBulkRecord(entry, index, tenantId, fallbackModels, fallbackBaseUrl)
+      normalizeBulkRecord(
+        entry,
+        index,
+        tenantId,
+        fallbackModels,
+        fallbackBaseUrl,
+      ),
     );
   } catch {
     const lines = trimmed
@@ -265,7 +286,13 @@ function parseBulkImportContent(
       throw new Error("请先填写账号数据。");
     }
     return lines.map((line, index) =>
-      normalizeBulkRecord(line, index, tenantId, fallbackModels, fallbackBaseUrl)
+      normalizeBulkRecord(
+        line,
+        index,
+        tenantId,
+        fallbackModels,
+        fallbackBaseUrl,
+      ),
     );
   }
 }
@@ -295,18 +322,18 @@ function readCallbackPayload(raw: string) {
   return {
     state,
     code,
-    redirectUri: `${url.origin}${url.pathname}`
+    redirectUri: `${url.origin}${url.pathname}`,
   };
 }
 
 function redirectWithNotice(
   tone: "ok" | "error",
   message: string,
-  anchor: string
+  anchor: string,
 ) {
   const params = new URLSearchParams({
     noticeTone: tone,
-    noticeMessage: message
+    noticeMessage: message,
   });
   redirect(`/?${params.toString()}#${anchor}`);
 }
@@ -367,7 +394,7 @@ export async function importAccountAction(formData: FormData) {
       quotaHeadroom5h: readOptionalNumber(formData, "quotaHeadroom5h"),
       quotaHeadroom7d: readOptionalNumber(formData, "quotaHeadroom7d"),
       healthScore: readOptionalNumber(formData, "healthScore"),
-      egressStability: readOptionalNumber(formData, "egressStability")
+      egressStability: readOptionalNumber(formData, "egressStability"),
     });
   } catch (error) {
     finishError(error, "connect");
@@ -385,7 +412,7 @@ export async function bulkImportAccountsAction(formData: FormData) {
       readString(formData, "bulkContent"),
       tenantId,
       models,
-      baseUrl
+      baseUrl,
     );
 
     if (!tenantId) {
@@ -418,11 +445,11 @@ export async function startOpenAiLoginAction(formData: FormData) {
       note: readOptionalString(formData, "notes"),
       redirectUri,
       models: parseModels(readString(formData, "models")),
-      baseUrl: readOptionalString(formData, "baseUrl")
+      baseUrl: readOptionalString(formData, "baseUrl"),
     });
     authUrl = result.authUrl;
   } catch (error) {
-    finishError(error, "login");
+    finishError(error, "accounts-workspace");
   }
 
   redirect(authUrl);
@@ -440,7 +467,7 @@ export async function parseOpenAiCallbackAction(formData: FormData) {
 
     if (target === "callback") {
       redirect(
-        `/oauth/callback?noticeTone=ok&noticeMessage=${encodeURIComponent("OpenAI 授权已解析并导入账号。")}`
+        `/oauth/callback?noticeTone=ok&noticeMessage=${encodeURIComponent("OpenAI 授权已解析并导入账号。")}`,
       );
     }
   } catch (error) {
@@ -449,19 +476,16 @@ export async function parseOpenAiCallbackAction(formData: FormData) {
       const message =
         error instanceof Error ? error.message : "授权回调解析失败。";
       redirect(
-        `/oauth/callback?noticeTone=error&noticeMessage=${encodeURIComponent(message)}`
+        `/oauth/callback?noticeTone=error&noticeMessage=${encodeURIComponent(message)}`,
       );
     }
-    finishError(error, "login");
+    finishError(error, "accounts-workspace");
   }
 
-  finishSuccess("OpenAI 授权已解析并导入账号。", "login");
+  finishSuccess("OpenAI 授权已解析并导入账号。", "accounts-workspace");
 }
 
-async function submitTaskAction(
-  kind: "login" | "recover",
-  formData: FormData
-) {
+async function submitTaskAction(kind: "login" | "recover", formData: FormData) {
   const accountId = readOptionalString(formData, "accountId");
   if (!accountId) {
     throw new Error("请先选择账号。");
@@ -476,7 +500,7 @@ async function submitTaskAction(
     email: readOptionalString(formData, "email"),
     password: readOptionalString(formData, "password"),
     otpCode: readOptionalString(formData, "otpCode"),
-    routeMode: routeModeFromForm(formData)
+    routeMode: routeModeFromForm(formData),
   });
 }
 
@@ -484,18 +508,18 @@ export async function browserLoginAction(formData: FormData) {
   try {
     await submitTaskAction("login", formData);
   } catch (error) {
-    finishError(error, "login");
+    finishError(error, "runtime-detail");
   }
 
-  finishSuccess("登录任务已启动。", "login");
+  finishSuccess("登录任务已启动。", "runtime-detail");
 }
 
 export async function browserRecoverAction(formData: FormData) {
   try {
     await submitTaskAction("recover", formData);
   } catch (error) {
-    finishError(error, "login");
+    finishError(error, "runtime-detail");
   }
 
-  finishSuccess("恢复任务已启动。", "login");
+  finishSuccess("恢复任务已启动。", "runtime-detail");
 }

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { startOpenAiLogin } from "@/lib/dashboard";
+import { getOpenAiCallbackPublicUrl } from "@/lib/openai-oauth";
 
 const defaultModels = ["gpt-5.4", "gpt-5.3-codex", "gpt-5.2"];
 const defaultBaseUrl = "https://chatgpt.com/backend-api/codex";
@@ -40,7 +41,7 @@ export async function GET(request: NextRequest) {
   const { searchParams } = request.nextUrl;
   const redirectUri =
     readOptional(searchParams, "redirectUri") ??
-    `${resolveWebOrigin(request)}/oauth/callback`;
+    getOpenAiCallbackPublicUrl();
 
   try {
     const result = await startOpenAiLogin({

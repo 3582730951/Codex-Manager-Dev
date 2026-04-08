@@ -10,7 +10,8 @@ use tracing::{info, warn};
 
 use crate::models::{
     AccountRouteState, CacheMetrics, CfIncident, CliLease, ConversationContext, GatewayApiKey,
-    RouteMode, SchedulingSignals, Tenant, UpstreamAccount, UpstreamCredential,
+    RequestLogEntry, RequestLogUsage, RouteMode, SchedulingSignals, Tenant, UpstreamAccount,
+    UpstreamCredential,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +27,7 @@ pub enum PersistenceMessage {
     IncidentInsert(CfIncident),
     ConversationContextUpsert(ConversationContext),
     CacheMetricsUpsert(CacheMetrics),
+    RequestLogInsert(RequestLogEntry),
 }
 
 impl PersistenceMessage {
@@ -41,6 +43,7 @@ impl PersistenceMessage {
             Self::IncidentInsert(_) => "incident_insert",
             Self::ConversationContextUpsert(_) => "conversation_context_upsert",
             Self::CacheMetricsUpsert(_) => "cache_metrics_upsert",
+            Self::RequestLogInsert(_) => "request_log_insert",
         }
     }
 }
@@ -56,6 +59,7 @@ pub struct PersistenceSnapshot {
     pub cf_incidents: Vec<CfIncident>,
     pub conversation_contexts: Vec<ConversationContext>,
     pub cache_metrics: Option<CacheMetrics>,
+    pub request_logs: Vec<RequestLogEntry>,
 }
 
 impl PersistenceSnapshot {
@@ -68,6 +72,7 @@ impl PersistenceSnapshot {
             || !self.leases.is_empty()
             || !self.cf_incidents.is_empty()
             || !self.conversation_contexts.is_empty()
+            || !self.request_logs.is_empty()
     }
 }
 
@@ -125,7 +130,9 @@ impl Persistence {
                 .collect::<Result<Vec<_>, _>>()?;
 
         let api_keys = sqlx::query(
-            "select id, tenant_id, name, token, created_at from gateway_api_keys order by created_at asc",
+            "select id, tenant_id, name, email, role, token, default_model, reasoning_effort,
+             force_model_override, force_reasoning_effort, created_at, updated_at
+             from gateway_api_keys order by created_at asc",
         )
         .fetch_all(self.pool.as_ref())
         .await?
@@ -135,8 +142,19 @@ impl Persistence {
                 id: row.try_get("id")?,
                 tenant_id: row.try_get("tenant_id")?,
                 name: row.try_get("name")?,
+                email: row
+                    .try_get::<Option<String>, _>("email")?
+                    .unwrap_or_default(),
+                role: crate::models::GatewayUserRole::from_db(
+                    row.try_get::<&str, _>("role")?,
+                ),
                 token: row.try_get("token")?,
+                default_model: row.try_get("default_model")?,
+                reasoning_effort: row.try_get("reasoning_effort")?,
+                force_model_override: row.try_get("force_model_override")?,
+                force_reasoning_effort: row.try_get("force_reasoning_effort")?,
                 created_at: row.try_get("created_at")?,
+                updated_at: row.try_get("updated_at")?,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -288,6 +306,45 @@ impl Persistence {
         })
         .transpose()?;
 
+        let request_logs = sqlx::query(
+            "select id, api_key_id, tenant_id, user_name, user_email, principal_id, account_id,
+             account_label, method, endpoint, requested_model, effective_model, reasoning_effort,
+             route_mode, status_code, usage, estimated_cost_usd, created_at
+             from request_logs order by created_at desc limit 512",
+        )
+        .fetch_all(self.pool.as_ref())
+        .await?
+        .into_iter()
+        .map(|row| -> Result<RequestLogEntry, sqlx::Error> {
+            let status_code: i32 = row.try_get("status_code")?;
+            Ok(RequestLogEntry {
+                id: row.try_get("id")?,
+                api_key_id: row.try_get("api_key_id")?,
+                tenant_id: row.try_get("tenant_id")?,
+                user_name: row.try_get("user_name")?,
+                user_email: row
+                    .try_get::<Option<String>, _>("user_email")?
+                    .unwrap_or_default(),
+                principal_id: row.try_get("principal_id")?,
+                account_id: row.try_get("account_id")?,
+                account_label: row.try_get("account_label")?,
+                method: row.try_get("method")?,
+                endpoint: row.try_get("endpoint")?,
+                requested_model: row.try_get("requested_model")?,
+                effective_model: row.try_get("effective_model")?,
+                reasoning_effort: row.try_get("reasoning_effort")?,
+                route_mode: RouteMode::from_db(row.try_get::<&str, _>("route_mode")?),
+                status_code: status_code.max(0) as u16,
+                usage: row
+                    .try_get::<Json<RequestLogUsage>, _>("usage")
+                    .map(|value| value.0)
+                    .unwrap_or_default(),
+                estimated_cost_usd: row.try_get("estimated_cost_usd")?,
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
         Ok(PersistenceSnapshot {
             tenants,
             api_keys,
@@ -298,6 +355,7 @@ impl Persistence {
             cf_incidents,
             conversation_contexts,
             cache_metrics,
+            request_logs,
         })
     }
 
@@ -319,14 +377,35 @@ impl Persistence {
                 }
                 PersistenceMessage::ApiKeyUpsert(api_key) => {
                     sqlx::query(
-                        "insert into gateway_api_keys (id, tenant_id, name, token, created_at) values ($1, $2, $3, $4, $5)
-                         on conflict (id) do update set tenant_id = excluded.tenant_id, name = excluded.name, token = excluded.token, created_at = excluded.created_at",
+                        "insert into gateway_api_keys (
+                            id, tenant_id, name, email, role, token, default_model, reasoning_effort,
+                            force_model_override, force_reasoning_effort, created_at, updated_at
+                         ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                         on conflict (id) do update set
+                         tenant_id = excluded.tenant_id,
+                         name = excluded.name,
+                         email = excluded.email,
+                         role = excluded.role,
+                         token = excluded.token,
+                         default_model = excluded.default_model,
+                         reasoning_effort = excluded.reasoning_effort,
+                         force_model_override = excluded.force_model_override,
+                         force_reasoning_effort = excluded.force_reasoning_effort,
+                         created_at = excluded.created_at,
+                         updated_at = excluded.updated_at",
                     )
                     .bind(api_key.id)
                     .bind(api_key.tenant_id)
                     .bind(&api_key.name)
+                    .bind(&api_key.email)
+                    .bind(api_key.role.as_str())
                     .bind(&api_key.token)
+                    .bind(&api_key.default_model)
+                    .bind(&api_key.reasoning_effort)
+                    .bind(api_key.force_model_override)
+                    .bind(api_key.force_reasoning_effort)
                     .bind(api_key.created_at)
+                    .bind(api_key.updated_at)
                     .execute(&mut *tx)
                     .await?;
                 }
@@ -457,6 +536,36 @@ impl Persistence {
                     .execute(&mut *tx)
                     .await?;
                 }
+                PersistenceMessage::RequestLogInsert(log) => {
+                    sqlx::query(
+                        "insert into request_logs (
+                            id, api_key_id, tenant_id, user_name, user_email, principal_id, account_id,
+                            account_label, method, endpoint, requested_model, effective_model,
+                            reasoning_effort, route_mode, status_code, usage, estimated_cost_usd, created_at
+                         ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                         on conflict (id) do nothing",
+                    )
+                    .bind(&log.id)
+                    .bind(log.api_key_id)
+                    .bind(log.tenant_id)
+                    .bind(&log.user_name)
+                    .bind(&log.user_email)
+                    .bind(&log.principal_id)
+                    .bind(&log.account_id)
+                    .bind(&log.account_label)
+                    .bind(&log.method)
+                    .bind(&log.endpoint)
+                    .bind(&log.requested_model)
+                    .bind(&log.effective_model)
+                    .bind(&log.reasoning_effort)
+                    .bind(log.route_mode.as_str())
+                    .bind(log.status_code as i32)
+                    .bind(Json(log.usage.clone()))
+                    .bind(log.estimated_cost_usd)
+                    .bind(log.created_at)
+                    .execute(&mut *tx)
+                    .await?;
+                }
             }
         }
         tx.commit().await?;
@@ -468,6 +577,7 @@ impl Persistence {
             include_str!("../migrations/0001_init.sql"),
             include_str!("../migrations/0002_upstream_credentials.sql"),
             include_str!("../migrations/0003_conversation_contexts.sql"),
+            include_str!("../migrations/0004_gateway_users_and_request_logs.sql"),
         ] {
             for statement in migration
                 .split("\n-- statement-break\n")

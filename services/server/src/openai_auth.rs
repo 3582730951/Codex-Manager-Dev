@@ -1,6 +1,5 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
-use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -8,7 +7,7 @@ pub const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 pub const DEFAULT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const DEFAULT_SCOPE: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
-pub const DEFAULT_ORIGINATOR: &str = "codex_manager_web";
+pub const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 
 #[derive(Debug, Clone)]
 pub struct PkceCodes {
@@ -64,20 +63,24 @@ pub fn build_authorize_url(
     code_challenge: &str,
     state: &str,
 ) -> Result<String, String> {
-    let mut url = Url::parse(&format!("{}/oauth/authorize", DEFAULT_ISSUER))
-        .map_err(|error| error.to_string())?;
-    url.query_pairs_mut()
-        .append_pair("response_type", "code")
-        .append_pair("client_id", DEFAULT_CLIENT_ID)
-        .append_pair("redirect_uri", redirect_uri)
-        .append_pair("scope", DEFAULT_SCOPE)
-        .append_pair("code_challenge", code_challenge)
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("id_token_add_organizations", "true")
-        .append_pair("codex_cli_simplified_flow", "true")
-        .append_pair("state", state)
-        .append_pair("originator", DEFAULT_ORIGINATOR);
-    Ok(url.to_string())
+    let query = [
+        ("response_type", "code".to_string()),
+        ("client_id", DEFAULT_CLIENT_ID.to_string()),
+        ("redirect_uri", redirect_uri.to_string()),
+        ("scope", DEFAULT_SCOPE.to_string()),
+        ("code_challenge", code_challenge.to_string()),
+        ("code_challenge_method", "S256".to_string()),
+        ("id_token_add_organizations", "true".to_string()),
+        ("codex_cli_simplified_flow", "true".to_string()),
+        ("state", state.to_string()),
+        ("originator", DEFAULT_ORIGINATOR.to_string()),
+    ]
+    .into_iter()
+    .map(|(key, value)| format!("{key}={}", urlencoding::encode(&value)))
+    .collect::<Vec<_>>()
+    .join("&");
+
+    Ok(format!("{}/oauth/authorize?{}", DEFAULT_ISSUER, query))
 }
 
 pub fn parse_id_token_claims(token: &str) -> Result<IdTokenClaims, String> {

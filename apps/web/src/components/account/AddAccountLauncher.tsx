@@ -1,12 +1,6 @@
 "use client";
 
-import {
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  useTransition
-} from "react";
+import { useEffect, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 
 type LoginStartResult = {
@@ -33,8 +27,6 @@ type AddAccountLauncherProps = {
   accountCount: number;
   tenantCount: number;
 };
-
-type ActiveTab = "login" | "callback" | "import";
 
 function parseError(payload: unknown, fallback: string) {
   if (payload && typeof payload === "object") {
@@ -100,106 +92,38 @@ function normalizeCallbackUrl(rawValue: string, callbackUrl: string) {
     return normalized;
   }
 
-  throw new Error("回调地址里缺少 state 或 code。请粘贴浏览器最终停留的完整地址。");
+  throw new Error(
+    "回调地址里缺少 state 或 code。请粘贴浏览器最终停留的完整地址。",
+  );
 }
 
 export function AddAccountLauncher({
   callbackUrl,
   accountCount,
-  tenantCount
+  tenantCount,
 }: AddAccountLauncherProps) {
   const router = useRouter();
-  const [open, setOpen] = useState(false);
-  const [activeTab, setActiveTab] = useState<ActiveTab>("login");
   const [label, setLabel] = useState("");
   const [note, setNote] = useState("");
   const [callbackValue, setCallbackValue] = useState("");
   const [loginUrl, setLoginUrl] = useState("");
   const [loginId, setLoginId] = useState("");
   const [copyReady, setCopyReady] = useState(false);
-  const [statusTone, setStatusTone] = useState<"neutral" | "ok" | "error">("neutral");
+  const [statusTone, setStatusTone] = useState<"neutral" | "ok" | "error">(
+    "neutral",
+  );
   const [statusMessage, setStatusMessage] = useState(
-    "点击主按钮后，会直接生成 OpenAI 官方登录链接。"
+    "点击“连接 OpenAI”后，系统会直接生成完整授权链接，并同时支持打开、复制和后续回调补导入。",
   );
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const popupRef = useRef<Window | null>(null);
-  const closeTimerRef = useRef<number | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isPending, startTransition] = useTransition();
 
-  const statusLabel = useMemo(() => {
-    if (tenantCount === 0) {
-      return "首次授权会自动创建默认租户";
-    }
-    return `当前 ${tenantCount} 个租户，${accountCount} 个账号`;
-  }, [accountCount, tenantCount]);
-
-  const guide = useMemo(() => {
-    if (activeTab === "login") {
-      return {
-        kicker: "主入口",
-        title: "弹窗授权，一次完成",
-        body: "这里是默认入口。点击后会生成 OpenAI 官方授权页，你可以直接打开，也可以复制到自己常用浏览器里登录。",
-        steps: [
-          "点击“登录 OpenAI”后，系统先生成一条专属授权链接。",
-          "你可以直接打开，也可以复制这条 auth.openai.com 链接到常用浏览器。",
-          "回调页会自动把结果通知主页面，账号直接入池。"
-        ]
-      };
-    }
-    if (activeTab === "callback") {
-      return {
-        kicker: "兜底入口",
-        title: "粘贴地址即可补导入",
-        body: "如果浏览器没有自动回传，只要把最终地址完整粘贴回来，系统就能解析 state 和 code。",
-        steps: [
-          "回调地址里必须同时带 state 和 code。",
-          "支持粘贴完整 URL，也支持只粘贴查询串。",
-          "解析成功后会立刻导入账号并刷新工作台。"
-        ]
-      };
-    }
-    return {
-      kicker: "批量入口",
-      title: "账号文件统一导入",
-      body: "适合已有 JSON、TXT 或日志文件的场景。系统会自动补默认租户并一次完成导入。",
-      steps: [
-        "选择一个或多个账号文件。",
-        "支持 JSON、TXT、LOG 等文本格式。",
-        "导入完成后会自动关闭弹层并刷新列表。"
-      ]
-    };
-  }, [activeTab]);
-
-  useEffect(() => {
-    if (!open) {
-      return undefined;
-    }
-
-    const previousBody = document.body.style.overflow;
-    const previousHtml = document.documentElement.style.overflow;
-    document.body.style.overflow = "hidden";
-    document.documentElement.style.overflow = "hidden";
-    return () => {
-      document.body.style.overflow = previousBody;
-      document.documentElement.style.overflow = previousHtml;
-    };
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) {
-      return undefined;
-    }
-
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setOpen(false);
-        resetModal();
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [open]);
+  const statusLabel =
+    tenantCount === 0
+      ? "首次授权会自动创建默认租户"
+      : `当前 ${tenantCount} 个租户，${accountCount} 个账号`;
 
   useEffect(() => {
     function handleMessage(event: MessageEvent) {
@@ -215,13 +139,12 @@ export function AddAccountLauncher({
         finishSuccess(
           payload.importedLabel
             ? `已导入账号 ${payload.importedLabel}`
-            : payload.message || "OpenAI 账号已导入控制面。"
+            : payload.message || "OpenAI 账号已导入控制面。",
         );
       }
       if (payload.type === "codex-manager:login-error") {
         setStatusTone("error");
         setStatusMessage(payload.message || "授权回调解析失败。");
-        setActiveTab("callback");
       }
     }
 
@@ -230,28 +153,36 @@ export function AddAccountLauncher({
   }, []);
 
   useEffect(() => {
-    if (!open || !loginId) {
+    if (!loginId) {
       return undefined;
     }
 
     const timer = window.setInterval(async () => {
       try {
         const response = await fetch(`/api/account-intake/login/${loginId}`, {
-          cache: "no-store"
+          cache: "no-store",
         });
-        const session = await readJson<LoginSession>(response, "读取登录状态失败。");
-        const status = String(session.status || "").trim().toLowerCase();
+        const session = await readJson<LoginSession>(
+          response,
+          "读取登录状态失败。",
+        );
+        const status = String(session.status || "")
+          .trim()
+          .toLowerCase();
+
         if (status === "success") {
           finishSuccess(
             session.importedAccountLabel
               ? `已导入账号 ${session.importedAccountLabel}`
-              : "OpenAI 账号已导入控制面。"
+              : "OpenAI 账号已导入控制面。",
           );
         }
+
         if (status === "failed") {
           setStatusTone("error");
-          setStatusMessage(session.error?.trim() || "授权失败，请重试或改用回调解析。");
-          setActiveTab("callback");
+          setStatusMessage(
+            session.error?.trim() || "授权失败，请重试或改用回调补导入。",
+          );
           clearLoginSession();
         }
       } catch {
@@ -260,7 +191,7 @@ export function AddAccountLauncher({
     }, 1500);
 
     return () => window.clearInterval(timer);
-  }, [loginId, open]);
+  }, [loginId]);
 
   function clearLoginSession() {
     setLoginId("");
@@ -270,35 +201,18 @@ export function AddAccountLauncher({
     popupRef.current = null;
   }
 
-  function resetModal() {
-    clearLoginSession();
-    if (closeTimerRef.current) {
-      window.clearTimeout(closeTimerRef.current);
-      closeTimerRef.current = null;
-    }
-    setActiveTab("login");
-    setLabel("");
-    setNote("");
-    setCallbackValue("");
-    setLoginUrl("");
-    setCopyReady(false);
-    setSelectedFiles([]);
-    setStatusTone("neutral");
-    setStatusMessage("点击主按钮后，会直接生成 OpenAI 官方登录链接。");
-  }
-
   function finishSuccess(message: string) {
     clearLoginSession();
     setStatusTone("ok");
     setStatusMessage(message);
+    setCallbackValue("");
+    setSelectedFiles([]);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
     startTransition(() => {
       router.refresh();
     });
-    closeTimerRef.current = window.setTimeout(() => {
-      closeTimerRef.current = null;
-      setOpen(false);
-      resetModal();
-    }, 900);
   }
 
   async function createLoginSession(options?: {
@@ -308,31 +222,32 @@ export function AddAccountLauncher({
     setStatusTone("neutral");
     setStatusMessage(
       tenantCount === 0
-        ? "正在生成授权链接，默认租户会在首次成功后自动创建。"
-        : "正在生成 OpenAI 授权链接..."
+        ? "正在生成授权链接，首次成功后会自动创建默认租户。"
+        : "正在生成 OpenAI 授权链接...",
     );
 
     const response = await fetch("/api/account-intake/login/start", {
       method: "POST",
       headers: {
-        "content-type": "application/json"
+        "content-type": "application/json",
       },
       body: JSON.stringify({
         label,
         note,
-        redirectUri: callbackUrl
-      })
+        redirectUri: callbackUrl,
+      }),
     });
+
     const result = await readJson<LoginStartResult>(
       response,
-      "OpenAI 授权地址生成失败。"
+      "OpenAI 授权地址生成失败。",
     );
     setLoginId(result.loginId);
     setLoginUrl(result.authUrl);
     setCopyReady(true);
 
     if (options?.openTab === false) {
-      setStatusMessage("授权链接已生成。你可以直接复制到常用浏览器打开。");
+      setStatusMessage("完整授权链接已生成。你可以直接复制到常用浏览器打开。");
       return result.authUrl;
     }
 
@@ -347,8 +262,8 @@ export function AddAccountLauncher({
     popup.focus();
     setStatusMessage(
       options?.manualOnly
-        ? "授权链接已打开；如果验证页有问题，也可以直接复制下面的链接。"
-        : "授权页已打开；如果验证页有问题，也可以直接复制下面的链接。"
+        ? "授权页已打开；如果自动回调失败，再使用下面的回调补导入。"
+        : "授权页已打开；系统会轮询登录状态，失败时可以直接使用回调补导入。",
     );
     return result.authUrl;
   }
@@ -358,54 +273,67 @@ export function AddAccountLauncher({
       await createLoginSession();
     } catch (error) {
       setStatusTone("error");
-      setStatusMessage(error instanceof Error ? error.message : "OpenAI 授权启动失败。");
+      setStatusMessage(
+        error instanceof Error ? error.message : "OpenAI 授权启动失败。",
+      );
     }
   }
 
   async function handleCopyLoginUrl() {
     try {
       const authUrl =
-        loginUrl.trim() || (await createLoginSession({ openTab: false, manualOnly: true }));
+        loginUrl.trim() ||
+        (await createLoginSession({ openTab: false, manualOnly: true }));
       if (!authUrl) {
         throw new Error("授权链接生成失败。");
       }
       await navigator.clipboard.writeText(authUrl);
       setCopyReady(true);
       setStatusTone("ok");
-      setStatusMessage("授权链接已复制。请粘贴到你自己的浏览器地址栏打开。");
+      setStatusMessage("授权链接已复制。请粘贴到你的浏览器地址栏打开。");
     } catch (error) {
       setStatusTone("error");
       setStatusMessage(
-        error instanceof Error ? error.message : "授权链接复制失败，请手动复制。"
+        error instanceof Error
+          ? error.message
+          : "授权链接复制失败，请手动复制。",
       );
     }
   }
 
   async function handleManualCallback() {
     try {
-      const normalizedCallbackUrl = normalizeCallbackUrl(callbackValue, callbackUrl);
+      const normalizedCallbackUrl = normalizeCallbackUrl(
+        callbackValue,
+        callbackUrl,
+      );
       setStatusTone("neutral");
       setStatusMessage("正在解析回调并导入账号...");
+
       const response = await fetch("/api/account-intake/login/complete", {
         method: "POST",
         headers: {
-          "content-type": "application/json"
+          "content-type": "application/json",
         },
         body: JSON.stringify({
-          callbackUrl: normalizedCallbackUrl
-        })
+          callbackUrl: normalizedCallbackUrl,
+        }),
       });
+
       const payload = await readJson<{
         session?: { importedAccountLabel?: string | null };
       }>(response, "回调解析失败。");
+
       finishSuccess(
         payload.session?.importedAccountLabel
           ? `已导入账号 ${payload.session.importedAccountLabel}`
-          : "OpenAI 账号已导入控制面。"
+          : "OpenAI 账号已导入控制面。",
       );
     } catch (error) {
       setStatusTone("error");
-      setStatusMessage(error instanceof Error ? error.message : "回调解析失败。");
+      setStatusMessage(
+        error instanceof Error ? error.message : "回调解析失败。",
+      );
     }
   }
 
@@ -418,24 +346,30 @@ export function AddAccountLauncher({
 
     setStatusTone("neutral");
     setStatusMessage("正在导入账号文件...");
+
     try {
-      const contents = await Promise.all(selectedFiles.map((file) => file.text()));
+      const contents = await Promise.all(
+        selectedFiles.map((file) => file.text()),
+      );
       const response = await fetch("/api/account-intake/import", {
         method: "POST",
         headers: {
-          "content-type": "application/json"
+          "content-type": "application/json",
         },
-        body: JSON.stringify({ contents })
+        body: JSON.stringify({ contents }),
       });
+
       const result = await readJson<ImportResult>(response, "账号导入失败。");
       finishSuccess(
         result.failed > 0
           ? `导入完成，成功 ${result.created} 条，失败 ${result.failed} 条。`
-          : `导入完成，已新增 ${result.created} 个账号。`
+          : `导入完成，已新增 ${result.created} 个账号。`,
       );
     } catch (error) {
       setStatusTone("error");
-      setStatusMessage(error instanceof Error ? error.message : "账号导入失败。");
+      setStatusMessage(
+        error instanceof Error ? error.message : "账号导入失败。",
+      );
     }
   }
 
@@ -443,344 +377,211 @@ export function AddAccountLauncher({
     <>
       <div className="intake-toolbar">
         <div className="intake-toolbar-copy">
-          <strong>添加账号</strong>
+          <strong>接入状态</strong>
           <span>{statusLabel}</span>
         </div>
-        <button
-          className="button primary launcher-button"
-          onClick={() => setOpen(true)}
-          type="button"
-        >
-          <span>+ 添加账号</span>
-        </button>
+        <span className="toolbar-chip">
+          {loginId ? "授权会话进行中" : "等待发起连接"}
+        </span>
       </div>
 
-      <div className="launcher-grid">
-        <article className="launcher-card launcher-card-primary">
-          <span className="launcher-mark">01</span>
-          <strong>一键登录接入</strong>
-          <p>主入口先生成专属授权链接。你可以直接打开，也可以复制到自己的浏览器。</p>
-          <button
-            className="button primary"
-            onClick={() => {
-              setOpen(true);
-              setActiveTab("login");
-            }}
-            type="button"
-          >
-            <span>登录 OpenAI</span>
-          </button>
-        </article>
-
-        <article className="launcher-card">
-          <span className="launcher-mark">02</span>
-          <strong>粘贴回调补导入</strong>
-          <p>适合浏览器没有自动关闭的情况，直接粘贴最终地址即可恢复导入。</p>
-          <button
-            className="button ghost"
-            onClick={() => {
-              setOpen(true);
-              setActiveTab("callback");
-            }}
-            type="button"
-          >
-            <span>粘贴回调</span>
-          </button>
-        </article>
-
-        <article className="launcher-card">
-          <span className="launcher-mark">03</span>
-          <strong>文件批量导入</strong>
-          <p>选择 JSON、TXT 或日志文件，系统自动归并并写入当前账号池。</p>
-          <button
-            className="button ghost"
-            onClick={() => {
-              setOpen(true);
-              setActiveTab("import");
-            }}
-            type="button"
-          >
-            <span>选择文件</span>
-          </button>
-        </article>
+      <div
+        className={`status-banner ${statusTone === "neutral" ? "" : statusTone}`}
+      >
+        <strong>
+          {statusTone === "ok"
+            ? "已完成"
+            : statusTone === "error"
+              ? "需要处理"
+              : "准备中"}
+        </strong>
+        <p>{statusMessage}</p>
       </div>
 
-      {open ? (
-        <div
-          className="modal-overlay"
-          onClick={() => {
-            setOpen(false);
-            resetModal();
-          }}
-          role="presentation"
-        >
-          <section
-            aria-modal="true"
-            className="modal-panel"
-            onClick={(event) => event.stopPropagation()}
-            role="dialog"
-          >
-            <header className="modal-head modal-head-rich">
-              <div className="modal-head-copy">
-                <p className="section-kicker">账号接入</p>
-                <h3>一键接入 OpenAI 账号</h3>
-                <p className="modal-intro">
-                  默认先生成官方授权链接。成功后会回到当前站点的回调页，再自动把账号写入控制面。
-                </p>
-              </div>
-              <div className="modal-head-actions">
-                <span className="modal-chip">
-                  {tenantCount === 0 ? "默认租户自动创建" : "沿用当前租户"}
-                </span>
-                <span className="modal-chip">
-                  {loginId ? "授权会话进行中" : "等待授权"}
-                </span>
-                <button
-                  className="button ghost modal-close"
-                  onClick={() => {
-                    setOpen(false);
-                    resetModal();
-                  }}
-                  type="button"
-                >
-                  <span>关闭</span>
-                </button>
-              </div>
-            </header>
+      <div className="intake-grid">
+        <article className="intake-card intake-card-primary">
+          <div className="card-step">
+            <span>01</span>
+            <small>主操作</small>
+          </div>
+          <div className="card-copy">
+            <strong>连接 OpenAI</strong>
+            <p>
+              点击后直接向后端申请完整授权链接。页面会保留
+              authUrl、回调地址和当前会话状态，不再让你先进入一个工具化小弹层。
+            </p>
+          </div>
 
-            <div className={`status-banner ${statusTone}`}>
-              <strong>
-                {statusTone === "ok" ? "已完成" : statusTone === "error" ? "需要处理" : "准备中"}
-              </strong>
-              <p>{statusMessage}</p>
+          <div className="button-row">
+            <button
+              className="button primary"
+              disabled={isPending}
+              onClick={handleStartLogin}
+              type="button"
+            >
+              <span>{loginId ? "重新打开授权页" : "连接 OpenAI"}</span>
+            </button>
+            <button
+              className="button ghost"
+              disabled={isPending}
+              onClick={handleCopyLoginUrl}
+              type="button"
+            >
+              <span>{copyReady ? "复制登录链接" : "生成并复制链接"}</span>
+            </button>
+            <a
+              className="button ghost"
+              href={loginUrl || callbackUrl}
+              rel="noreferrer"
+              target="_blank"
+            >
+              <span>{loginUrl ? "打开当前授权页" : "打开回调页"}</span>
+            </a>
+          </div>
+
+          <div className="field-grid intake-fields">
+            <label className="field span-2">
+              <span>完整授权链接</span>
+              <textarea
+                readOnly
+                rows={5}
+                value={loginUrl || "点击上方按钮后，这里会显示完整 authUrl。"}
+              />
+            </label>
+            <label className="field span-2">
+              <span>当前回调地址</span>
+              <input readOnly type="text" value={callbackUrl} />
+            </label>
+          </div>
+
+          {loginId ? (
+            <div className="session-inline">
+              <strong>当前会话</strong>
+              <code>{loginId}</code>
             </div>
+          ) : null}
 
-            <div className="modal-tabs" role="tablist">
-              {[
-                ["login", "登录授权"],
-                ["callback", "回调解析"],
-                ["import", "文件导入"]
-              ].map(([key, title]) => (
-                <button
-                  aria-selected={activeTab === key}
-                  className={`modal-tab ${activeTab === key ? "active" : ""}`}
-                  key={key}
-                  onClick={() => setActiveTab(key as ActiveTab)}
-                  role="tab"
-                  type="button"
-                >
-                  {title}
-                </button>
+          <details className="detail-panel">
+            <summary>高级项</summary>
+            <div className="detail-body">
+              <div className="field-grid compact-grid">
+                <label className="field">
+                  <span>账号别名，可留空</span>
+                  <input
+                    onChange={(event) => setLabel(event.target.value)}
+                    placeholder="默认读取 OpenAI 账号信息"
+                    type="text"
+                    value={label}
+                  />
+                </label>
+                <label className="field">
+                  <span>备注，可留空</span>
+                  <input
+                    onChange={(event) => setNote(event.target.value)}
+                    placeholder="例如：主账号 / 团队工作区"
+                    type="text"
+                    value={note}
+                  />
+                </label>
+              </div>
+            </div>
+          </details>
+        </article>
+
+        <article className="intake-card">
+          <div className="card-step">
+            <span>02</span>
+            <small>回调兜底</small>
+          </div>
+          <div className="card-copy">
+            <strong>粘贴回调补导入</strong>
+            <p>
+              如果没有自动回到页面，就把浏览器最终停留的完整地址粘贴到这里，系统会自动抽取
+              state 和 code。
+            </p>
+          </div>
+
+          <label className="field">
+            <span>登录成功后的完整地址</span>
+            <textarea
+              onChange={(event) => setCallbackValue(event.target.value)}
+              placeholder="粘贴包含 state 和 code 的完整 URL"
+              rows={9}
+              value={callbackValue}
+            />
+          </label>
+
+          <div className="button-row">
+            <button
+              className="button primary"
+              disabled={isPending}
+              onClick={handleManualCallback}
+              type="button"
+            >
+              <span>解析并导入</span>
+            </button>
+            <a
+              className="button ghost"
+              href={callbackUrl}
+              rel="noreferrer"
+              target="_blank"
+            >
+              <span>打开回调页</span>
+            </a>
+          </div>
+        </article>
+
+        <article className="intake-card">
+          <div className="card-step">
+            <span>03</span>
+            <small>批量入口</small>
+          </div>
+          <div className="card-copy">
+            <strong>文件批量导入</strong>
+            <p>
+              把 JSON、TXT、LOG
+              直接拖进来，系统会逐个解析并写入账号池，不再经过额外弹层。
+            </p>
+          </div>
+
+          <label className="field">
+            <span>账号文件</span>
+            <input
+              accept=".json,.txt,.log"
+              multiple
+              onChange={(event) =>
+                setSelectedFiles(Array.from(event.target.files ?? []))
+              }
+              ref={fileInputRef}
+              type="file"
+            />
+          </label>
+
+          {selectedFiles.length > 0 ? (
+            <div className="file-list">
+              {selectedFiles.map((file) => (
+                <div className="file-item" key={`${file.name}-${file.size}`}>
+                  <strong>{file.name}</strong>
+                  <span>{Math.max(1, Math.round(file.size / 1024))} KB</span>
+                </div>
               ))}
             </div>
+          ) : (
+            <div className="upload-empty">选择账号文件后即可导入。</div>
+          )}
 
-            <div className="modal-stage">
-              <aside className="modal-aside">
-                <article className="modal-guide-card">
-                  <p className="section-kicker">{guide.kicker}</p>
-                  <strong>{guide.title}</strong>
-                  <p>{guide.body}</p>
-                </article>
-
-                <div className="modal-guide-list">
-                  {guide.steps.map((step, index) => (
-                    <div className="modal-guide-step" key={step}>
-                      <span>{String(index + 1).padStart(2, "0")}</span>
-                      <p>{step}</p>
-                    </div>
-                  ))}
-                </div>
-
-                <article className="modal-meta-card">
-                  <div className="modal-meta-row">
-                    <span>回调页</span>
-                    <strong>{callbackUrl}</strong>
-                  </div>
-                  <div className="modal-meta-row">
-                    <span>账号池</span>
-                    <strong>{accountCount} 个账号</strong>
-                  </div>
-                  <div className="modal-meta-row">
-                    <span>租户策略</span>
-                    <strong>{statusLabel}</strong>
-                  </div>
-                  {loginId ? (
-                    <div className="modal-meta-row">
-                      <span>当前会话</span>
-                      <strong>{loginId}</strong>
-                    </div>
-                  ) : null}
-                </article>
-              </aside>
-
-              <div className="modal-content">
-                {activeTab === "login" ? (
-                  <div className="modal-body">
-                    <div className="inline-note">
-                      <strong>无需先创建租户</strong>
-                      <span>
-                        {tenantCount === 0
-                          ? "首次授权成功后，系统会自动补一个默认租户。"
-                          : "当前环境已有租户，账号会直接写入当前控制面。"}
-                      </span>
-                    </div>
-
-                    <div className="modal-grid">
-                      <label className="modal-field">
-                        <span>账号别名</span>
-                        <input
-                          onChange={(event) => setLabel(event.target.value)}
-                          placeholder="可留空，默认读取 OpenAI 账号信息"
-                          type="text"
-                          value={label}
-                        />
-                      </label>
-                      <label className="modal-field">
-                        <span>备注</span>
-                        <input
-                          onChange={(event) => setNote(event.target.value)}
-                          placeholder="例如：主账号 / 团队工作区"
-                          type="text"
-                          value={note}
-                        />
-                      </label>
-                      <label className="modal-field modal-span-2">
-                        <span>回调地址</span>
-                        <input readOnly type="text" value={callbackUrl} />
-                      </label>
-                    </div>
-
-                    <div className="callout-card modal-callout">
-                      如果弹出的验证页不好用，直接复制下面的 `auth.openai.com` 链接到你自己的浏览器地址栏打开。
-                    </div>
-
-                    <div className="modal-actions">
-                      <button
-                        className="button primary"
-                        disabled={isPending}
-                        onClick={handleStartLogin}
-                        type="button"
-                      >
-                        <span>{loginId ? "重新打开授权页" : "登录 OpenAI"}</span>
-                      </button>
-                      <button
-                        className="button ghost"
-                        disabled={isPending}
-                        onClick={handleCopyLoginUrl}
-                        type="button"
-                      >
-                        <span>{copyReady ? "复制登录链接" : "生成并复制链接"}</span>
-                      </button>
-                      <a
-                        className="button ghost"
-                        href={loginUrl || callbackUrl}
-                        rel="noreferrer"
-                        target="_blank"
-                      >
-                        <span>{loginUrl ? "打开当前授权页" : "打开回调页"}</span>
-                      </a>
-                    </div>
-
-                    {loginUrl ? (
-                      <div className="auth-link-panel">
-                        <label className="modal-field">
-                          <span>可复制的 OpenAI 登录链接</span>
-                          <textarea readOnly rows={5} value={loginUrl} />
-                        </label>
-                      </div>
-                    ) : null}
-                  </div>
-                ) : null}
-
-                {activeTab === "callback" ? (
-                  <div className="modal-body">
-                    <div className="inline-note">
-                      <strong>完整地址里必须带 state 和 code</strong>
-                      <span>
-                        如果浏览器已经停在回调页，直接把地址栏里的完整内容整段粘贴进来即可。
-                      </span>
-                    </div>
-
-                    <label className="modal-field">
-                      <span>登录成功后的完整地址</span>
-                      <textarea
-                        onChange={(event) => setCallbackValue(event.target.value)}
-                        placeholder="粘贴包含 state 和 code 的完整 URL"
-                        rows={8}
-                        value={callbackValue}
-                      />
-                    </label>
-
-                    <div className="modal-actions">
-                      <button
-                        className="button primary"
-                        disabled={isPending}
-                        onClick={handleManualCallback}
-                        type="button"
-                      >
-                        <span>解析并导入</span>
-                      </button>
-                      <a
-                        className="button ghost"
-                        href={callbackUrl}
-                        rel="noreferrer"
-                        target="_blank"
-                      >
-                        <span>打开回调页</span>
-                      </a>
-                    </div>
-                  </div>
-                ) : null}
-
-                {activeTab === "import" ? (
-                  <div className="modal-body">
-                    <div className="inline-note">
-                      <strong>支持 JSON、TXT、LOG</strong>
-                      <span>适合把已有账号文件一次拖进来，由系统自动解析并导入。</span>
-                    </div>
-
-                    <label className="modal-field">
-                      <span>账号文件</span>
-                      <input
-                        accept=".json,.txt,.log"
-                        multiple
-                        onChange={(event) =>
-                          setSelectedFiles(Array.from(event.target.files ?? []))
-                        }
-                        type="file"
-                      />
-                    </label>
-
-                    {selectedFiles.length > 0 ? (
-                      <div className="upload-list">
-                        {selectedFiles.map((file) => (
-                          <div className="upload-item" key={`${file.name}-${file.size}`}>
-                            <strong>{file.name}</strong>
-                            <span>{Math.max(1, Math.round(file.size / 1024))} KB</span>
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="upload-empty">选择账号文件后即可一键导入。</div>
-                    )}
-
-                    <div className="modal-actions">
-                      <button
-                        className="button primary"
-                        disabled={isPending || selectedFiles.length === 0}
-                        onClick={handleImportFiles}
-                        type="button"
-                      >
-                        <span>一键导入账号</span>
-                      </button>
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            </div>
-          </section>
-        </div>
-      ) : null}
+          <div className="button-row">
+            <button
+              className="button primary"
+              disabled={isPending || selectedFiles.length === 0}
+              onClick={handleImportFiles}
+              type="button"
+            >
+              <span>导入账号文件</span>
+            </button>
+          </div>
+        </article>
+      </div>
     </>
   );
 }
