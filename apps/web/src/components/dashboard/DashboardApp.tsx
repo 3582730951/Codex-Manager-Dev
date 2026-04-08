@@ -631,7 +631,7 @@ function translationFor(language: Language) {
         curlExample: "curl 示例",
         copy: "复制",
         copied: "已复制",
-        fullKeyOnce: "完整 Key 只会在创建成功时显示一次；现有用户仅保留预览。",
+        fullKeyOnce: "打开用户配置即可查看并复制完整 Key；用户列表仍只显示预览。",
         tokenPreview: "Key 预览",
         requestCount: "请求数",
         estimatedSpend: "消费",
@@ -789,7 +789,7 @@ function translationFor(language: Language) {
         copy: "Copy",
         copied: "Copied",
         fullKeyOnce:
-          "The full key is shown only once at creation time; existing users keep a preview only.",
+          "Open user settings to view and copy the full key. The user list still keeps a preview only.",
         tokenPreview: "Key Preview",
         requestCount: "Requests",
         estimatedSpend: "Spend",
@@ -909,9 +909,10 @@ function UserPolicyCard({
     forceReasoningEffort !== user.forceReasoningEffort;
 
   const affinityValue = `${user.name.toLowerCase().replace(/\s+/g, "-")}-mbp-main`;
-  const shellSnippet = `export OPENAI_API_BASE="${gatewayBaseUrl}"\nexport OPENAI_API_KEY="${latestIssuedToken ?? "<gateway-key>"}"\nexport CODEX_AFFINITY_ID="${affinityValue}"`;
+  const visibleGatewayKey = latestIssuedToken ?? user.token;
+  const shellSnippet = `export OPENAI_API_BASE="${gatewayBaseUrl}"\nexport OPENAI_API_KEY="${visibleGatewayKey}"\nexport CODEX_AFFINITY_ID="${affinityValue}"`;
   const codexSnippet = `model_provider = "gateway"\nmodel = "${defaultModel || "gpt-5.4"}"\n\n[model_providers.gateway]\nname = "AI Pool Gateway"\nbase_url = "${gatewayBaseUrl}"\nenv_key = "OPENAI_API_KEY"\nenv_http_headers = { "x-codex-cli-affinity-id" = "CODEX_AFFINITY_ID" }`;
-  const curlSnippet = `curl ${gatewayBaseUrl.replace(/\/v1$/, "")}/v1/models -H "Authorization: Bearer ${latestIssuedToken ?? "<gateway-key>"}" -H "x-codex-cli-affinity-id: ${affinityValue}"`;
+  const curlSnippet = `curl ${gatewayBaseUrl.replace(/\/v1$/, "")}/v1/models -H "Authorization: Bearer ${visibleGatewayKey}" -H "x-codex-cli-affinity-id: ${affinityValue}"`;
   const routeModeLabel = (value: "direct" | "warp") =>
     value === "warp" ? "Warp" : language === "zh" ? "直连" : "Direct";
   const panelClass = cx(
@@ -1317,7 +1318,7 @@ function UserPolicyCard({
                   {
                     icon: KeyRound,
                     label: t.gatewayKey,
-                    value: latestIssuedToken ?? user.tokenPreview,
+                    value: visibleGatewayKey,
                     field: "base-key"
                   },
                   {
@@ -1385,11 +1386,9 @@ function UserPolicyCard({
                 <p className={cx("mt-3 text-xs leading-6", isDark ? "text-zinc-500" : "text-zinc-500")}>
                   {t.affinityHint}
                 </p>
-                {!latestIssuedToken ? (
-                  <p className={cx("mt-3 text-xs leading-6", isDark ? "text-zinc-500" : "text-zinc-500")}>
-                    {t.fullKeyOnce}
-                  </p>
-                ) : null}
+                <p className={cx("mt-3 text-xs leading-6", isDark ? "text-zinc-500" : "text-zinc-500")}>
+                  {t.fullKeyOnce}
+                </p>
               </div>
             </div>
 

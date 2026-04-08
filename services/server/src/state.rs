@@ -1978,6 +1978,7 @@ fn gateway_user_view(
         email: api_key.email.clone(),
         role: api_key.role,
         token_preview: mask_token(&api_key.token),
+        token: api_key.token.clone(),
         default_model: api_key.default_model.clone(),
         reasoning_effort: api_key.reasoning_effort.clone(),
         force_model_override: api_key.force_model_override,

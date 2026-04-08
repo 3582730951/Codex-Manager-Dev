@@ -380,6 +380,7 @@ pub struct GatewayUserView {
     pub email: String,
     pub role: GatewayUserRole,
     pub token_preview: String,
+    pub token: String,
     pub default_model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub force_model_override: bool,

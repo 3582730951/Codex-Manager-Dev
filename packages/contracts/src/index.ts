@@ -90,6 +90,7 @@ export interface GatewayUserView {
   email: string;
   role: GatewayUserRole;
   tokenPreview: string;
+  token: string;
   defaultModel: string | null;
   reasoningEffort: string | null;
   forceModelOverride: boolean;
@@ -287,6 +288,7 @@ export const dashboardFallback: DashboardSnapshot = {
       email: "demo@codex.local",
       role: "admin",
       tokenPreview: "cmgr_d…key",
+      token: "cmgr_demo_full_key",
       defaultModel: "gpt-5.4",
       reasoningEffort: "high",
       forceModelOverride: false,

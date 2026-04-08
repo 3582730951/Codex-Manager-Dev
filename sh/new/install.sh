@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUNNING_SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="${RUNNING_SCRIPT_DIR}"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-STATE_DIR="${SCRIPT_DIR}/state"
+STATE_DIR="${RUNNING_SCRIPT_DIR}/state"
 STATE_FILE="${STATE_DIR}/install-state.tsv"
 
 DEFAULT_IMAGE_NAME="codexmanager/codex-lite:latest"
 DEFAULT_CONTAINER_PREFIX="codex-"
-DEFAULT_REPO_URL="$(git -C "${PROJECT_DIR}" remote get-url origin 2>/dev/null || true)"
+DEFAULT_BOOTSTRAP_REPO_URL="https://github.com/3582730951/Codex-Manager-Dev.git"
+DEFAULT_REPO_URL="$(git -C "${PROJECT_DIR}" remote get-url origin 2>/dev/null || printf '%s' "${DEFAULT_BOOTSTRAP_REPO_URL}")"
 DEFAULT_REPO_REF="$(git -C "${PROJECT_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || printf 'main')"
-DEFAULT_DEPLOY_DIR="${PROJECT_DIR}/.docker-deploy/codex-manager"
+DEFAULT_DEPLOY_DIR=""
 LEGACY_RUNTIME_ENV="${SCRIPT_DIR}/../.runtime.env"
+BOOTSTRAP_CACHE_DIR="${XDG_CACHE_HOME:-${HOME:-/root}/.cache}/codex-manager-install"
 
 log() {
   printf '[install] %s\n' "$*"
@@ -237,6 +240,73 @@ load_legacy_runtime_env() {
         ;;
     esac
   done < "${file}"
+}
+
+cache_key_for_value() {
+  local value="$1"
+  python3 - "$value" <<'PY'
+import hashlib
+import sys
+
+print(hashlib.sha256(sys.argv[1].encode("utf-8")).hexdigest()[:16])
+PY
+}
+
+runtime_layout_ready() {
+  [[ -f "${SCRIPT_DIR}/Dockerfile" ]] || return 1
+  [[ -f "${SCRIPT_DIR}/scripts/container-bootstrap.sh" ]] || return 1
+  [[ -d "${SCRIPT_DIR}/skills" ]] || return 1
+  [[ -d "${PROJECT_DIR}/sh/new" ]] || return 1
+}
+
+ensure_runtime_layout() {
+  local repo_url repo_ref cache_key bootstrap_root
+
+  if runtime_layout_ready; then
+    return 0
+  fi
+
+  repo_url="${CMGR_BOOTSTRAP_REPO_URL:-${DEFAULT_REPO_URL:-${DEFAULT_BOOTSTRAP_REPO_URL}}}"
+  repo_ref="${CMGR_BOOTSTRAP_REPO_REF:-${DEFAULT_REPO_REF:-main}}"
+  [[ -n "${repo_url}" ]] || repo_url="${DEFAULT_BOOTSTRAP_REPO_URL}"
+  [[ -n "${repo_ref}" ]] || repo_ref="main"
+
+  mkdir -p "${BOOTSTRAP_CACHE_DIR}"
+  cache_key="$(cache_key_for_value "${repo_url}|${repo_ref}")"
+  bootstrap_root="${BOOTSTRAP_CACHE_DIR}/${cache_key}"
+
+  if [[ -d "${bootstrap_root}/.git" ]]; then
+    git config --global --add safe.directory "${bootstrap_root}"
+    git -C "${bootstrap_root}" remote set-url origin "${repo_url}" >/dev/null 2>&1 || true
+    git -C "${bootstrap_root}" fetch --prune --tags origin >/dev/null 2>&1 || true
+  else
+    rm -rf "${bootstrap_root}"
+    if ! git clone --depth 1 --branch "${repo_ref}" "${repo_url}" "${bootstrap_root}" >/dev/null 2>&1; then
+      rm -rf "${bootstrap_root}"
+      git clone "${repo_url}" "${bootstrap_root}" >/dev/null 2>&1 || die "无法自动拉取 install.sh 所需资源，请检查仓库地址或网络。"
+      git config --global --add safe.directory "${bootstrap_root}"
+      git -C "${bootstrap_root}" fetch --prune --tags origin >/dev/null 2>&1 || true
+    else
+      git config --global --add safe.directory "${bootstrap_root}"
+    fi
+  fi
+
+  if git -C "${bootstrap_root}" show-ref --verify --quiet "refs/remotes/origin/${repo_ref}"; then
+    git -C "${bootstrap_root}" checkout -B "${repo_ref}" "origin/${repo_ref}" >/dev/null 2>&1 || die "无法切换到分支: ${repo_ref}"
+  else
+    git -C "${bootstrap_root}" checkout --detach "${repo_ref}" >/dev/null 2>&1 || die "无法切换到引用: ${repo_ref}"
+  fi
+  git -C "${bootstrap_root}" reset --hard >/dev/null 2>&1 || true
+  git -C "${bootstrap_root}" clean -fdx >/dev/null 2>&1 || true
+
+  [[ -f "${bootstrap_root}/sh/new/Dockerfile" ]] || die "自动拉取成功，但缺少 sh/new/Dockerfile。"
+  [[ -f "${bootstrap_root}/sh/new/scripts/container-bootstrap.sh" ]] || die "自动拉取成功，但缺少容器启动脚本。"
+  [[ -d "${bootstrap_root}/sh/new/skills" ]] || die "自动拉取成功，但缺少 skills 目录。"
+
+  SCRIPT_DIR="${bootstrap_root}/sh/new"
+  PROJECT_DIR="${bootstrap_root}"
+  LEGACY_RUNTIME_ENV="${SCRIPT_DIR}/../.runtime.env"
+  log "检测到当前只有 install.sh，已自动同步运行资源到: ${bootstrap_root}"
 }
 
 latest_container_name() {
@@ -489,6 +559,14 @@ is_current_project_repo() {
   [[ -f "${repo_dir}/compose.yml" || -f "${repo_dir}/compose.current.test.yml" ]] || return 1
 }
 
+default_deploy_dir() {
+  if is_current_project_repo "${PROJECT_DIR}"; then
+    printf '%s' "${PROJECT_DIR}/.docker-deploy/codex-manager"
+  else
+    resolve_path "${HOME:-/root}/.docker-deploy/codex-manager"
+  fi
+}
+
 write_current_project_deploy_compose() {
   local compose_file="$1" stack_name="$2" web_port="$3" data_port="$4" admin_port="$5" browser_port="$6" postgres_port="$7" redis_port="$8"
   cat > "${compose_file}" <<EOF
@@ -694,6 +772,7 @@ build_image_action() {
   activate_action_context "${action}" "image=${image_name}"
   state_set 'LAST_IMAGE_NAME' "${image_name}"
 
+  run_step "${action}" "prepare_runtime" ensure_runtime_layout
   run_step "${action}" "verify_inputs" test -f "${SCRIPT_DIR}/Dockerfile"
   run_step "${action}" "verify_skills" test -d "${SCRIPT_DIR}/skills/ui-ux-pro-max"
   run_step "${action}" "docker_build" docker build -f "${SCRIPT_DIR}/Dockerfile" -t "${image_name}" "${PROJECT_DIR}"
@@ -838,7 +917,7 @@ deploy_project_action() {
 
   repo_url="$(prompt_default '请输入远端仓库 URL' "$(state_get_or_default 'LAST_DEPLOY_REPO_URL' "${DEFAULT_REPO_URL}")")"
   repo_ref="$(prompt_default '请输入远端分支或引用' "$(state_get_or_default 'LAST_DEPLOY_REPO_REF' "${DEFAULT_REPO_REF}")")"
-  deploy_dir="$(prompt_default '请输入部署目录' "$(state_get_or_default 'LAST_DEPLOY_DIR' "${DEFAULT_DEPLOY_DIR}")")"
+  deploy_dir="$(prompt_default '请输入部署目录' "$(state_get_or_default 'LAST_DEPLOY_DIR' "$(default_deploy_dir)")")"
   stack_name="$(prompt_default '请输入部署栈名称' "$(state_get_or_default 'LAST_DEPLOY_STACK_NAME' 'cmgrd')")"
   activate_action_context "${action}" "repo=${repo_url}|ref=${repo_ref}|dir=${deploy_dir}|stack=${stack_name}"
 
