@@ -188,11 +188,35 @@ print(target.resolve())
 PY
 }
 
+is_windows_drive_path() {
+  [[ "$1" =~ ^[A-Za-z]:[\\/].* ]]
+}
+
+windows_path_to_host_path() {
+  local target="$1"
+  python3 - "$target" <<'PY'
+import re
+import sys
+
+raw = sys.argv[1].strip()
+match = re.match(r'^([A-Za-z]):[\\/]*(.*)$', raw)
+if not match:
+    raise SystemExit(raw)
+
+drive = match.group(1).lower()
+rest = match.group(2).replace("\\", "/").strip("/")
+if rest:
+    print(f"/mnt/{drive}/{rest}")
+else:
+    print(f"/mnt/{drive}")
+PY
+}
+
 running_inside_docker() {
   [[ -f "/.dockerenv" ]]
 }
 
-container_path_to_host_path() {
+linux_path_to_host_path() {
   local container_path="$1" abs_path container_id best_source="" best_destination=""
   abs_path="$(resolve_path "${container_path}")"
 
@@ -222,6 +246,33 @@ container_path_to_host_path() {
   else
     printf '%s' "${abs_path}"
   fi
+}
+
+workspace_path_to_host_path() {
+  local workspace_path="$1"
+  if is_windows_drive_path "${workspace_path}"; then
+    windows_path_to_host_path "${workspace_path}"
+  else
+    linux_path_to_host_path "${workspace_path}"
+  fi
+}
+
+docker_bind_source_exists() {
+  local host_path="$1"
+  docker run --rm \
+    --mount "type=bind,src=${host_path},dst=/cmgr-probe,readonly" \
+    alpine:3.20 \
+    test -d /cmgr-probe >/dev/null 2>&1
+}
+
+verify_workspace_path() {
+  local workspace_path="$1" host_workspace_path="$2"
+
+  if [[ -d "${host_workspace_path}" ]]; then
+    return 0
+  fi
+
+  docker_bind_source_exists "${host_workspace_path}"
 }
 
 load_legacy_runtime_env() {
@@ -472,7 +523,7 @@ docker_mode_prompt_default() {
 }
 
 default_workspace_path() {
-  local last_deploy_dir last_workspace_path
+  local last_deploy_dir last_workspace_path last_host_workspace_path
 
   last_deploy_dir="$(state_get 'LAST_DEPLOY_DIR' 2>/dev/null || true)"
   if [[ -n "${last_deploy_dir}" && -d "${last_deploy_dir}" ]]; then
@@ -481,7 +532,8 @@ default_workspace_path() {
   fi
 
   last_workspace_path="$(state_get 'LAST_WORKSPACE_PATH' 2>/dev/null || true)"
-  if [[ -n "${last_workspace_path}" && -d "${last_workspace_path}" ]]; then
+  last_host_workspace_path="$(state_get 'LAST_HOST_WORKSPACE_PATH' 2>/dev/null || true)"
+  if [[ -n "${last_workspace_path}" && ( -d "${last_workspace_path}" || -d "${last_host_workspace_path}" ) ]]; then
     printf '%s' "${last_workspace_path}"
     return 0
   fi
@@ -799,7 +851,10 @@ create_container_action() {
   docker_mode_input="$(prompt_default 'Docker 模式: 0=禁用 1=容器内独立 Docker(推荐) 2=共享宿主 docker.sock' "$(docker_mode_prompt_default)")"
   docker_mode="$(normalize_docker_mode "${docker_mode_input}")" || die "未知 Docker 模式: ${docker_mode_input}"
 
-  host_workspace_path="$(container_path_to_host_path "${workspace_path}")"
+  host_workspace_path="$(workspace_path_to_host_path "${workspace_path}")"
+  if [[ "${host_workspace_path}" != "${workspace_path}" ]]; then
+    log "检测到工作区输入需要转换，已映射为宿主路径: ${host_workspace_path}"
+  fi
   network_name="$(container_network_name "${container_name}")"
   volume_name="$(container_volume_name "${container_name}")"
   agents_volume_name="$(container_agents_volume_name "${container_name}")"
@@ -819,7 +874,7 @@ create_container_action() {
   activate_action_context "${action}" "image=${image_name}|container=${container_name}|workspace=${workspace_path}|api-base=${api_base}|docker=${docker_mode}"
 
   run_step "${action}" "verify_image" docker image inspect "${image_name}" >/dev/null
-  run_step "${action}" "verify_workspace" test -d "${workspace_path}"
+  run_step "${action}" "verify_workspace" verify_workspace_path "${workspace_path}" "${host_workspace_path}"
   run_step "${action}" "ensure_network" ensure_network_exists "${network_name}"
   run_step "${action}" "ensure_volume" ensure_volume_exists "${volume_name}"
   run_step "${action}" "ensure_agents_volume" ensure_volume_exists "${agents_volume_name}"
