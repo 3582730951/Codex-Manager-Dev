@@ -4,7 +4,10 @@ use async_stream::stream;
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::State,
+    extract::{
+        State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::{HeaderMap, HeaderValue, Response, StatusCode, header::CONTENT_TYPE},
     response::{
         IntoResponse,
@@ -66,7 +69,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
-        .route("/v1/responses", post(responses))
+        .route("/v1/responses", get(responses_ws).post(responses))
         .route("/v1/chat/completions", post(chat_completions))
         .with_state(state)
 }
@@ -292,6 +295,262 @@ async fn responses(
     }
 
     waiting_response(stream_requested, state.config.heartbeat_seconds)
+}
+
+async fn responses_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let Some(auth) = authenticated_context(&state, &headers).await else {
+        return unauthorized().into_response();
+    };
+    let principal_id = derive_principal_id(&headers, auth.tenant.slug.as_str());
+    let subagent_count = headers.get("x-openai-subagent").map(|_| 1_u32).unwrap_or(0);
+    let context = forward_context(&headers, &principal_id);
+
+    ws.on_upgrade(move |socket| async move {
+        handle_responses_ws(socket, state, auth, principal_id, context, subagent_count).await;
+    })
+    .into_response()
+}
+
+async fn handle_responses_ws(
+    mut socket: WebSocket,
+    state: AppState,
+    auth: GatewayAuthContext,
+    principal_id: String,
+    context: ForwardContext,
+    subagent_count: u32,
+) {
+    loop {
+        let Some(message) = socket.recv().await else {
+            break;
+        };
+        let message = match message {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::warn!(%error, principal_id = %principal_id, "responses websocket receive failed");
+                break;
+            }
+        };
+
+        match message {
+            Message::Text(text) => {
+                if handle_responses_ws_text(
+                    &mut socket,
+                    &state,
+                    &auth,
+                    &principal_id,
+                    &context,
+                    subagent_count,
+                    text.as_str(),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+            Message::Binary(_) => {
+                if send_ws_failure_response(
+                    &mut socket,
+                    None,
+                    "invalid_request_error",
+                    "binary websocket frames are not supported on /v1/responses",
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+            Message::Ping(payload) => {
+                if socket.send(Message::Pong(payload)).await.is_err() {
+                    break;
+                }
+            }
+            Message::Pong(_) => {}
+            Message::Close(_) => break,
+        }
+    }
+}
+
+async fn handle_responses_ws_text(
+    socket: &mut WebSocket,
+    state: &AppState,
+    auth: &GatewayAuthContext,
+    principal_id: &str,
+    context: &ForwardContext,
+    subagent_count: u32,
+    message: &str,
+) -> Result<(), ()> {
+    let payload = match parse_responses_ws_create(message) {
+        Ok(payload) => payload,
+        Err(error) => {
+            send_ws_failure_response(socket, None, "invalid_request_error", &error).await?;
+            return Ok(());
+        }
+    };
+
+    forward_responses_ws(socket, state, auth, principal_id, context, subagent_count, payload).await
+}
+
+async fn forward_responses_ws(
+    socket: &mut WebSocket,
+    state: &AppState,
+    auth: &GatewayAuthContext,
+    principal_id: &str,
+    context: &ForwardContext,
+    subagent_count: u32,
+    mut payload: ResponsesRequest,
+) -> Result<(), ()> {
+    let generate = match extract_ws_generate(&mut payload) {
+        Ok(generate) => generate,
+        Err(error) => {
+            send_ws_failure_response(socket, None, "invalid_request_error", &error).await?;
+            return Ok(());
+        }
+    };
+    if !generate {
+        send_ws_failure_response(
+            socket,
+            None,
+            "unsupported_feature",
+            "response.create with generate=false is not supported by this gateway",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let requested_model = payload.model.clone();
+    let effective_model = resolve_effective_model(&auth.api_key, &requested_model);
+    let effective_reasoning_effort =
+        resolve_effective_reasoning_for_responses(&auth.api_key, &payload);
+    let mut payload =
+        apply_responses_policy(&payload, &effective_model, effective_reasoning_effort.as_deref());
+    payload.stream = Some(true);
+    payload.extra.remove("background");
+
+    let model = payload.model.clone();
+    let input_summary = summarize_value(&payload.input);
+    let request_log = RequestLogSeed {
+        api_key: auth.api_key.clone(),
+        tenant_id: auth.tenant.id,
+        principal_id: principal_id.to_string(),
+        endpoint: "/v1/responses",
+        method: "WS",
+        requested_model,
+        effective_model: model.clone(),
+        reasoning_effort: effective_reasoning_effort.clone(),
+    };
+    let selection_request = LeaseSelectionRequest {
+        tenant_id: auth.tenant.id,
+        principal_id: principal_id.to_string(),
+        model: model.clone(),
+        reasoning_effort: effective_reasoning_effort.clone(),
+        subagent_count,
+    };
+    let mut selection = state.resolve_lease(selection_request.clone()).await;
+    let mut recorded_input = false;
+
+    for attempt in 0..2 {
+        let Some((lease, replay, _warmup)) = selection.take() else {
+            send_ws_waiting_response(socket, &model).await?;
+            return Ok(());
+        };
+        if !recorded_input {
+            state
+                .record_context_input(
+                    principal_id,
+                    &model,
+                    lease.generation,
+                    input_summary.clone(),
+                )
+                .await;
+            recorded_input = true;
+        }
+        let replay_context = state.replay_context_for(principal_id, lease.generation).await;
+        let Some(credential) = state.credential_for_account(&lease.account_id).await else {
+            let _ = state
+                .failover_account(&lease.account_id, "credential-missing", 300, true)
+                .await;
+            tracing::warn!(
+                account_id = %lease.account_id,
+                principal_id = %principal_id,
+                "selected account missing credential for responses websocket, retrying hidden failover"
+            );
+            if attempt == 0 {
+                selection = state.resolve_lease(selection_request.clone()).await;
+                continue;
+            }
+            send_ws_waiting_response(socket, &model).await?;
+            return Ok(());
+        };
+
+        let codex_protocol = is_codex_chatgpt_backend(&credential.base_url);
+        let upstream_value = responses_payload_for_upstream(
+            &payload,
+            replay.cache_key.clone(),
+            replay_context.as_deref(),
+            codex_protocol,
+        );
+
+        match state
+            .upstream
+            .post_json(
+                &credential,
+                "responses",
+                &upstream_value,
+                context,
+                true,
+                lease.route_mode,
+            )
+            .await
+        {
+            Ok(response) => match upstream_stream_to_ws_response(
+                response,
+                socket,
+                state,
+                lease.clone(),
+                request_log.clone(),
+                principal_id.to_string(),
+                &model,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(kind) => {
+                    handle_hidden_failure(state, &lease, kind).await;
+                    if attempt == 0 && kind.requires_failover() {
+                        selection = state.resolve_lease(selection_request.clone()).await;
+                        continue;
+                    }
+                    send_ws_waiting_response(socket, &model).await?;
+                    return Ok(());
+                }
+            },
+            Err(error) => {
+                handle_hidden_failure(state, &lease, error.kind).await;
+                tracing::warn!(
+                    account_id = %lease.account_id,
+                    route_mode = %lease.route_mode.as_str(),
+                    status = ?error.status,
+                    kind = ?error.kind,
+                    body_preview = %truncate_text(error.body.unwrap_or_default(), 160),
+                    "responses websocket upstream request failed"
+                );
+                if attempt == 0 && error.kind.requires_failover() {
+                    selection = state.resolve_lease(selection_request.clone()).await;
+                    continue;
+                }
+                send_ws_waiting_response(socket, &model).await?;
+                return Ok(());
+            }
+        }
+    }
+
+    send_ws_waiting_response(socket, &model).await
 }
 
 async fn chat_completions(
@@ -774,6 +1033,270 @@ fn waiting_chat_response(
     }
 
     waiting_response(false, heartbeat_seconds)
+}
+
+fn parse_responses_ws_create(message: &str) -> Result<ResponsesRequest, String> {
+    let mut value =
+        serde_json::from_str::<Value>(message).map_err(|error| format!("invalid JSON: {error}"))?;
+    let Some(object) = value.as_object_mut() else {
+        return Err("invalid websocket payload: expected a JSON object".to_string());
+    };
+    let Some(event_type) = object.remove("type").and_then(|value| {
+        value.as_str().map(str::to_string)
+    }) else {
+        return Err("invalid websocket payload: missing type".to_string());
+    };
+    if event_type != "response.create" {
+        return Err(format!("unsupported websocket event type: {event_type}"));
+    }
+    object.remove("background");
+    serde_json::from_value(value)
+        .map_err(|error| format!("invalid response.create payload: {error}"))
+}
+
+fn extract_ws_generate(payload: &mut ResponsesRequest) -> Result<bool, String> {
+    match payload.extra.remove("generate") {
+        None => Ok(true),
+        Some(Value::Bool(generate)) => Ok(generate),
+        Some(_) => Err("invalid response.create payload: generate must be a boolean".to_string()),
+    }
+}
+
+async fn upstream_stream_to_ws_response(
+    response: reqwest::Response,
+    socket: &mut WebSocket,
+    state: &AppState,
+    lease: CliLease,
+    request_log: RequestLogSeed,
+    principal_id: String,
+    expected_model: &str,
+) -> Result<(), UpstreamFailureKind> {
+    let status = response.status();
+    let headers = response.headers().clone();
+    if let Some(kind) = hidden_failure_kind_from_headers(&headers, expected_model) {
+        return Err(kind);
+    }
+
+    let (mut upstream, buffered_records, mut buffer) =
+        preflight_response_stream(response, expected_model).await?;
+    let mut output_summary = String::new();
+    let mut usage = RequestLogUsage::default();
+    let mut observed_model = observed_model_from_headers(&headers);
+
+    for record in buffered_records {
+        if let Some(value) = response_value_from_sse_record(&record) {
+            merge_request_usage(&mut usage, request_usage_from_value(&value));
+            if observed_model.is_none() {
+                observed_model = observed_model_from_value(&value);
+            }
+        }
+        if let Some(delta) = response_delta_text(&record) {
+            output_summary.push_str(delta.as_str());
+        }
+        send_ws_record(socket, &record)
+            .await
+            .map_err(|_| UpstreamFailureKind::Generic)?;
+    }
+
+    while let Some(chunk) = upstream.next().await {
+        let chunk = chunk.map_err(|_| UpstreamFailureKind::Generic)?;
+        buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()).replace("\r\n", "\n"));
+        while let Some(record) = take_sse_record(&mut buffer) {
+            if let Some(kind) = hidden_failure_kind_from_sse_record(&record, expected_model) {
+                return Err(kind);
+            }
+            if let Some(value) = response_value_from_sse_record(&record) {
+                merge_request_usage(&mut usage, request_usage_from_value(&value));
+                if observed_model.is_none() {
+                    observed_model = observed_model_from_value(&value);
+                }
+            }
+            if let Some(delta) = response_delta_text(&record) {
+                output_summary.push_str(delta.as_str());
+            }
+            send_ws_record(socket, &record)
+                .await
+                .map_err(|_| UpstreamFailureKind::Generic)?;
+        }
+    }
+
+    let _ = state
+        .record_route_event(
+            &lease.account_id,
+            RouteEventRequest {
+                mode: lease.route_mode,
+                kind: "success".to_string(),
+            },
+        )
+        .await;
+    let summary = if output_summary.trim().is_empty() {
+        "streamed assistant response delivered".to_string()
+    } else {
+        truncate_text(output_summary, 240)
+    };
+    state.record_context_output(&principal_id, summary).await;
+    state
+        .record_request_log(build_request_log_entry(
+            &request_log,
+            &lease,
+            status.as_u16(),
+            usage,
+            observed_model,
+        ))
+        .await;
+    Ok(())
+}
+
+async fn send_ws_record(socket: &mut WebSocket, record: &str) -> Result<(), ()> {
+    let Some((_, data)) = parse_sse_record(record) else {
+        return Ok(());
+    };
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(());
+    }
+    socket
+        .send(Message::Text(data.to_string().into()))
+        .await
+        .map_err(|_| ())
+}
+
+async fn send_ws_waiting_response(socket: &mut WebSocket, model: &str) -> Result<(), ()> {
+    for value in websocket_text_response_events(
+        model,
+        "Gateway queue active. Waiting for an exact-capability account.",
+    ) {
+        send_ws_json(socket, &value).await?;
+    }
+    Ok(())
+}
+
+async fn send_ws_failure_response(
+    socket: &mut WebSocket,
+    response_id: Option<&str>,
+    code: &str,
+    message: &str,
+) -> Result<(), ()> {
+    let mut response = serde_json::Map::new();
+    if let Some(response_id) = response_id {
+        response.insert("id".to_string(), Value::String(response_id.to_string()));
+    }
+    response.insert("status".to_string(), Value::String("failed".to_string()));
+    response.insert(
+        "error".to_string(),
+        json!({
+            "code": code,
+            "message": message,
+        }),
+    );
+    send_ws_json(
+        socket,
+        &Value::Object(serde_json::Map::from_iter([
+            ("type".to_string(), Value::String("response.failed".to_string())),
+            ("response".to_string(), Value::Object(response)),
+        ])),
+    )
+    .await
+}
+
+async fn send_ws_json(socket: &mut WebSocket, value: &Value) -> Result<(), ()> {
+    socket
+        .send(Message::Text(value.to_string().into()))
+        .await
+        .map_err(|_| ())
+}
+
+fn websocket_text_response_events(model: &str, text: &str) -> Vec<Value> {
+    let response_id = format!("resp_ws_{}", uuid::Uuid::new_v4().simple());
+    let item_id = format!("msg_ws_{}", uuid::Uuid::new_v4().simple());
+    let part = json!({
+        "type": "output_text",
+        "text": "",
+    });
+    let item = json!({
+        "id": item_id,
+        "type": "message",
+        "role": "assistant",
+        "status": "in_progress",
+        "content": [part.clone()],
+    });
+    let final_item = json!({
+        "id": item_id,
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{
+            "type": "output_text",
+            "text": text,
+        }],
+    });
+    vec![
+        json!({
+            "type": "response.created",
+            "response": {
+                "id": response_id,
+                "model": model,
+                "status": "in_progress",
+                "output": [],
+            }
+        }),
+        json!({
+            "type": "response.output_item.added",
+            "response_id": response_id,
+            "output_index": 0,
+            "item": item,
+        }),
+        json!({
+            "type": "response.content_part.added",
+            "response_id": response_id,
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": part,
+        }),
+        json!({
+            "type": "response.output_text.delta",
+            "response_id": response_id,
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "delta": text,
+        }),
+        json!({
+            "type": "response.output_text.done",
+            "response_id": response_id,
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": text,
+        }),
+        json!({
+            "type": "response.content_part.done",
+            "response_id": response_id,
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {
+                "type": "output_text",
+                "text": text,
+            },
+        }),
+        json!({
+            "type": "response.output_item.done",
+            "response_id": response_id,
+            "output_index": 0,
+            "item": final_item.clone(),
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "model": model,
+                "status": "completed",
+                "output": [final_item],
+            }
+        }),
+    ]
 }
 
 async fn upstream_json_response(
@@ -1687,15 +2210,19 @@ fn codex_responses_payload(
         object.insert("reasoning".to_string(), reasoning);
     }
     for (key, value) in &payload.extra {
-        if !matches!(
-            key.as_str(),
-            "instructions" | "store" | "stream" | "prompt_cache_key"
-        ) && !object.contains_key(key)
+        if codex_passthrough_extra_key(key) && !object.contains_key(key)
         {
             object.insert(key.clone(), value.clone());
         }
     }
     Value::Object(object)
+}
+
+fn codex_passthrough_extra_key(key: &str) -> bool {
+    !matches!(
+        key,
+        "instructions" | "store" | "stream" | "prompt_cache_key" | "max_output_tokens"
+    )
 }
 
 fn codex_instructions_and_input(
@@ -1819,11 +2346,7 @@ fn responses_payload_from_chat_request(
     }
     for (key, value) in &payload.extra {
         if !object.contains_key(key)
-            && (!codex_protocol
-                || !matches!(
-                    key.as_str(),
-                    "instructions" | "store" | "stream" | "prompt_cache_key"
-                ))
+            && (!codex_protocol || codex_passthrough_extra_key(key))
         {
             object.insert(key.clone(), value.clone());
         }
@@ -2704,6 +3227,115 @@ mod tests {
         assert_eq!(
             mapped.get("prompt_cache_key").and_then(Value::as_str),
             Some("cache-123")
+        );
+    }
+
+    #[test]
+    fn codex_responses_payload_drops_unsupported_max_output_tokens() {
+        let payload = ResponsesRequest {
+            model: "gpt-5.2".to_string(),
+            input: json!("hello"),
+            stream: Some(false),
+            reasoning: None,
+            prompt_cache_key: None,
+            extra: serde_json::Map::from_iter([
+                ("max_output_tokens".to_string(), json!(16)),
+                ("metadata".to_string(), json!({"source": "test"})),
+            ]),
+        };
+
+        let mapped = responses_payload_for_upstream(&payload, "cache-123".to_string(), None, true);
+        assert!(mapped.get("max_output_tokens").is_none());
+        assert_eq!(
+            mapped
+                .get("metadata")
+                .and_then(|value| value.get("source"))
+                .and_then(Value::as_str),
+            Some("test")
+        );
+    }
+
+    #[test]
+    fn parse_responses_ws_create_strips_transport_fields() {
+        let payload = parse_responses_ws_create(
+            r#"{"type":"response.create","model":"gpt-5.4","input":"hello","background":true,"metadata":{"source":"test"}}"#,
+        )
+        .expect("parse websocket response.create");
+
+        assert_eq!(payload.model, "gpt-5.4");
+        assert_eq!(payload.input, json!("hello"));
+        assert!(payload.extra.get("background").is_none());
+        assert_eq!(
+            payload
+                .extra
+                .get("metadata")
+                .and_then(|value| value.get("source"))
+                .and_then(Value::as_str),
+            Some("test")
+        );
+    }
+
+    #[test]
+    fn extract_ws_generate_defaults_true_and_strips_field() {
+        let mut payload = parse_responses_ws_create(
+            r#"{"type":"response.create","model":"gpt-5.4","input":"hello","generate":true}"#,
+        )
+        .expect("parse websocket response.create");
+
+        assert_eq!(extract_ws_generate(&mut payload), Ok(true));
+        assert!(payload.extra.get("generate").is_none());
+    }
+
+    #[test]
+    fn extract_ws_generate_rejects_non_boolean_values() {
+        let mut payload = parse_responses_ws_create(
+            r#"{"type":"response.create","model":"gpt-5.4","input":"hello","generate":"yes"}"#,
+        )
+        .expect("parse websocket response.create");
+
+        assert_eq!(
+            extract_ws_generate(&mut payload),
+            Err("invalid response.create payload: generate must be a boolean".to_string())
+        );
+    }
+
+    #[test]
+    fn websocket_text_response_events_include_active_item_sequence() {
+        let events = websocket_text_response_events("gpt-5.4", "OK");
+        let kinds = events
+            .iter()
+            .filter_map(|value| value.get("type").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            kinds,
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        assert_eq!(
+            events[3].get("delta").and_then(Value::as_str),
+            Some("OK")
+        );
+        assert_eq!(
+            events[7]
+                .get("response")
+                .and_then(|response| response.get("output"))
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("content"))
+                .and_then(Value::as_array)
+                .and_then(|parts| parts.first())
+                .and_then(|part| part.get("text"))
+                .and_then(Value::as_str),
+            Some("OK")
         );
     }
 
