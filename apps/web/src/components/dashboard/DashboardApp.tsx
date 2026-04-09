@@ -559,8 +559,9 @@ function translationFor(language: Language) {
         attention: "关注",
         overview: "概览",
         overviewSub: "缓存、账号状态和消费概况",
-        cacheHit: "缓存命中",
-        prefixCache: "前缀缓存",
+        cacheHit: "缓存命中率",
+        prefixCache: "累计缓存 Token",
+        cacheHitHint: "按最近 512 条请求日志中出现缓存命中的请求占比计算。",
         hit: "命中",
         tokens: "tokens",
         lowQuota: "低额度",
@@ -714,8 +715,10 @@ function translationFor(language: Language) {
         attention: "Attention",
         overview: "Overview",
         overviewSub: "Cache, account state, and spend signals",
-        cacheHit: "Cache Hit",
-        prefixCache: "Prefix Cache",
+        cacheHit: "Cache Hit Rate",
+        prefixCache: "Cached Input Tokens",
+        cacheHitHint:
+          "Computed from the share of the last 512 logged requests that reported cached input tokens.",
         hit: "hit",
         tokens: "tokens",
         lowQuota: "Low Quota",
@@ -2154,6 +2157,9 @@ export function DashboardApp({
                 <p className={cx("text-xs", isDark ? "text-zinc-500" : "text-zinc-500")}>
                   {formatNumber(runtimeSnapshot.cacheMetrics.cachedTokens, language)}{" "}
                   {t.tokens}
+                </p>
+                <p className={cx("text-[11px] leading-5", isDark ? "text-zinc-500" : "text-zinc-500")}>
+                  {t.cacheHitHint}
                 </p>
               </div>
             </div>

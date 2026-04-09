@@ -516,9 +516,9 @@ impl AppState {
         leases.sort_by(|left, right| right.last_used_at.cmp(&left.last_used_at));
 
         let cf_incidents = self.runtime.cf_incidents.read().await.clone();
-        let cache_metrics = self.runtime.cache_metrics.read().await.clone();
         let account_summaries = self.account_summaries().await;
         let request_logs = self.list_request_logs().await;
+        let cache_metrics = self.derived_cache_metrics(&request_logs).await;
         let billing = self.billing_summary(&request_logs);
         let users = self.gateway_user_views(&request_logs).await;
         let model_catalog = build_model_catalog(&account_summaries);
@@ -648,7 +648,8 @@ impl AppState {
     }
 
     pub async fn cache_metrics(&self) -> CacheMetrics {
-        self.runtime.cache_metrics.read().await.clone()
+        let logs = self.list_request_logs().await;
+        self.derived_cache_metrics(&logs).await
     }
 
     pub async fn list_api_keys(&self) -> Vec<GatewayApiKeyView> {
@@ -1283,12 +1284,28 @@ impl AppState {
     }
 
     pub async fn record_request_log(&self, entry: RequestLogEntry) {
-        {
+        let logs_snapshot = {
             let mut logs = self.runtime.request_logs.write().await;
             logs.insert(0, entry.clone());
             logs.truncate(512);
-        }
-        self.enqueue(PersistenceMessage::RequestLogInsert(entry)).await;
+            logs.clone()
+        };
+        let metrics_snapshot = {
+            let mut metrics = self.runtime.cache_metrics.write().await;
+            let derived = derive_cache_metrics_from_logs(&logs_snapshot, &metrics);
+            *metrics = derived.clone();
+            derived
+        };
+        self.enqueue_many(vec![
+            PersistenceMessage::RequestLogInsert(entry),
+            PersistenceMessage::CacheMetricsUpsert(metrics_snapshot),
+        ])
+        .await;
+    }
+
+    async fn derived_cache_metrics(&self, logs: &[RequestLogEntry]) -> CacheMetrics {
+        let metrics = self.runtime.cache_metrics.read().await.clone();
+        derive_cache_metrics_from_logs(logs, &metrics)
     }
 
     fn billing_summary(&self, logs: &[RequestLogEntry]) -> BillingSummary {
@@ -1729,16 +1746,17 @@ impl AppState {
             false,
         );
 
+        let request_logs = self.list_request_logs().await;
         let metrics_snapshot = {
             let mut metrics = self.runtime.cache_metrics.write().await;
-            metrics.cached_tokens += replay.static_prefix_tokens;
-            metrics.replay_tokens += replay.total_tokens;
-            metrics.prefix_hit_ratio = ((metrics.prefix_hit_ratio * 9.0) + 0.88) / 10.0;
+            metrics.static_prefix_tokens = replay.static_prefix_tokens;
             if warmup.should_warm {
                 metrics.warmup_roi =
                     ((metrics.warmup_roi * 4.0) + warmup.expected_saving.max(1.0)) / 5.0;
             }
-            metrics.clone()
+            let derived = derive_cache_metrics_from_logs(&request_logs, &metrics);
+            *metrics = derived.clone();
+            derived
         };
 
         self.enqueue_many(vec![
@@ -2035,12 +2053,43 @@ fn spawn_persistence_writer(
 
 fn default_cache_metrics() -> CacheMetrics {
     CacheMetrics {
-        cached_tokens: 131_072,
-        replay_tokens: 24_576,
-        prefix_hit_ratio: 0.81,
-        warmup_roi: 2.14,
-        static_prefix_tokens: 4_096,
+        cached_tokens: 0,
+        replay_tokens: 0,
+        prefix_hit_ratio: 0.0,
+        warmup_roi: 0.0,
+        static_prefix_tokens: 0,
     }
+}
+
+fn derive_cache_metrics_from_logs(logs: &[RequestLogEntry], base: &CacheMetrics) -> CacheMetrics {
+    let mut metrics = base.clone();
+    let mut eligible_requests = 0_u64;
+    let mut hit_requests = 0_u64;
+    let mut total_input_tokens = 0_u64;
+    let mut total_cached_input_tokens = 0_u64;
+
+    for log in logs {
+        let input_tokens = log.usage.input_tokens;
+        let cached_input_tokens = log.usage.cached_input_tokens.min(input_tokens);
+        total_input_tokens += input_tokens;
+        total_cached_input_tokens += cached_input_tokens;
+
+        if input_tokens > 0 {
+            eligible_requests += 1;
+            if cached_input_tokens > 0 {
+                hit_requests += 1;
+            }
+        }
+    }
+
+    metrics.cached_tokens = total_cached_input_tokens;
+    metrics.replay_tokens = total_input_tokens;
+    metrics.prefix_hit_ratio = if eligible_requests > 0 {
+        hit_requests as f64 / eligible_requests as f64
+    } else {
+        0.0
+    };
+    metrics
 }
 
 fn default_oauth_models() -> Vec<String> {
@@ -2160,5 +2209,63 @@ fn mask_endpoint(url: &str) -> String {
         format!("{prefix}...")
     } else {
         prefix
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::RequestLogUsage;
+
+    fn sample_request_log(input_tokens: u64, cached_input_tokens: u64) -> RequestLogEntry {
+        RequestLogEntry {
+            id: format!("log_{}", uuid::Uuid::new_v4().simple()),
+            api_key_id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            user_name: "Test User".to_string(),
+            user_email: "test@example.com".to_string(),
+            principal_id: "tenant:test/principal:test".to_string(),
+            account_id: "acc_test".to_string(),
+            account_label: "Test".to_string(),
+            method: "POST".to_string(),
+            endpoint: "/v1/responses".to_string(),
+            requested_model: "gpt-5.4".to_string(),
+            effective_model: "gpt-5.4".to_string(),
+            reasoning_effort: None,
+            route_mode: RouteMode::Direct,
+            status_code: 200,
+            usage: RequestLogUsage {
+                input_tokens,
+                cached_input_tokens,
+                output_tokens: 32,
+                total_tokens: input_tokens + 32,
+            },
+            estimated_cost_usd: Some(0.01),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn cache_metrics_use_real_request_hit_rate() {
+        let base = CacheMetrics {
+            cached_tokens: 999,
+            replay_tokens: 999,
+            prefix_hit_ratio: 0.99,
+            warmup_roi: 1.5,
+            static_prefix_tokens: 2048,
+        };
+        let logs = vec![
+            sample_request_log(120, 30),
+            sample_request_log(80, 0),
+            sample_request_log(64, 8),
+        ];
+
+        let derived = derive_cache_metrics_from_logs(&logs, &base);
+
+        assert_eq!(derived.cached_tokens, 38);
+        assert_eq!(derived.replay_tokens, 264);
+        assert!((derived.prefix_hit_ratio - (2.0 / 3.0)).abs() < 1e-9);
+        assert_eq!(derived.warmup_roi, base.warmup_roi);
+        assert_eq!(derived.static_prefix_tokens, base.static_prefix_tokens);
     }
 }

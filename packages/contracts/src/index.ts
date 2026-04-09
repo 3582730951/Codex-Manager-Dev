@@ -193,11 +193,11 @@ export const dashboardFallback: DashboardSnapshot = {
     }
   ],
   cacheMetrics: {
-    cachedTokens: 131072,
-    replayTokens: 24576,
-    prefixHitRatio: 0.81,
-    warmupRoi: 2.14,
-    staticPrefixTokens: 4096
+    cachedTokens: 0,
+    replayTokens: 0,
+    prefixHitRatio: 0,
+    warmupRoi: 0,
+    staticPrefixTokens: 0
   },
   accounts: [
     {
