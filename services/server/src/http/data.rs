@@ -1,4 +1,4 @@
-use std::{convert::Infallible, pin::Pin, time::Duration};
+use std::{collections::BTreeMap, convert::Infallible, pin::Pin, time::Duration};
 
 use async_stream::stream;
 use axum::{
@@ -35,6 +35,8 @@ struct ForwardSuccess {
     output_summary: Option<String>,
     usage: RequestLogUsage,
     observed_model: Option<String>,
+    response_id: Option<String>,
+    response_output_items: Vec<Value>,
 }
 
 impl Default for ForwardSuccess {
@@ -44,6 +46,8 @@ impl Default for ForwardSuccess {
             output_summary: None,
             usage: RequestLogUsage::default(),
             observed_model: None,
+            response_id: None,
+            response_output_items: Vec::new(),
         }
     }
 }
@@ -176,11 +180,27 @@ async fn responses(
         };
 
         let codex_protocol = is_codex_chatgpt_backend(&credential.base_url);
+        let previous_response_id = payload
+            .extra
+            .get("previous_response_id")
+            .and_then(Value::as_str);
+        let replayed_tool_calls = if codex_protocol {
+            state
+                .replay_tool_call_items_for(
+                    &principal_id,
+                    previous_response_id,
+                    &responses_input_function_call_output_call_ids(&payload.input),
+                )
+                .await
+        } else {
+            Vec::new()
+        };
         let upstream_value = responses_payload_for_upstream(
             &payload,
             replay.cache_key.clone(),
             replay_context.as_deref(),
             codex_protocol,
+            &replayed_tool_calls,
         );
         let upstream_stream = codex_protocol || stream_requested;
 
@@ -240,6 +260,14 @@ async fn responses(
                     upstream_json_response(response, &model).await
                 } {
                     ForwardOutcome::Response(success) => {
+                        let ForwardSuccess {
+                            response,
+                            output_summary,
+                            usage,
+                            observed_model,
+                            response_id,
+                            response_output_items,
+                        } = success;
                         let _ = state
                             .record_route_event(
                                 &lease.account_id,
@@ -249,21 +277,26 @@ async fn responses(
                                 },
                             )
                             .await;
-                        if let Some(output_summary) = success.output_summary {
+                        if let Some(output_summary) = output_summary {
                             state
-                                .record_context_output(&principal_id, output_summary)
+                                .record_context_output_with_response(
+                                    &principal_id,
+                                    output_summary,
+                                    response_id,
+                                    response_output_items,
+                                )
                                 .await;
                         }
                         state
                             .record_request_log(build_request_log_entry(
                                 &request_log,
                                 &lease,
-                                success.response.status().as_u16(),
-                                success.usage,
-                                success.observed_model,
+                                response.status().as_u16(),
+                                usage,
+                                observed_model,
                             ))
                             .await;
-                        return success.response;
+                        return response;
                     }
                     ForwardOutcome::HiddenFailure(kind) => {
                         handle_hidden_failure(&state, &lease, kind).await;
@@ -413,13 +446,7 @@ async fn forward_responses_ws(
         }
     };
     if !generate {
-        send_ws_failure_response(
-            socket,
-            None,
-            "unsupported_feature",
-            "response.create with generate=false is not supported by this gateway",
-        )
-        .await?;
+        send_ws_empty_response(socket, &payload.model).await?;
         return Ok(());
     }
 
@@ -489,11 +516,27 @@ async fn forward_responses_ws(
         };
 
         let codex_protocol = is_codex_chatgpt_backend(&credential.base_url);
+        let previous_response_id = payload
+            .extra
+            .get("previous_response_id")
+            .and_then(Value::as_str);
+        let replayed_tool_calls = if codex_protocol {
+            state
+                .replay_tool_call_items_for(
+                    principal_id,
+                    previous_response_id,
+                    &responses_input_function_call_output_call_ids(&payload.input),
+                )
+                .await
+        } else {
+            Vec::new()
+        };
         let upstream_value = responses_payload_for_upstream(
             &payload,
             replay.cache_key.clone(),
             replay_context.as_deref(),
             codex_protocol,
+            &replayed_tool_calls,
         );
 
         match state
@@ -692,6 +735,14 @@ async fn chat_completions(
                     upstream_responses_json_to_chat_response(response, &payload.model).await
                 } {
                     ForwardOutcome::Response(success) => {
+                        let ForwardSuccess {
+                            response,
+                            output_summary,
+                            usage,
+                            observed_model,
+                            response_id,
+                            response_output_items,
+                        } = success;
                         let _ = state
                             .record_route_event(
                                 &lease.account_id,
@@ -701,21 +752,26 @@ async fn chat_completions(
                                 },
                             )
                             .await;
-                        if let Some(output_summary) = success.output_summary {
+                        if let Some(output_summary) = output_summary {
                             state
-                                .record_context_output(&principal_id, output_summary)
+                                .record_context_output_with_response(
+                                    &principal_id,
+                                    output_summary,
+                                    response_id,
+                                    response_output_items,
+                                )
                                 .await;
                         }
                         state
                             .record_request_log(build_request_log_entry(
                                 &request_log,
                                 &lease,
-                                success.response.status().as_u16(),
-                                success.usage,
-                                success.observed_model,
+                                response.status().as_u16(),
+                                usage,
+                                observed_model,
                             ))
                             .await;
-                        return success.response;
+                        return response;
                     }
                     ForwardOutcome::HiddenFailure(kind) => {
                         handle_hidden_failure(&state, &lease, kind).await;
@@ -1082,6 +1138,9 @@ async fn upstream_stream_to_ws_response(
     let mut output_summary = String::new();
     let mut usage = RequestLogUsage::default();
     let mut observed_model = observed_model_from_headers(&headers);
+    let mut streamed_response_id = None;
+    let mut streamed_output_items = BTreeMap::new();
+    let mut completed_response = None;
 
     for record in buffered_records {
         if let Some(value) = response_value_from_sse_record(&record) {
@@ -1089,6 +1148,12 @@ async fn upstream_stream_to_ws_response(
             if observed_model.is_none() {
                 observed_model = observed_model_from_value(&value);
             }
+            capture_stream_response_metadata(
+                &value,
+                &mut streamed_response_id,
+                &mut streamed_output_items,
+                &mut completed_response,
+            );
         }
         if let Some(delta) = response_delta_text(&record) {
             output_summary.push_str(delta.as_str());
@@ -1110,6 +1175,12 @@ async fn upstream_stream_to_ws_response(
                 if observed_model.is_none() {
                     observed_model = observed_model_from_value(&value);
                 }
+                capture_stream_response_metadata(
+                    &value,
+                    &mut streamed_response_id,
+                    &mut streamed_output_items,
+                    &mut completed_response,
+                );
             }
             if let Some(delta) = response_delta_text(&record) {
                 output_summary.push_str(delta.as_str());
@@ -1134,7 +1205,22 @@ async fn upstream_stream_to_ws_response(
     } else {
         truncate_text(output_summary, 240)
     };
-    state.record_context_output(&principal_id, summary).await;
+    let completed_response = finalize_stream_response(
+        completed_response,
+        streamed_response_id,
+        streamed_output_items,
+    );
+    state
+        .record_context_output_with_response(
+            &principal_id,
+            summary,
+            completed_response.as_ref().and_then(response_id_from_value),
+            completed_response
+                .as_ref()
+                .map(response_output_items_from_value)
+                .unwrap_or_default(),
+        )
+        .await;
     state
         .record_request_log(build_request_log_entry(
             &request_log,
@@ -1169,6 +1255,36 @@ async fn send_ws_waiting_response(socket: &mut WebSocket, model: &str) -> Result
         send_ws_json(socket, &value).await?;
     }
     Ok(())
+}
+
+async fn send_ws_empty_response(socket: &mut WebSocket, model: &str) -> Result<(), ()> {
+    let response_id = format!("resp_ws_empty_{}", uuid::Uuid::new_v4().simple());
+    send_ws_json(
+        socket,
+        &json!({
+            "type": "response.created",
+            "response": {
+                "id": response_id,
+                "model": model,
+                "status": "in_progress",
+                "output": [],
+            }
+        }),
+    )
+    .await?;
+    send_ws_json(
+        socket,
+        &json!({
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "model": model,
+                "status": "completed",
+                "output": [],
+            }
+        }),
+    )
+    .await
 }
 
 async fn send_ws_failure_response(
@@ -1330,6 +1446,11 @@ async fn upstream_json_response(
         .as_ref()
         .and_then(observed_model_from_value)
         .or_else(|| observed_model_from_headers(&headers));
+    let response_id = parsed.as_ref().and_then(response_id_from_value);
+    let response_output_items = parsed
+        .as_ref()
+        .map(response_output_items_from_value)
+        .unwrap_or_default();
     let mut builder = Response::builder().status(status);
     copy_upstream_headers(&mut builder, &headers);
     let response = builder
@@ -1340,6 +1461,8 @@ async fn upstream_json_response(
         output_summary,
         usage,
         observed_model,
+        response_id,
+        response_output_items,
     })
 }
 
@@ -1359,6 +1482,8 @@ async fn upstream_responses_json_to_chat_response(
     let output_summary = extract_response_output_text(&value);
     let usage = request_usage_from_value(&value);
     let observed_model = observed_model_from_value(&value).or_else(|| observed_model_from_headers(&headers));
+    let response_id = response_id_from_value(&value);
+    let response_output_items = response_output_items_from_value(&value);
     let payload = responses_json_to_chat_completion(&value, fallback_model);
     let bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
     let mut builder = Response::builder().status(status);
@@ -1371,6 +1496,8 @@ async fn upstream_responses_json_to_chat_response(
         output_summary: (!output_summary.is_empty()).then_some(output_summary),
         usage,
         observed_model,
+        response_id,
+        response_output_items,
     })
 }
 
@@ -1391,6 +1518,8 @@ async fn upstream_stream_to_json_response(
     let output_summary = extract_response_output_text(&value);
     let usage = request_usage_from_value(&value);
     let observed_model = observed_model_from_value(&value).or_else(|| observed_model_from_headers(&headers));
+    let response_id = response_id_from_value(&value);
+    let response_output_items = response_output_items_from_value(&value);
     let bytes = serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec());
     let mut builder = Response::builder().status(status);
     if let Some(out) = builder.headers_mut() {
@@ -1405,6 +1534,8 @@ async fn upstream_stream_to_json_response(
         output_summary: (!output_summary.is_empty()).then_some(output_summary),
         usage,
         observed_model,
+        response_id,
+        response_output_items,
     })
 }
 
@@ -1425,6 +1556,8 @@ async fn upstream_stream_to_chat_json_response(
     let output_summary = extract_response_output_text(&value);
     let usage = request_usage_from_value(&value);
     let observed_model = observed_model_from_value(&value).or_else(|| observed_model_from_headers(&headers));
+    let response_id = response_id_from_value(&value);
+    let response_output_items = response_output_items_from_value(&value);
     let payload = responses_json_to_chat_completion(&value, fallback_model);
     let bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
     let mut builder = Response::builder().status(status);
@@ -1440,6 +1573,8 @@ async fn upstream_stream_to_chat_json_response(
         output_summary: (!output_summary.is_empty()).then_some(output_summary),
         usage,
         observed_model,
+        response_id,
+        response_output_items,
     })
 }
 
@@ -1472,6 +1607,9 @@ async fn upstream_stream_response(
         let mut output_summary = String::new();
         let mut usage = RequestLogUsage::default();
         let mut observed_model = observed_model_from_headers(&headers);
+        let mut streamed_response_id = None;
+        let mut streamed_output_items = BTreeMap::new();
+        let mut completed_response = None;
 
         for record in buffered_records {
             if let Some(value) = response_value_from_sse_record(&record) {
@@ -1479,6 +1617,12 @@ async fn upstream_stream_response(
                 if observed_model.is_none() {
                     observed_model = observed_model_from_value(&value);
                 }
+                capture_stream_response_metadata(
+                    &value,
+                    &mut streamed_response_id,
+                    &mut streamed_output_items,
+                    &mut completed_response,
+                );
             }
             if let Some(delta) = response_delta_text(&record) {
                 output_summary.push_str(delta.as_str());
@@ -1504,6 +1648,12 @@ async fn upstream_stream_response(
                     if observed_model.is_none() {
                         observed_model = observed_model_from_value(&value);
                     }
+                    capture_stream_response_metadata(
+                        &value,
+                        &mut streamed_response_id,
+                        &mut streamed_output_items,
+                        &mut completed_response,
+                    );
                 }
                 if let Some(delta) = response_delta_text(&record) {
                     output_summary.push_str(delta.as_str());
@@ -1530,7 +1680,22 @@ async fn upstream_stream_response(
             } else {
                 truncate_text(output_summary, 240)
             };
-            state.record_context_output(&principal_id, summary).await;
+            let completed_response = finalize_stream_response(
+                completed_response,
+                streamed_response_id,
+                streamed_output_items,
+            );
+            state
+                .record_context_output_with_response(
+                    &principal_id,
+                    summary,
+                    completed_response.as_ref().and_then(response_id_from_value),
+                    completed_response
+                        .as_ref()
+                        .map(response_output_items_from_value)
+                        .unwrap_or_default(),
+                )
+                .await;
             state
                 .record_request_log(build_request_log_entry(
                     &request_log,
@@ -1576,6 +1741,9 @@ fn passthrough_stream_response(
                 let mut output_summary = String::new();
                 let mut usage = RequestLogUsage::default();
                 let mut observed_model = observed_model_from_headers(&headers);
+                let mut streamed_response_id = None;
+                let mut streamed_output_items = BTreeMap::new();
+                let mut completed_response = None;
 
                 while let Some(chunk) = upstream.next().await {
                     let Ok(chunk) = chunk else {
@@ -1589,6 +1757,12 @@ fn passthrough_stream_response(
                             if observed_model.is_none() {
                                 observed_model = observed_model_from_value(&value);
                             }
+                            capture_stream_response_metadata(
+                                &value,
+                                &mut streamed_response_id,
+                                &mut streamed_output_items,
+                                &mut completed_response,
+                            );
                         }
                         if let Some(delta) = response_delta_text(&record) {
                             output_summary.push_str(delta.as_str());
@@ -1612,7 +1786,22 @@ fn passthrough_stream_response(
                     } else {
                         truncate_text(output_summary, 240)
                     };
-                    state.record_context_output(&principal_id, summary).await;
+                    let completed_response = finalize_stream_response(
+                        completed_response,
+                        streamed_response_id,
+                        streamed_output_items,
+                    );
+                    state
+                        .record_context_output_with_response(
+                            &principal_id,
+                            summary,
+                            completed_response.as_ref().and_then(response_id_from_value),
+                            completed_response
+                                .as_ref()
+                                .map(response_output_items_from_value)
+                                .unwrap_or_default(),
+                        )
+                        .await;
                     state
                         .record_request_log(build_request_log_entry(
                             &request_log,
@@ -1671,12 +1860,21 @@ async fn upstream_responses_stream_to_chat_response(
         let mut had_hidden_failure = false;
         let mut usage = RequestLogUsage::default();
         let mut observed_model = observed_model_from_headers(&headers_for_usage);
+        let mut streamed_response_id = None;
+        let mut streamed_output_items = BTreeMap::new();
+        let mut completed_response = None;
         for record in buffered_records {
             if let Some(value) = response_value_from_sse_record(&record) {
                 merge_request_usage(&mut usage, request_usage_from_value(&value));
                 if observed_model.is_none() {
                     observed_model = observed_model_from_value(&value);
                 }
+                capture_stream_response_metadata(
+                    &value,
+                    &mut streamed_response_id,
+                    &mut streamed_output_items,
+                    &mut completed_response,
+                );
             }
             for event in translate_response_record_to_chat_events(&record, &mut adapter_state) {
                 yield Ok::<Event, Infallible>(event);
@@ -1700,6 +1898,12 @@ async fn upstream_responses_stream_to_chat_response(
                     if observed_model.is_none() {
                         observed_model = observed_model_from_value(&value);
                     }
+                    capture_stream_response_metadata(
+                        &value,
+                        &mut streamed_response_id,
+                        &mut streamed_output_items,
+                        &mut completed_response,
+                    );
                 }
                 for event in translate_response_record_to_chat_events(&record, &mut adapter_state) {
                     yield Ok::<Event, Infallible>(event);
@@ -1734,7 +1938,22 @@ async fn upstream_responses_stream_to_chat_response(
             } else {
                 "streamed chat completion delivered".to_string()
             };
-            gateway_state.record_context_output(&principal_id, summary).await;
+            let completed_response = finalize_stream_response(
+                completed_response,
+                streamed_response_id,
+                streamed_output_items,
+            );
+            gateway_state
+                .record_context_output_with_response(
+                    &principal_id,
+                    summary,
+                    completed_response.as_ref().and_then(response_id_from_value),
+                    completed_response
+                        .as_ref()
+                        .map(response_output_items_from_value)
+                        .unwrap_or_default(),
+                )
+                .await;
             gateway_state
                 .record_request_log(build_request_log_entry(
                     &request_log,
@@ -1816,6 +2035,8 @@ async fn collect_completed_response_from_stream(
 
     let mut upstream = response.bytes_stream();
     let mut buffer = String::new();
+    let mut streamed_response_id = None;
+    let mut streamed_output_items = BTreeMap::new();
     let mut completed_response = None;
 
     while let Some(chunk) = upstream.next().await {
@@ -1825,33 +2046,33 @@ async fn collect_completed_response_from_stream(
             if let Some(kind) = hidden_failure_kind_from_sse_record(&record, expected_model) {
                 return Err(kind);
             }
-            if let Some(value) = response_value_from_sse_record(&record)
-                && value
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| kind == "response.completed")
-            {
-                completed_response = value.get("response").cloned().or(Some(value));
+            if let Some(value) = response_value_from_sse_record(&record) {
+                capture_stream_response_metadata(
+                    &value,
+                    &mut streamed_response_id,
+                    &mut streamed_output_items,
+                    &mut completed_response,
+                );
             }
         }
     }
 
-    if completed_response.is_none() && !buffer.trim().is_empty() {
+    if !buffer.trim().is_empty() {
         let record = buffer.trim();
         if let Some(kind) = hidden_failure_kind_from_sse_record(record, expected_model) {
             return Err(kind);
         }
-        if let Some(value) = response_value_from_sse_record(record)
-            && value
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|kind| kind == "response.completed")
-        {
-            completed_response = value.get("response").cloned().or(Some(value));
+        if let Some(value) = response_value_from_sse_record(record) {
+            capture_stream_response_metadata(
+                &value,
+                &mut streamed_response_id,
+                &mut streamed_output_items,
+                &mut completed_response,
+            );
         }
     }
 
-    completed_response
+    finalize_stream_response(completed_response, streamed_response_id, streamed_output_items)
         .map(|value| (status, headers, value))
         .ok_or(UpstreamFailureKind::Generic)
 }
@@ -2161,9 +2382,10 @@ fn responses_payload_for_upstream(
     cache_key: String,
     replay_context: Option<&str>,
     codex_protocol: bool,
+    codex_input_prefix: &[Value],
 ) -> Value {
     if codex_protocol {
-        return codex_responses_payload(payload, cache_key, replay_context);
+        return codex_responses_payload(payload, cache_key, replay_context, codex_input_prefix);
     }
 
     let mut upstream_payload = payload.clone();
@@ -2189,10 +2411,17 @@ fn codex_responses_payload(
     payload: &ResponsesRequest,
     cache_key: String,
     replay_context: Option<&str>,
+    codex_input_prefix: &[Value],
 ) -> Value {
+    let mut normalized_input = normalize_responses_input(payload.input.clone());
+    if !codex_input_prefix.is_empty() {
+        let mut prefixed = codex_input_prefix.to_vec();
+        prefixed.extend(normalized_input);
+        normalized_input = prefixed;
+    }
     let input = replay_context
-        .map(|context| attach_replay_context_to_responses_input(payload.input.clone(), context))
-        .unwrap_or_else(|| Value::Array(normalize_responses_input(payload.input.clone())));
+        .map(|context| attach_replay_context_to_responses_input(Value::Array(normalized_input.clone()), context))
+        .unwrap_or_else(|| Value::Array(normalized_input));
     let (instructions, input) =
         codex_instructions_and_input(input, payload.extra.get("instructions"));
 
@@ -2221,7 +2450,14 @@ fn codex_responses_payload(
 fn codex_passthrough_extra_key(key: &str) -> bool {
     !matches!(
         key,
-        "instructions" | "store" | "stream" | "prompt_cache_key" | "max_output_tokens"
+        // The ChatGPT Codex backend does not accept client-side response chaining.
+        // Gateway replay/session affinity already preserves continuity for failover.
+        "instructions"
+            | "store"
+            | "stream"
+            | "prompt_cache_key"
+            | "max_output_tokens"
+            | "previous_response_id"
     )
 }
 
@@ -2358,6 +2594,107 @@ fn attach_replay_context_to_responses_input(input: Value, replay_context: &str) 
     let mut normalized = normalize_responses_input(input);
     normalized.insert(0, replay_context_message(replay_context));
     Value::Array(normalized)
+}
+
+fn responses_input_function_call_output_call_ids(input: &Value) -> Vec<String> {
+    normalize_responses_input(input.clone())
+        .into_iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str).map(str::to_string))
+        .collect::<Vec<_>>()
+}
+
+fn response_root_value(value: &Value) -> &Value {
+    value.get("response").unwrap_or(value)
+}
+
+fn response_id_from_value(value: &Value) -> Option<String> {
+    response_root_value(value)
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn response_output_items_from_value(value: &Value) -> Vec<Value> {
+    response_root_value(value)
+        .get("output")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn response_output_item_from_stream_value(value: &Value) -> Option<(usize, Value)> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("response.output_item.added") | Some("response.output_item.done") => Some((
+            value.get("output_index").and_then(Value::as_u64)? as usize,
+            value.get("item")?.clone(),
+        )),
+        _ => None,
+    }
+}
+
+fn capture_stream_response_metadata(
+    value: &Value,
+    response_id: &mut Option<String>,
+    output_items: &mut BTreeMap<usize, Value>,
+    completed_response: &mut Option<Value>,
+) {
+    if response_id.is_none() {
+        *response_id = response_id_from_value(value);
+    }
+    if let Some((index, item)) = response_output_item_from_stream_value(value) {
+        output_items.insert(index, item);
+    }
+    for (index, item) in response_output_items_from_value(value).into_iter().enumerate() {
+        output_items.insert(index, item);
+    }
+    if response_status_is_completed(value) {
+        *completed_response = Some(response_root_value(value).clone());
+    }
+}
+
+fn finalize_stream_response(
+    completed_response: Option<Value>,
+    response_id: Option<String>,
+    output_items: BTreeMap<usize, Value>,
+) -> Option<Value> {
+    let mut response = completed_response?;
+    let Some(object) = response.as_object_mut() else {
+        return Some(response);
+    };
+
+    if !object.contains_key("id")
+        && let Some(response_id) = response_id
+    {
+        object.insert("id".to_string(), Value::String(response_id));
+    }
+
+    let mut merged_output = object
+        .get("output")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .collect::<BTreeMap<usize, Value>>();
+    for (index, item) in output_items {
+        merged_output.insert(index, item);
+    }
+    if !merged_output.is_empty() {
+        object.insert(
+            "output".to_string(),
+            Value::Array(merged_output.into_values().collect()),
+        );
+    }
+
+    Some(response)
+}
+
+fn response_status_is_completed(value: &Value) -> bool {
+    response_root_value(value)
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status.eq_ignore_ascii_case("completed"))
 }
 
 fn normalize_responses_input(input: Value) -> Vec<Value> {
@@ -3217,7 +3554,8 @@ mod tests {
             extra: serde_json::Map::new(),
         };
 
-        let mapped = responses_payload_for_upstream(&payload, "cache-123".to_string(), None, true);
+        let mapped =
+            responses_payload_for_upstream(&payload, "cache-123".to_string(), None, true, &[]);
         assert_eq!(mapped.get("stream").and_then(Value::as_bool), Some(true));
         assert_eq!(mapped.get("store").and_then(Value::as_bool), Some(false));
         assert_eq!(
@@ -3244,7 +3582,8 @@ mod tests {
             ]),
         };
 
-        let mapped = responses_payload_for_upstream(&payload, "cache-123".to_string(), None, true);
+        let mapped =
+            responses_payload_for_upstream(&payload, "cache-123".to_string(), None, true, &[]);
         assert!(mapped.get("max_output_tokens").is_none());
         assert_eq!(
             mapped
@@ -3252,6 +3591,98 @@ mod tests {
                 .and_then(|value| value.get("source"))
                 .and_then(Value::as_str),
             Some("test")
+        );
+    }
+
+    #[test]
+    fn codex_responses_payload_drops_previous_response_id() {
+        let payload = ResponsesRequest {
+            model: "gpt-5.2".to_string(),
+            input: json!("hello"),
+            stream: Some(false),
+            reasoning: None,
+            prompt_cache_key: None,
+            extra: serde_json::Map::from_iter([
+                ("previous_response_id".to_string(), json!("resp_prev_123")),
+                ("metadata".to_string(), json!({"source": "test"})),
+            ]),
+        };
+
+        let mapped =
+            responses_payload_for_upstream(&payload, "cache-123".to_string(), None, true, &[]);
+        assert!(mapped.get("previous_response_id").is_none());
+        assert_eq!(
+            mapped
+                .get("metadata")
+                .and_then(|value| value.get("source"))
+                .and_then(Value::as_str),
+            Some("test")
+        );
+    }
+
+    #[test]
+    fn non_codex_responses_payload_preserves_previous_response_id() {
+        let payload = ResponsesRequest {
+            model: "gpt-5.2".to_string(),
+            input: json!("hello"),
+            stream: Some(false),
+            reasoning: None,
+            prompt_cache_key: None,
+            extra: serde_json::Map::from_iter([(
+                "previous_response_id".to_string(),
+                json!("resp_prev_123"),
+            )]),
+        };
+
+        let mapped =
+            responses_payload_for_upstream(&payload, "cache-123".to_string(), None, false, &[]);
+        assert_eq!(
+            mapped.get("previous_response_id").and_then(Value::as_str),
+            Some("resp_prev_123")
+        );
+    }
+
+    #[test]
+    fn codex_responses_payload_prepends_replayed_function_calls() {
+        let payload = ResponsesRequest {
+            model: "gpt-5.2".to_string(),
+            input: json!([{
+                "type": "function_call_output",
+                "call_id": "call_plan_123",
+                "output": "Plan updated"
+            }]),
+            stream: Some(false),
+            reasoning: None,
+            prompt_cache_key: None,
+            extra: serde_json::Map::new(),
+        };
+
+        let mapped = responses_payload_for_upstream(
+            &payload,
+            "cache-123".to_string(),
+            None,
+            true,
+            &[json!({
+                "type": "function_call",
+                "call_id": "call_plan_123",
+                "name": "update_plan",
+                "arguments": "{\"plan\":[{\"step\":\"Inspect logs\",\"status\":\"completed\"}]}"
+            })],
+        );
+        let input = mapped
+            .get("input")
+            .and_then(Value::as_array)
+            .expect("input");
+
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0].get("type").and_then(Value::as_str), Some("function_call"));
+        assert_eq!(
+            input[0].get("call_id").and_then(Value::as_str),
+            Some("call_plan_123")
+        );
+        assert_eq!(
+            input[1].get("type").and_then(Value::as_str),
+            Some("function_call_output")
         );
     }
 
@@ -3468,6 +3899,64 @@ mod tests {
         );
         assert_eq!(completed_events.len(), 2);
         assert!(state.finished);
+    }
+
+    #[test]
+    fn finalize_stream_response_preserves_streamed_function_calls() {
+        let mut response_id = None;
+        let mut output_items = BTreeMap::new();
+        let mut completed_response = None;
+
+        capture_stream_response_metadata(
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "update_plan",
+                    "arguments": "{\"plan\":[]}"
+                }
+            }),
+            &mut response_id,
+            &mut output_items,
+            &mut completed_response,
+        );
+        capture_stream_response_metadata(
+            &json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed"
+                }
+            }),
+            &mut response_id,
+            &mut output_items,
+            &mut completed_response,
+        );
+
+        let finalized = finalize_stream_response(completed_response, response_id, output_items)
+            .expect("finalized response");
+
+        assert_eq!(finalized.get("id").and_then(Value::as_str), Some("resp_1"));
+        assert_eq!(
+            finalized
+                .get("output")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("type"))
+                .and_then(Value::as_str),
+            Some("function_call")
+        );
+        assert_eq!(
+            finalized
+                .get("output")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("call_id"))
+                .and_then(Value::as_str),
+            Some("call_1")
+        );
     }
 
     #[test]

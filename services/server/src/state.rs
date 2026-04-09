@@ -1804,6 +1804,67 @@ impl AppState {
         Some(block)
     }
 
+    pub async fn replay_tool_call_items_for(
+        &self,
+        principal_id: &str,
+        previous_response_id: Option<&str>,
+        call_ids: &[String],
+    ) -> Vec<serde_json::Value> {
+        if call_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let contexts = self.runtime.conversation_contexts.read().await;
+        let Some(context) = contexts.get(principal_id) else {
+            return Vec::new();
+        };
+
+        let call_id_set = call_ids.iter().map(String::as_str).collect::<std::collections::HashSet<_>>();
+        let matching_turn = previous_response_id
+            .and_then(|response_id| {
+                context.turns.iter().rev().find(|turn| {
+                    turn.response_id.as_deref() == Some(response_id)
+                        && turn.response_output_items.iter().any(|item| {
+                            item.get("type").and_then(serde_json::Value::as_str)
+                                == Some("function_call")
+                                && item
+                                    .get("call_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|call_id| call_id_set.contains(call_id))
+                        })
+                })
+            })
+            .or_else(|| {
+                context.turns.iter().rev().find(|turn| {
+                    turn.response_output_items.iter().any(|item| {
+                        item.get("type").and_then(serde_json::Value::as_str)
+                            == Some("function_call")
+                            && item
+                                .get("call_id")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|call_id| call_id_set.contains(call_id))
+                    })
+                })
+            });
+
+        matching_turn
+            .map(|turn| {
+                turn.response_output_items
+                    .iter()
+                    .filter(|item| {
+                        item.get("type").and_then(serde_json::Value::as_str)
+                            == Some("function_call")
+                            && item
+                                .get("call_id")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|call_id| call_id_set.contains(call_id))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
     pub async fn record_context_input(
         &self,
         principal_id: &str,
@@ -1831,6 +1892,8 @@ impl AppState {
                 generation,
                 request_summary,
                 response_summary: None,
+                response_id: None,
+                response_output_items: Vec::new(),
                 created_at: Utc::now(),
             });
             if context.turns.len() > 12 {
@@ -1844,6 +1907,22 @@ impl AppState {
     }
 
     pub async fn record_context_output(&self, principal_id: &str, response_summary: String) {
+        self.record_context_output_with_response(
+            principal_id,
+            response_summary,
+            None,
+            Vec::new(),
+        )
+        .await;
+    }
+
+    pub async fn record_context_output_with_response(
+        &self,
+        principal_id: &str,
+        response_summary: String,
+        response_id: Option<String>,
+        response_output_items: Vec<serde_json::Value>,
+    ) {
         let snapshot = {
             let mut contexts = self.runtime.conversation_contexts.write().await;
             let Some(context) = contexts.get_mut(principal_id) else {
@@ -1851,6 +1930,12 @@ impl AppState {
             };
             if let Some(turn) = context.turns.last_mut() {
                 turn.response_summary = Some(response_summary);
+                if response_id.is_some() {
+                    turn.response_id = response_id;
+                }
+                if !response_output_items.is_empty() {
+                    turn.response_output_items = response_output_items;
+                }
                 turn.created_at = Utc::now();
             }
             context.updated_at = Some(Utc::now());

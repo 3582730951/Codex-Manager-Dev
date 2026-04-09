@@ -161,6 +161,10 @@ pub struct ContextTurn {
     pub generation: u32,
     pub request_summary: String,
     pub response_summary: Option<String>,
+    #[serde(default)]
+    pub response_id: Option<String>,
+    #[serde(default)]
+    pub response_output_items: Vec<Value>,
     pub created_at: DateTime<Utc>,
 }
 

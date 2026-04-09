@@ -282,32 +282,28 @@ pub fn classify_failure(
     headers: &reqwest::header::HeaderMap,
     body: &str,
 ) -> UpstreamFailureKind {
-    if looks_like_cf(status, headers, body) {
-        return UpstreamFailureKind::Cf;
-    }
+    let body_kind = classify_failure_body(body);
+
     if status == StatusCode::UNAUTHORIZED
-        || (status == StatusCode::FORBIDDEN
-            && matches!(classify_failure_body(body), Some(UpstreamFailureKind::Auth)))
+        || matches!(body_kind, Some(UpstreamFailureKind::Auth))
     {
         return UpstreamFailureKind::Auth;
     }
-    if status == StatusCode::TOO_MANY_REQUESTS
-        || matches!(
-            classify_failure_body(body),
-            Some(UpstreamFailureKind::Quota)
-        )
-    {
+    if matches!(body_kind, Some(UpstreamFailureKind::Quota)) {
         return UpstreamFailureKind::Quota;
     }
     if matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND)
-        && matches!(
-            classify_failure_body(body),
-            Some(UpstreamFailureKind::Capability)
-        )
+        && matches!(body_kind, Some(UpstreamFailureKind::Capability))
     {
         return UpstreamFailureKind::Capability;
     }
-    if let Some(kind) = classify_failure_body(body) {
+    if looks_like_cf(status, headers, body) {
+        return UpstreamFailureKind::Cf;
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return UpstreamFailureKind::Quota;
+    }
+    if let Some(kind) = body_kind {
         return kind;
     }
     UpstreamFailureKind::Generic
@@ -563,6 +559,21 @@ mod tests {
                 "model gpt-5.4 does not support reasoning_effort"
             ),
             UpstreamFailureKind::Capability
+        );
+    }
+
+    #[test]
+    fn classify_failure_prefers_quota_over_cf_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("cf-ray", reqwest::header::HeaderValue::from_static("123"));
+
+        assert_eq!(
+            classify_failure(
+                StatusCode::TOO_MANY_REQUESTS,
+                &headers,
+                "{\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"The usage limit has been reached\"}}"
+            ),
+            UpstreamFailureKind::Quota
         );
     }
 }
