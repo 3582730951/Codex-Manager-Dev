@@ -9,9 +9,10 @@ use uuid::Uuid;
 use crate::{
     browser_assist,
     models::{
-        BrowserTaskRequest, CreateGatewayApiKeyRequest, CreateGatewayUserRequest,
-        CreateTenantRequest, ImportAccountRequest, OpenAiLoginCompleteRequest,
-        OpenAiLoginStartRequest, RouteEventRequest, UpdateGatewayUserRequest,
+        BrowserTaskRequest, CompactConversationThreadRequest, CreateGatewayApiKeyRequest,
+        CreateGatewayUserRequest, CreateTenantRequest, ForkConversationThreadRequest,
+        ImportAccountRequest, OpenAiLoginCompleteRequest, OpenAiLoginStartRequest,
+        RouteEventRequest, StartConversationThreadRequest, UpdateGatewayUserRequest,
     },
     state::AppState,
 };
@@ -22,12 +23,20 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/dashboard", get(dashboard))
         .route("/api/v1/tenants", get(tenants).post(create_tenant))
         .route("/api/v1/accounts", get(accounts))
-        .route("/api/v1/accounts/models/refresh", post(refresh_account_models))
+        .route(
+            "/api/v1/accounts/models/refresh",
+            post(refresh_account_models),
+        )
         .route("/api/v1/egress-slots", get(egress_slots))
         .route("/api/v1/leases", get(leases))
         .route("/api/v1/cache-metrics", get(cache_metrics))
         .route("/api/v1/cf-incidents", get(cf_incidents))
         .route("/api/v1/accounts/import", post(import_account))
+        .route("/api/internal/threads", get(threads))
+        .route("/api/internal/threads/start", post(start_thread))
+        .route("/api/internal/threads/fork", post(fork_thread))
+        .route("/api/internal/threads/compact", post(compact_thread))
+        .route("/api/internal/threads/{thread_id}", get(thread_view))
         .route("/api/v1/users", get(users).post(create_user))
         .route("/api/v1/users/{user_id}", put(update_user))
         .route(
@@ -127,6 +136,82 @@ async fn import_account(
     Json(payload): Json<ImportAccountRequest>,
 ) -> Json<crate::models::UpstreamAccount> {
     Json(state.import_account(payload).await)
+}
+
+async fn threads(State(state): State<AppState>) -> Json<Vec<crate::models::ConversationThread>> {
+    Json(state.list_conversation_threads().await)
+}
+
+async fn start_thread(
+    State(state): State<AppState>,
+    Json(payload): Json<StartConversationThreadRequest>,
+) -> Result<Json<crate::models::ConversationThreadView>, (StatusCode, Json<serde_json::Value>)> {
+    match state.start_conversation_thread(payload).await {
+        Ok(thread) => Ok(Json(thread)),
+        Err(message) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "thread_start_failed"
+                }
+            })),
+        )),
+    }
+}
+
+async fn fork_thread(
+    State(state): State<AppState>,
+    Json(payload): Json<ForkConversationThreadRequest>,
+) -> Result<Json<crate::models::ConversationThreadView>, (StatusCode, Json<serde_json::Value>)> {
+    match state.fork_conversation_thread(payload).await {
+        Ok(thread) => Ok(Json(thread)),
+        Err(message) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "thread_fork_failed"
+                }
+            })),
+        )),
+    }
+}
+
+async fn compact_thread(
+    State(state): State<AppState>,
+    Json(payload): Json<CompactConversationThreadRequest>,
+) -> Result<Json<crate::models::ConversationThreadView>, (StatusCode, Json<serde_json::Value>)> {
+    match state.compact_conversation_thread(payload).await {
+        Ok(thread) => Ok(Json(thread)),
+        Err(message) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "thread_compact_failed"
+                }
+            })),
+        )),
+    }
+}
+
+async fn thread_view(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+) -> Result<Json<crate::models::ConversationThreadView>, (StatusCode, Json<serde_json::Value>)> {
+    match state.conversation_thread_view(&thread_id).await {
+        Some(thread) => Ok(Json(thread)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "Thread not found.",
+                    "type": "not_found"
+                }
+            })),
+        )),
+    }
 }
 
 async fn users(State(state): State<AppState>) -> Json<Vec<crate::models::GatewayUserView>> {

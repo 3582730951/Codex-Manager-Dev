@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use axum::http::header::ACCEPT;
+use axum::http::header::{ACCEPT, CONTENT_ENCODING, CONTENT_TYPE};
 use reqwest::{Client, Proxy, Response, StatusCode};
 use serde_json::Value;
 use tracing::warn;
@@ -19,6 +19,8 @@ pub struct ForwardContext {
     pub request_id: String,
     pub subagent: Option<String>,
     pub originator: Option<String>,
+    pub window_id: Option<String>,
+    pub parent_thread_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,13 +110,16 @@ impl UpstreamClient {
         route_mode: RouteMode,
     ) -> Result<Response, UpstreamFailure> {
         let url = endpoint_url(&credential.base_url, path);
+        let compression_enabled = should_use_zstd_request_compression(&credential.base_url, path);
+        let (request_body, compressed) = build_request_body(payload, compression_enabled);
         let mut request = self
             .client_for_route_mode(route_mode)
             .post(url)
             .bearer_auth(&credential.bearer_token)
             .header("session_id", &context.conversation_id)
             .header("x-client-request-id", &context.request_id)
-            .json(payload);
+            .header(CONTENT_TYPE, "application/json")
+            .body(request_body);
 
         if let Some(timeout) = request_timeout_for_stream(stream) {
             request = request.timeout(timeout);
@@ -122,6 +127,9 @@ impl UpstreamClient {
 
         if stream {
             request = request.header(ACCEPT, "text/event-stream");
+        }
+        if compressed {
+            request = request.header(CONTENT_ENCODING, "zstd");
         }
 
         if let Some(account_id) = credential.chatgpt_account_id.as_deref() {
@@ -132,6 +140,12 @@ impl UpstreamClient {
         }
         if let Some(originator) = context.originator.as_deref() {
             request = request.header("originator", originator);
+        }
+        if let Some(window_id) = context.window_id.as_deref() {
+            request = request.header("x-codex-window-id", window_id);
+        }
+        if let Some(parent_thread_id) = context.parent_thread_id.as_deref() {
+            request = request.header("x-codex-parent-thread-id", parent_thread_id);
         }
 
         for (name, value) in &credential.extra_headers {
@@ -193,8 +207,7 @@ impl UpstreamClient {
         if !status.is_success() {
             return Err(format!(
                 "upstream model catalog returned {}: {}",
-                status,
-                value
+                status, value
             ));
         }
 
@@ -247,6 +260,25 @@ fn request_timeout_for_stream(stream: bool) -> Option<Duration> {
     (!stream).then_some(UNARY_REQUEST_TIMEOUT)
 }
 
+fn build_request_body(payload: &Value, compress: bool) -> (Vec<u8>, bool) {
+    let raw = serde_json::to_vec(payload).unwrap_or_else(|_| b"{}".to_vec());
+    if !compress {
+        return (raw, false);
+    }
+    match zstd::stream::encode_all(std::io::Cursor::new(raw.as_slice()), 3) {
+        Ok(compressed) => (compressed, true),
+        Err(error) => {
+            warn!(%error, "failed to zstd-compress upstream request body, falling back to json");
+            (raw, false)
+        }
+    }
+}
+
+fn should_use_zstd_request_compression(base_url: &str, path: &str) -> bool {
+    base_url.to_ascii_lowercase().contains("/backend-api/codex")
+        && path.trim_matches('/').eq_ignore_ascii_case("responses")
+}
+
 pub fn endpoint_url(base_url: &str, path: &str) -> String {
     let normalized_base = base_url.trim_end_matches('/');
     let normalized_path = path.trim_start_matches('/');
@@ -284,9 +316,7 @@ pub fn classify_failure(
 ) -> UpstreamFailureKind {
     let body_kind = classify_failure_body(body);
 
-    if status == StatusCode::UNAUTHORIZED
-        || matches!(body_kind, Some(UpstreamFailureKind::Auth))
-    {
+    if status == StatusCode::UNAUTHORIZED || matches!(body_kind, Some(UpstreamFailureKind::Auth)) {
         return UpstreamFailureKind::Auth;
     }
     if matches!(body_kind, Some(UpstreamFailureKind::Quota)) {
@@ -371,7 +401,7 @@ pub fn classify_failure_body(body: &str) -> Option<UpstreamFailureKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+    use axum::{Json, Router, body::Bytes, extract::State, http::HeaderMap, routing::post};
     use chrono::Utc;
     use serde_json::json;
     use std::sync::Arc;
@@ -397,6 +427,30 @@ mod tests {
         }))
     }
 
+    async fn record_raw_request(
+        State(recorder): State<Recorder>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Json<Value> {
+        recorder.headers.lock().await.push(headers.clone());
+        let payload = if headers
+            .get(CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            == Some("zstd")
+        {
+            let decoded =
+                zstd::stream::decode_all(std::io::Cursor::new(body.as_ref())).expect("decode zstd");
+            serde_json::from_slice::<Value>(&decoded).expect("decode json")
+        } else {
+            serde_json::from_slice::<Value>(body.as_ref()).expect("decode plain json")
+        };
+        recorder.bodies.lock().await.push(payload);
+        Json(json!({
+            "id": format!("resp_{}", Utc::now().timestamp_nanos_opt().unwrap_or_default()),
+            "status": "completed"
+        }))
+    }
+
     #[tokio::test]
     async fn post_json_adds_codex_headers() {
         let recorder = Recorder::default();
@@ -413,6 +467,7 @@ mod tests {
             bind_addr: "127.0.0.1".parse().expect("ip"),
             data_port: 8080,
             admin_port: 8081,
+            max_data_plane_body_bytes: 64 * 1024 * 1024,
             postgres_url: "postgres://localhost/test".to_string(),
             redis_url: "redis://127.0.0.1:6379".to_string(),
             redis_channel: "cmgr:test".to_string(),
@@ -445,6 +500,8 @@ mod tests {
                     request_id: "req-123".to_string(),
                     subagent: Some("review".to_string()),
                     originator: Some("cmgr".to_string()),
+                    window_id: None,
+                    parent_thread_id: None,
                 },
                 false,
                 RouteMode::Direct,
@@ -493,6 +550,87 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn post_json_compresses_codex_requests_and_forwards_thread_headers() {
+        let recorder = Recorder::default();
+        let app = Router::new()
+            .route("/backend-api/codex/responses", post(record_raw_request))
+            .with_state(recorder.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let client = UpstreamClient::new(&Config {
+            bind_addr: "127.0.0.1".parse().expect("ip"),
+            data_port: 8080,
+            admin_port: 8081,
+            max_data_plane_body_bytes: 64 * 1024 * 1024,
+            postgres_url: "postgres://localhost/test".to_string(),
+            redis_url: "redis://127.0.0.1:6379".to_string(),
+            redis_channel: "cmgr:test".to_string(),
+            instance_id: "cmgr-test".to_string(),
+            browser_assist_url: "http://127.0.0.1:8090".to_string(),
+            heartbeat_seconds: 5,
+            enable_demo_seed: false,
+            direct_proxy_url: None,
+            warp_proxy_url: None,
+            browser_assist_direct_proxy_url: None,
+            browser_assist_warp_proxy_url: None,
+        });
+        let credential = UpstreamCredential {
+            account_id: "acc_1".to_string(),
+            base_url: format!("http://{addr}/backend-api/codex"),
+            bearer_token: "secret".to_string(),
+            chatgpt_account_id: None,
+            extra_headers: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let response = client
+            .post_json(
+                &credential,
+                "responses",
+                &json!({"model":"gpt-5.4","stream":true}),
+                &ForwardContext {
+                    conversation_id: "sess-456".to_string(),
+                    request_id: "req-456".to_string(),
+                    subagent: Some("implementer".to_string()),
+                    originator: Some("cmgr".to_string()),
+                    window_id: Some("window-1".to_string()),
+                    parent_thread_id: Some("parent-1".to_string()),
+                },
+                true,
+                RouteMode::Direct,
+            )
+            .await
+            .expect("success");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let headers = recorder.headers.lock().await;
+        let request_headers = headers.first().expect("recorded headers");
+        assert_eq!(
+            request_headers
+                .get(CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("zstd")
+        );
+        assert_eq!(
+            request_headers
+                .get("x-codex-window-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("window-1")
+        );
+        assert_eq!(
+            request_headers
+                .get("x-codex-parent-thread-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("parent-1")
+        );
+    }
+
     #[test]
     fn endpoint_url_does_not_duplicate_path() {
         assert_eq!(
@@ -512,6 +650,18 @@ mod tests {
             request_timeout_for_stream(false),
             Some(UNARY_REQUEST_TIMEOUT)
         );
+    }
+
+    #[test]
+    fn codex_request_compression_only_enables_on_codex_backend() {
+        assert!(should_use_zstd_request_compression(
+            "https://chatgpt.com/backend-api/codex",
+            "responses"
+        ));
+        assert!(!should_use_zstd_request_compression(
+            "https://api.openai.com/v1",
+            "responses"
+        ));
     }
 
     #[test]

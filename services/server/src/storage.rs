@@ -9,9 +9,9 @@ use sqlx::{
 use tracing::{info, warn};
 
 use crate::models::{
-    AccountRouteState, CacheMetrics, CfIncident, CliLease, ConversationContext, GatewayApiKey,
-    RequestLogEntry, RequestLogUsage, RouteMode, SchedulingSignals, Tenant, UpstreamAccount,
-    UpstreamCredential,
+    AccountRouteState, CacheMetrics, CfIncident, CliLease, ConversationContext, ConversationThread,
+    GatewayApiKey, RequestLogEntry, RequestLogUsage, RouteMode, SchedulingSignals, Tenant,
+    ThreadEdge, UpstreamAccount, UpstreamCredential,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +26,8 @@ pub enum PersistenceMessage {
     LeaseDelete(String),
     IncidentInsert(CfIncident),
     ConversationContextUpsert(ConversationContext),
+    ConversationThreadUpsert(ConversationThread),
+    ThreadEdgeUpsert(ThreadEdge),
     CacheMetricsUpsert(CacheMetrics),
     RequestLogInsert(RequestLogEntry),
 }
@@ -42,6 +44,8 @@ impl PersistenceMessage {
             Self::LeaseDelete(_) => "lease_delete",
             Self::IncidentInsert(_) => "incident_insert",
             Self::ConversationContextUpsert(_) => "conversation_context_upsert",
+            Self::ConversationThreadUpsert(_) => "conversation_thread_upsert",
+            Self::ThreadEdgeUpsert(_) => "thread_edge_upsert",
             Self::CacheMetricsUpsert(_) => "cache_metrics_upsert",
             Self::RequestLogInsert(_) => "request_log_insert",
         }
@@ -58,6 +62,8 @@ pub struct PersistenceSnapshot {
     pub leases: Vec<CliLease>,
     pub cf_incidents: Vec<CfIncident>,
     pub conversation_contexts: Vec<ConversationContext>,
+    pub conversation_threads: Vec<ConversationThread>,
+    pub thread_edges: Vec<ThreadEdge>,
     pub cache_metrics: Option<CacheMetrics>,
     pub request_logs: Vec<RequestLogEntry>,
 }
@@ -72,6 +78,8 @@ impl PersistenceSnapshot {
             || !self.leases.is_empty()
             || !self.cf_incidents.is_empty()
             || !self.conversation_contexts.is_empty()
+            || !self.conversation_threads.is_empty()
+            || !self.thread_edges.is_empty()
             || !self.request_logs.is_empty()
     }
 }
@@ -145,9 +153,7 @@ impl Persistence {
                 email: row
                     .try_get::<Option<String>, _>("email")?
                     .unwrap_or_default(),
-                role: crate::models::GatewayUserRole::from_db(
-                    row.try_get::<&str, _>("role")?,
-                ),
+                role: crate::models::GatewayUserRole::from_db(row.try_get::<&str, _>("role")?),
                 token: row.try_get("token")?,
                 default_model: row.try_get("default_model")?,
                 reasoning_effort: row.try_get("reasoning_effort")?,
@@ -272,7 +278,7 @@ impl Persistence {
         .collect::<Result<Vec<_>, _>>()?;
 
         let conversation_contexts = sqlx::query(
-            "select principal_id, model, workflow_spine, turns, updated_at from conversation_contexts order by updated_at desc",
+            "select principal_id, model, workflow_spine, behavior_profile, pending_turn, turns, updated_at from conversation_contexts order by updated_at desc",
         )
         .fetch_all(self.pool.as_ref())
         .await?
@@ -282,10 +288,65 @@ impl Persistence {
                 principal_id: row.try_get("principal_id")?,
                 model: row.try_get("model")?,
                 workflow_spine: row.try_get("workflow_spine")?,
+                behavior_profile: row
+                    .try_get::<Json<crate::models::BehaviorProfile>, _>("behavior_profile")?
+                    .0,
+                pending_turn: row
+                    .try_get::<Option<Json<crate::models::PendingContextTurn>>, _>(
+                        "pending_turn",
+                    )?
+                    .map(|value| value.0),
                 turns: row
                     .try_get::<Json<Vec<crate::models::ContextTurn>>, _>("turns")?
                     .0,
                 updated_at: row.try_get("updated_at")?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+        let conversation_threads = sqlx::query(
+            "select thread_id, tenant_id, principal_id, root_thread_id, parent_thread_id, title,
+                    model, source, status, compaction_summary, last_compaction_at, created_at,
+                    updated_at
+             from conversation_threads
+             order by created_at asc",
+        )
+        .fetch_all(self.pool.as_ref())
+        .await?
+        .into_iter()
+        .map(|row| -> Result<ConversationThread, sqlx::Error> {
+            Ok(ConversationThread {
+                thread_id: row.try_get("thread_id")?,
+                tenant_id: row.try_get("tenant_id")?,
+                principal_id: row.try_get("principal_id")?,
+                root_thread_id: row.try_get("root_thread_id")?,
+                parent_thread_id: row.try_get("parent_thread_id")?,
+                title: row.try_get("title")?,
+                model: row.try_get("model")?,
+                source: row.try_get("source")?,
+                status: row.try_get("status")?,
+                compaction_summary: row.try_get("compaction_summary")?,
+                last_compaction_at: row.try_get("last_compaction_at")?,
+                created_at: row.try_get("created_at")?,
+                updated_at: row.try_get("updated_at")?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+        let thread_edges = sqlx::query(
+            "select parent_thread_id, child_thread_id, relation, created_at
+             from conversation_thread_edges
+             order by created_at asc",
+        )
+        .fetch_all(self.pool.as_ref())
+        .await?
+        .into_iter()
+        .map(|row| -> Result<ThreadEdge, sqlx::Error> {
+            Ok(ThreadEdge {
+                parent_thread_id: row.try_get("parent_thread_id")?,
+                child_thread_id: row.try_get("child_thread_id")?,
+                relation: row.try_get("relation")?,
+                created_at: row.try_get("created_at")?,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -354,6 +415,8 @@ impl Persistence {
             leases,
             cf_incidents,
             conversation_contexts,
+            conversation_threads,
+            thread_edges,
             cache_metrics,
             request_logs,
         })
@@ -508,16 +571,71 @@ impl Persistence {
                 }
                 PersistenceMessage::ConversationContextUpsert(context) => {
                     sqlx::query(
-                        "insert into conversation_contexts (principal_id, model, workflow_spine, turns, updated_at)
-                         values ($1, $2, $3, $4, $5)
+                        "insert into conversation_contexts (principal_id, model, workflow_spine, behavior_profile, pending_turn, turns, updated_at)
+                         values ($1, $2, $3, $4, $5, $6, $7)
                          on conflict (principal_id) do update set model = excluded.model, workflow_spine = excluded.workflow_spine,
+                         behavior_profile = excluded.behavior_profile, pending_turn = excluded.pending_turn,
                          turns = excluded.turns, updated_at = excluded.updated_at",
                     )
                     .bind(&context.principal_id)
                     .bind(&context.model)
                     .bind(&context.workflow_spine)
+                    .bind(Json(context.behavior_profile.clone()))
+                    .bind(context.pending_turn.clone().map(Json))
                     .bind(Json(context.turns.clone()))
                     .bind(context.updated_at)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                PersistenceMessage::ConversationThreadUpsert(thread) => {
+                    sqlx::query(
+                        "insert into conversation_threads (
+                            thread_id, tenant_id, principal_id, root_thread_id, parent_thread_id,
+                            title, model, source, status, compaction_summary, last_compaction_at,
+                            created_at, updated_at
+                         ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                         on conflict (thread_id) do update set
+                         tenant_id = excluded.tenant_id,
+                         principal_id = excluded.principal_id,
+                         root_thread_id = excluded.root_thread_id,
+                         parent_thread_id = excluded.parent_thread_id,
+                         title = excluded.title,
+                         model = excluded.model,
+                         source = excluded.source,
+                         status = excluded.status,
+                         compaction_summary = excluded.compaction_summary,
+                         last_compaction_at = excluded.last_compaction_at,
+                         created_at = excluded.created_at,
+                         updated_at = excluded.updated_at",
+                    )
+                    .bind(&thread.thread_id)
+                    .bind(thread.tenant_id)
+                    .bind(&thread.principal_id)
+                    .bind(&thread.root_thread_id)
+                    .bind(&thread.parent_thread_id)
+                    .bind(&thread.title)
+                    .bind(&thread.model)
+                    .bind(&thread.source)
+                    .bind(&thread.status)
+                    .bind(&thread.compaction_summary)
+                    .bind(thread.last_compaction_at)
+                    .bind(thread.created_at)
+                    .bind(thread.updated_at)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                PersistenceMessage::ThreadEdgeUpsert(edge) => {
+                    sqlx::query(
+                        "insert into conversation_thread_edges (
+                            parent_thread_id, child_thread_id, relation, created_at
+                         ) values ($1, $2, $3, $4)
+                         on conflict (parent_thread_id, child_thread_id, relation) do update set
+                         created_at = excluded.created_at",
+                    )
+                    .bind(&edge.parent_thread_id)
+                    .bind(&edge.child_thread_id)
+                    .bind(&edge.relation)
+                    .bind(edge.created_at)
                     .execute(&mut *tx)
                     .await?;
                 }
@@ -578,6 +696,8 @@ impl Persistence {
             include_str!("../migrations/0002_upstream_credentials.sql"),
             include_str!("../migrations/0003_conversation_contexts.sql"),
             include_str!("../migrations/0004_gateway_users_and_request_logs.sql"),
+            include_str!("../migrations/0005_behavior_profiles.sql"),
+            include_str!("../migrations/0006_conversation_threads.sql"),
         ] {
             for statement in migration
                 .split("\n-- statement-break\n")

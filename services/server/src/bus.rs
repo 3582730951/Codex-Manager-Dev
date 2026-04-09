@@ -9,8 +9,9 @@ use tracing::{info, warn};
 use crate::{
     config::Config,
     models::{
-        AccountRouteState, CacheMetrics, CfIncident, CliLease, ConversationContext, GatewayApiKey,
-        RequestLogEntry, Tenant, UpstreamAccount, UpstreamCredential,
+        AccountRouteState, CacheMetrics, CfIncident, CliLease, ConversationContext,
+        ConversationThread, GatewayApiKey, RequestLogEntry, Tenant, ThreadEdge, UpstreamAccount,
+        UpstreamCredential,
     },
     state::RuntimeState,
     storage::PersistenceMessage,
@@ -127,6 +128,10 @@ async fn apply_message(runtime: &Arc<RuntimeState>, message: PersistenceMessage)
         PersistenceMessage::ConversationContextUpsert(context) => {
             upsert_conversation_context(runtime, context).await
         }
+        PersistenceMessage::ConversationThreadUpsert(thread) => {
+            upsert_conversation_thread(runtime, thread).await
+        }
+        PersistenceMessage::ThreadEdgeUpsert(edge) => upsert_thread_edge(runtime, edge).await,
         PersistenceMessage::CacheMetricsUpsert(metrics) => {
             replace_cache_metrics(runtime, metrics).await
         }
@@ -211,6 +216,26 @@ async fn upsert_conversation_context(runtime: &Arc<RuntimeState>, context: Conve
         .write()
         .await
         .insert(context.principal_id.clone(), context);
+}
+
+async fn upsert_conversation_thread(runtime: &Arc<RuntimeState>, thread: ConversationThread) {
+    runtime
+        .conversation_threads
+        .write()
+        .await
+        .insert(thread.thread_id.clone(), thread);
+}
+
+async fn upsert_thread_edge(runtime: &Arc<RuntimeState>, edge: ThreadEdge) {
+    let mut edges = runtime.thread_edges.write().await;
+    if edges.iter().any(|existing| {
+        existing.parent_thread_id == edge.parent_thread_id
+            && existing.child_thread_id == edge.child_thread_id
+            && existing.relation == edge.relation
+    }) {
+        return;
+    }
+    edges.push(edge);
 }
 
 async fn insert_request_log(runtime: &Arc<RuntimeState>, log: RequestLogEntry) {

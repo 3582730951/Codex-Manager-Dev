@@ -5,7 +5,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{
-        State,
+        DefaultBodyLimit, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, HeaderValue, Response, StatusCode, header::CONTENT_TYPE},
@@ -22,8 +22,9 @@ use uuid::Uuid;
 
 use crate::{
     models::{
-        ChatCompletionsRequest, ChatMessage, CliLease, GatewayApiKey, LeaseSelectionRequest,
-        RequestLogEntry, RequestLogUsage, ResponsesRequest, RouteEventRequest,
+        BehaviorHints, BehaviorProfile, ChatCompletionsRequest, ChatMessage, CliLease,
+        ExecutionMode, GatewayApiKey, LeaseSelectionRequest, RequestLogEntry, RequestLogUsage,
+        ResponsesRequest, RouteEventRequest, ToolPolicy, VerbosityPolicy,
     },
     state::{AppState, GatewayAuthContext},
     upstream::{ForwardContext, UpstreamFailureKind, classify_failure_body},
@@ -64,9 +65,25 @@ struct RequestLogSeed {
     reasoning_effort: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct RequestRoutingScope {
+    principal_id: String,
+    placement_affinity_key: String,
+    window_id: Option<String>,
+    parent_thread_id: Option<String>,
+}
+
 enum ForwardOutcome {
     Response(ForwardSuccess),
     HiddenFailure(UpstreamFailureKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GatewayFailureReason {
+    Queue,
+    Quota,
+    Capability,
+    UpstreamFailure,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -75,6 +92,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/responses", get(responses_ws).post(responses))
         .route("/v1/chat/completions", post(chat_completions))
+        .layer(DefaultBodyLimit::max(
+            state.config.max_data_plane_body_bytes,
+        ))
         .with_state(state)
 }
 
@@ -114,14 +134,28 @@ async fn responses(
     let Some(auth) = authenticated_context(&state, &headers).await else {
         return unauthorized().into_response();
     };
-    let principal_id = derive_principal_id(&headers, auth.tenant.slug.as_str());
     let subagent_count = headers.get("x-openai-subagent").map(|_| 1_u32).unwrap_or(0);
     let requested_model = payload.model.clone();
     let effective_model = resolve_effective_model(&auth.api_key, &requested_model);
     let effective_reasoning_effort =
         resolve_effective_reasoning_for_responses(&auth.api_key, &payload);
-    let payload = apply_responses_policy(&payload, &effective_model, effective_reasoning_effort.as_deref());
+    let payload = apply_responses_policy(
+        &payload,
+        &effective_model,
+        effective_reasoning_effort.as_deref(),
+    );
     let model = payload.model.clone();
+    let routing = resolve_request_scope(&state, &auth, &headers, &model).await;
+    let principal_id = routing.principal_id.clone();
+    let behavior_profile = state
+        .reconcile_behavior_profile(
+            &principal_id,
+            &model,
+            behavior_hints_from_responses_request(&payload),
+        )
+        .await;
+    let cache_affinity_key =
+        responses_cache_affinity_key(auth.tenant.id, &payload, &behavior_profile);
     let input_summary = summarize_value(&payload.input);
     let request_log = RequestLogSeed {
         api_key: auth.api_key.clone(),
@@ -139,19 +173,25 @@ async fn responses(
         model: model.clone(),
         reasoning_effort: effective_reasoning_effort.clone(),
         subagent_count,
+        cache_affinity_key: cache_affinity_key.clone(),
+        placement_affinity_key: routing.placement_affinity_key.clone(),
     };
     let mut selection = state.resolve_lease(selection_request.clone()).await;
     let stream_requested = payload.stream.unwrap_or(false);
     let mut recorded_input = false;
-    let context = forward_context(&headers, &principal_id);
+    let context = forward_context(&headers, &routing, behavior_profile.session_epoch);
 
     for attempt in 0..2 {
         let Some((lease, replay, _warmup)) = selection.take() else {
-            return waiting_response(stream_requested, state.config.heartbeat_seconds);
+            return gateway_failure_response(
+                stream_requested,
+                state.config.heartbeat_seconds,
+                GatewayFailureReason::Queue,
+            );
         };
         if !recorded_input {
             state
-                .record_context_input(
+                .begin_context_turn(
                     &principal_id,
                     &model,
                     lease.generation,
@@ -176,7 +216,12 @@ async fn responses(
                 selection = state.resolve_lease(selection_request.clone()).await;
                 continue;
             }
-            return waiting_response(stream_requested, state.config.heartbeat_seconds);
+            state.discard_pending_context_turn(&principal_id).await;
+            return gateway_failure_response(
+                stream_requested,
+                state.config.heartbeat_seconds,
+                GatewayFailureReason::Queue,
+            );
         };
 
         let codex_protocol = is_codex_chatgpt_backend(&credential.base_url);
@@ -201,6 +246,7 @@ async fn responses(
             replay_context.as_deref(),
             codex_protocol,
             &replayed_tool_calls,
+            &behavior_profile,
         );
         let upstream_stream = codex_protocol || stream_requested;
 
@@ -247,9 +293,11 @@ async fn responses(
                                 selection = state.resolve_lease(selection_request.clone()).await;
                                 continue;
                             }
-                            return waiting_response(
+                            state.discard_pending_context_turn(&principal_id).await;
+                            return gateway_failure_response(
                                 stream_requested,
                                 state.config.heartbeat_seconds,
+                                gateway_failure_reason_from_upstream(kind),
                             );
                         }
                     }
@@ -277,16 +325,18 @@ async fn responses(
                                 },
                             )
                             .await;
-                        if let Some(output_summary) = output_summary {
-                            state
-                                .record_context_output_with_response(
-                                    &principal_id,
+                        state
+                            .record_context_output_with_response(
+                                &principal_id,
+                                success_response_summary(
                                     output_summary,
-                                    response_id,
-                                    response_output_items,
-                                )
-                                .await;
-                        }
+                                    &response_output_items,
+                                    "assistant response delivered",
+                                ),
+                                response_id,
+                                response_output_items,
+                            )
+                            .await;
                         state
                             .record_request_log(build_request_log_entry(
                                 &request_log,
@@ -304,7 +354,12 @@ async fn responses(
                             selection = state.resolve_lease(selection_request.clone()).await;
                             continue;
                         }
-                        return waiting_response(stream_requested, state.config.heartbeat_seconds);
+                        state.discard_pending_context_turn(&principal_id).await;
+                        return gateway_failure_response(
+                            stream_requested,
+                            state.config.heartbeat_seconds,
+                            gateway_failure_reason_from_upstream(kind),
+                        );
                     }
                 }
             }
@@ -322,12 +377,24 @@ async fn responses(
                     selection = state.resolve_lease(selection_request.clone()).await;
                     continue;
                 }
-                return waiting_response(stream_requested, state.config.heartbeat_seconds);
+                state.discard_pending_context_turn(&principal_id).await;
+                return gateway_failure_response(
+                    stream_requested,
+                    state.config.heartbeat_seconds,
+                    gateway_failure_reason_from_upstream(error.kind),
+                );
             }
         }
     }
 
-    waiting_response(stream_requested, state.config.heartbeat_seconds)
+    if recorded_input {
+        state.discard_pending_context_turn(&principal_id).await;
+    }
+    gateway_failure_response(
+        stream_requested,
+        state.config.heartbeat_seconds,
+        GatewayFailureReason::Queue,
+    )
 }
 
 async fn responses_ws(
@@ -338,12 +405,9 @@ async fn responses_ws(
     let Some(auth) = authenticated_context(&state, &headers).await else {
         return unauthorized().into_response();
     };
-    let principal_id = derive_principal_id(&headers, auth.tenant.slug.as_str());
     let subagent_count = headers.get("x-openai-subagent").map(|_| 1_u32).unwrap_or(0);
-    let context = forward_context(&headers, &principal_id);
-
     ws.on_upgrade(move |socket| async move {
-        handle_responses_ws(socket, state, auth, principal_id, context, subagent_count).await;
+        handle_responses_ws(socket, state, auth, headers, subagent_count).await;
     })
     .into_response()
 }
@@ -352,8 +416,7 @@ async fn handle_responses_ws(
     mut socket: WebSocket,
     state: AppState,
     auth: GatewayAuthContext,
-    principal_id: String,
-    context: ForwardContext,
+    headers: HeaderMap,
     subagent_count: u32,
 ) {
     loop {
@@ -363,7 +426,7 @@ async fn handle_responses_ws(
         let message = match message {
             Ok(message) => message,
             Err(error) => {
-                tracing::warn!(%error, principal_id = %principal_id, "responses websocket receive failed");
+                tracing::warn!(%error, "responses websocket receive failed");
                 break;
             }
         };
@@ -374,8 +437,7 @@ async fn handle_responses_ws(
                     &mut socket,
                     &state,
                     &auth,
-                    &principal_id,
-                    &context,
+                    &headers,
                     subagent_count,
                     text.as_str(),
                 )
@@ -413,8 +475,7 @@ async fn handle_responses_ws_text(
     socket: &mut WebSocket,
     state: &AppState,
     auth: &GatewayAuthContext,
-    principal_id: &str,
-    context: &ForwardContext,
+    headers: &HeaderMap,
     subagent_count: u32,
     message: &str,
 ) -> Result<(), ()> {
@@ -426,15 +487,14 @@ async fn handle_responses_ws_text(
         }
     };
 
-    forward_responses_ws(socket, state, auth, principal_id, context, subagent_count, payload).await
+    forward_responses_ws(socket, state, auth, headers, subagent_count, payload).await
 }
 
 async fn forward_responses_ws(
     socket: &mut WebSocket,
     state: &AppState,
     auth: &GatewayAuthContext,
-    principal_id: &str,
-    context: &ForwardContext,
+    headers: &HeaderMap,
     subagent_count: u32,
     mut payload: ResponsesRequest,
 ) -> Result<(), ()> {
@@ -454,17 +514,35 @@ async fn forward_responses_ws(
     let effective_model = resolve_effective_model(&auth.api_key, &requested_model);
     let effective_reasoning_effort =
         resolve_effective_reasoning_for_responses(&auth.api_key, &payload);
-    let mut payload =
-        apply_responses_policy(&payload, &effective_model, effective_reasoning_effort.as_deref());
+    let mut payload = apply_responses_policy(
+        &payload,
+        &effective_model,
+        effective_reasoning_effort.as_deref(),
+    );
     payload.stream = Some(true);
     payload.extra.remove("background");
 
     let model = payload.model.clone();
+    let routing = resolve_request_scope(state, auth, headers, &model).await;
+    let principal_id = routing.principal_id.clone();
+    let behavior_profile = state
+        .reconcile_behavior_profile(
+            &principal_id,
+            &model,
+            behavior_hints_from_responses_request(&payload),
+        )
+        .await;
+    let cache_affinity_key =
+        responses_cache_affinity_key(auth.tenant.id, &payload, &behavior_profile);
+    let scoped_context = session_scoped_forward_context(
+        &forward_context(headers, &routing, 1),
+        behavior_profile.session_epoch,
+    );
     let input_summary = summarize_value(&payload.input);
     let request_log = RequestLogSeed {
         api_key: auth.api_key.clone(),
         tenant_id: auth.tenant.id,
-        principal_id: principal_id.to_string(),
+        principal_id: principal_id.clone(),
         endpoint: "/v1/responses",
         method: "WS",
         requested_model,
@@ -473,23 +551,25 @@ async fn forward_responses_ws(
     };
     let selection_request = LeaseSelectionRequest {
         tenant_id: auth.tenant.id,
-        principal_id: principal_id.to_string(),
+        principal_id: principal_id.clone(),
         model: model.clone(),
         reasoning_effort: effective_reasoning_effort.clone(),
         subagent_count,
+        cache_affinity_key: cache_affinity_key.clone(),
+        placement_affinity_key: routing.placement_affinity_key.clone(),
     };
     let mut selection = state.resolve_lease(selection_request.clone()).await;
     let mut recorded_input = false;
 
     for attempt in 0..2 {
         let Some((lease, replay, _warmup)) = selection.take() else {
-            send_ws_waiting_response(socket, &model).await?;
+            send_ws_gateway_failure_response(socket, GatewayFailureReason::Queue).await?;
             return Ok(());
         };
         if !recorded_input {
             state
-                .record_context_input(
-                    principal_id,
+                .begin_context_turn(
+                    &principal_id,
                     &model,
                     lease.generation,
                     input_summary.clone(),
@@ -497,7 +577,9 @@ async fn forward_responses_ws(
                 .await;
             recorded_input = true;
         }
-        let replay_context = state.replay_context_for(principal_id, lease.generation).await;
+        let replay_context = state
+            .replay_context_for(&principal_id, lease.generation)
+            .await;
         let Some(credential) = state.credential_for_account(&lease.account_id).await else {
             let _ = state
                 .failover_account(&lease.account_id, "credential-missing", 300, true)
@@ -511,7 +593,8 @@ async fn forward_responses_ws(
                 selection = state.resolve_lease(selection_request.clone()).await;
                 continue;
             }
-            send_ws_waiting_response(socket, &model).await?;
+            state.discard_pending_context_turn(&principal_id).await;
+            send_ws_gateway_failure_response(socket, GatewayFailureReason::Queue).await?;
             return Ok(());
         };
 
@@ -523,7 +606,7 @@ async fn forward_responses_ws(
         let replayed_tool_calls = if codex_protocol {
             state
                 .replay_tool_call_items_for(
-                    principal_id,
+                    &principal_id,
                     previous_response_id,
                     &responses_input_function_call_output_call_ids(&payload.input),
                 )
@@ -537,6 +620,7 @@ async fn forward_responses_ws(
             replay_context.as_deref(),
             codex_protocol,
             &replayed_tool_calls,
+            &behavior_profile,
         );
 
         match state
@@ -545,7 +629,7 @@ async fn forward_responses_ws(
                 &credential,
                 "responses",
                 &upstream_value,
-                context,
+                &scoped_context,
                 true,
                 lease.route_mode,
             )
@@ -557,7 +641,7 @@ async fn forward_responses_ws(
                 state,
                 lease.clone(),
                 request_log.clone(),
-                principal_id.to_string(),
+                principal_id.clone(),
                 &model,
             )
             .await
@@ -569,7 +653,12 @@ async fn forward_responses_ws(
                         selection = state.resolve_lease(selection_request.clone()).await;
                         continue;
                     }
-                    send_ws_waiting_response(socket, &model).await?;
+                    state.discard_pending_context_turn(&principal_id).await;
+                    send_ws_gateway_failure_response(
+                        socket,
+                        gateway_failure_reason_from_upstream(kind),
+                    )
+                    .await?;
                     return Ok(());
                 }
             },
@@ -587,13 +676,21 @@ async fn forward_responses_ws(
                     selection = state.resolve_lease(selection_request.clone()).await;
                     continue;
                 }
-                send_ws_waiting_response(socket, &model).await?;
+                state.discard_pending_context_turn(&principal_id).await;
+                send_ws_gateway_failure_response(
+                    socket,
+                    gateway_failure_reason_from_upstream(error.kind),
+                )
+                .await?;
                 return Ok(());
             }
         }
     }
 
-    send_ws_waiting_response(socket, &model).await
+    if recorded_input {
+        state.discard_pending_context_turn(&principal_id).await;
+    }
+    send_ws_gateway_failure_response(socket, GatewayFailureReason::Queue).await
 }
 
 async fn chat_completions(
@@ -604,14 +701,26 @@ async fn chat_completions(
     let Some(auth) = authenticated_context(&state, &headers).await else {
         return unauthorized().into_response();
     };
-    let principal_id = derive_principal_id(&headers, auth.tenant.slug.as_str());
     let subagent_count = headers.get("x-openai-subagent").map(|_| 1_u32).unwrap_or(0);
     let requested_model = payload.model.clone();
     let effective_model = resolve_effective_model(&auth.api_key, &requested_model);
-    let effective_reasoning_effort =
-        resolve_effective_reasoning_for_chat(&auth.api_key, &payload);
-    let payload = apply_chat_policy(&payload, &effective_model, effective_reasoning_effort.as_deref());
+    let effective_reasoning_effort = resolve_effective_reasoning_for_chat(&auth.api_key, &payload);
+    let payload = apply_chat_policy(
+        &payload,
+        &effective_model,
+        effective_reasoning_effort.as_deref(),
+    );
     let model = payload.model.clone();
+    let routing = resolve_request_scope(&state, &auth, &headers, &model).await;
+    let principal_id = routing.principal_id.clone();
+    let behavior_profile = state
+        .reconcile_behavior_profile(
+            &principal_id,
+            &model,
+            behavior_hints_from_chat_request(&payload),
+        )
+        .await;
+    let cache_affinity_key = chat_cache_affinity_key(auth.tenant.id, &payload, &behavior_profile);
     let message_summary = summarize_messages(&payload.messages);
     let request_log = RequestLogSeed {
         api_key: auth.api_key.clone(),
@@ -629,23 +738,26 @@ async fn chat_completions(
         model: model.clone(),
         reasoning_effort: payload.reasoning_effort.clone(),
         subagent_count,
+        cache_affinity_key: cache_affinity_key.clone(),
+        placement_affinity_key: routing.placement_affinity_key.clone(),
     };
     let mut selection = state.resolve_lease(selection_request.clone()).await;
-    let context = forward_context(&headers, &principal_id);
+    let context = forward_context(&headers, &routing, behavior_profile.session_epoch);
     let stream_requested = payload.stream.unwrap_or(false);
     let mut recorded_input = false;
 
     for attempt in 0..2 {
         let Some((lease, replay, _warmup)) = selection.take() else {
-            return waiting_chat_response(
+            return gateway_chat_failure_response(
                 stream_requested,
                 state.config.heartbeat_seconds,
                 &payload.model,
+                GatewayFailureReason::Queue,
             );
         };
         if !recorded_input {
             state
-                .record_context_input(
+                .begin_context_turn(
                     &principal_id,
                     &model,
                     lease.generation,
@@ -671,10 +783,12 @@ async fn chat_completions(
                 selection = state.resolve_lease(selection_request.clone()).await;
                 continue;
             }
-            return waiting_chat_response(
+            state.discard_pending_context_turn(&principal_id).await;
+            return gateway_chat_failure_response(
                 stream_requested,
                 state.config.heartbeat_seconds,
                 &payload.model,
+                GatewayFailureReason::Queue,
             );
         };
 
@@ -684,6 +798,7 @@ async fn chat_completions(
             replay.cache_key.clone(),
             replay_context.as_deref(),
             codex_protocol,
+            &behavior_profile,
         );
         let upstream_stream = codex_protocol || stream_requested;
 
@@ -721,10 +836,12 @@ async fn chat_completions(
                                 selection = state.resolve_lease(selection_request.clone()).await;
                                 continue;
                             }
-                            return waiting_chat_response(
+                            state.discard_pending_context_turn(&principal_id).await;
+                            return gateway_chat_failure_response(
                                 stream_requested,
                                 state.config.heartbeat_seconds,
                                 &payload.model,
+                                gateway_failure_reason_from_upstream(kind),
                             );
                         }
                     }
@@ -752,16 +869,18 @@ async fn chat_completions(
                                 },
                             )
                             .await;
-                        if let Some(output_summary) = output_summary {
-                            state
-                                .record_context_output_with_response(
-                                    &principal_id,
+                        state
+                            .record_context_output_with_response(
+                                &principal_id,
+                                success_response_summary(
                                     output_summary,
-                                    response_id,
-                                    response_output_items,
-                                )
-                                .await;
-                        }
+                                    &response_output_items,
+                                    "assistant response delivered",
+                                ),
+                                response_id,
+                                response_output_items,
+                            )
+                            .await;
                         state
                             .record_request_log(build_request_log_entry(
                                 &request_log,
@@ -779,10 +898,12 @@ async fn chat_completions(
                             selection = state.resolve_lease(selection_request.clone()).await;
                             continue;
                         }
-                        return waiting_chat_response(
+                        state.discard_pending_context_turn(&principal_id).await;
+                        return gateway_chat_failure_response(
                             stream_requested,
                             state.config.heartbeat_seconds,
                             &payload.model,
+                            gateway_failure_reason_from_upstream(kind),
                         );
                     }
                 }
@@ -801,19 +922,25 @@ async fn chat_completions(
                     selection = state.resolve_lease(selection_request.clone()).await;
                     continue;
                 }
-                return waiting_chat_response(
+                state.discard_pending_context_turn(&principal_id).await;
+                return gateway_chat_failure_response(
                     stream_requested,
                     state.config.heartbeat_seconds,
                     &payload.model,
+                    gateway_failure_reason_from_upstream(error.kind),
                 );
             }
         }
     }
 
-    waiting_chat_response(
+    if recorded_input {
+        state.discard_pending_context_turn(&principal_id).await;
+    }
+    gateway_chat_failure_response(
         stream_requested,
         state.config.heartbeat_seconds,
         &payload.model,
+        GatewayFailureReason::Queue,
     )
 }
 
@@ -982,10 +1109,55 @@ fn observed_model_from_value(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn waiting_response(stream_requested: bool, heartbeat_seconds: u64) -> Response<Body> {
+impl GatewayFailureReason {
+    fn as_reason(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::Quota => "quota",
+            Self::Capability => "capability",
+            Self::UpstreamFailure => "upstream_failure",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::Queue => "Gateway queue active.",
+            Self::Quota => "Gateway upstream quota exhausted.",
+            Self::Capability => "Gateway capability match unavailable.",
+            Self::UpstreamFailure => "Gateway upstream request failed.",
+        }
+    }
+}
+
+fn gateway_failure_reason_from_upstream(kind: UpstreamFailureKind) -> GatewayFailureReason {
+    match kind {
+        UpstreamFailureKind::Quota => GatewayFailureReason::Quota,
+        UpstreamFailureKind::Capability => GatewayFailureReason::Capability,
+        UpstreamFailureKind::Cf | UpstreamFailureKind::Auth | UpstreamFailureKind::Generic => {
+            GatewayFailureReason::UpstreamFailure
+        }
+    }
+}
+
+fn gateway_error_value(reason: GatewayFailureReason) -> Value {
+    json!({
+        "code": "server_busy",
+        "message": reason.message(),
+        "type": "server_busy",
+        "reason": reason.as_reason(),
+        "retryable": true
+    })
+}
+
+fn gateway_failure_response(
+    stream_requested: bool,
+    heartbeat_seconds: u64,
+    reason: GatewayFailureReason,
+) -> Response<Body> {
     if stream_requested {
+        let response_id = format!("resp_failed_{}", uuid::Uuid::new_v4().simple());
+        let error = gateway_error_value(reason);
         let wait_stream = stream! {
-            let response_id = format!("resp_wait_{}", uuid::Uuid::new_v4().simple());
             yield Ok::<Event, Infallible>(
                 Event::default()
                     .event("response.created")
@@ -999,28 +1171,13 @@ fn waiting_response(stream_requested: bool, heartbeat_seconds: u64) -> Response<
             );
             yield Ok::<Event, Infallible>(
                 Event::default()
-                    .event("response.output_text.delta")
+                    .event("response.failed")
                     .data(json!({
-                        "type": "response.output_text.delta",
-                        "delta": "Gateway queue active. Waiting for an exact-capability account."
-                    }).to_string())
-            );
-            yield Ok::<Event, Infallible>(
-                Event::default()
-                    .event("response.completed")
-                    .data(json!({
-                        "type": "response.completed",
+                        "type": "response.failed",
                         "response": {
                             "id": response_id,
-                            "status": "completed",
-                            "output": [{
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [{
-                                    "type": "output_text",
-                                    "text": "Gateway queue active. Waiting for an exact-capability account."
-                                }]
-                            }]
+                            "status": "failed",
+                            "error": error,
                         }
                     }).to_string())
             );
@@ -1037,58 +1194,22 @@ fn waiting_response(stream_requested: bool, heartbeat_seconds: u64) -> Response<
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
-            "error": {
-                "message": "Gateway queue active.",
-                "type": "server_busy"
-            }
+            "error": gateway_error_value(reason)
         })),
     )
         .into_response()
 }
 
-fn waiting_chat_response(
+fn gateway_chat_failure_response(
     stream_requested: bool,
     heartbeat_seconds: u64,
     model: &str,
+    reason: GatewayFailureReason,
 ) -> Response<Body> {
-    if stream_requested {
-        let created = Utc::now().timestamp();
-        let model = model.to_string();
-        let chat_id = format!("chatcmpl_wait_{}", uuid::Uuid::new_v4().simple());
-        let wait_stream = stream! {
-            yield Ok::<Event, Infallible>(chat_completion_sse_event(chat_completion_chunk(
-                &chat_id,
-                &model,
-                created,
-                json!({"role":"assistant"}),
-                None,
-            )));
-            yield Ok::<Event, Infallible>(chat_completion_sse_event(chat_completion_chunk(
-                &chat_id,
-                &model,
-                created,
-                json!({"content":"Gateway queue active. Waiting for an exact-capability account."}),
-                None,
-            )));
-            yield Ok::<Event, Infallible>(chat_completion_sse_event(chat_completion_chunk(
-                &chat_id,
-                &model,
-                created,
-                json!({}),
-                Some("stop"),
-            )));
-            yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
-        };
-        return Sse::new(wait_stream)
-            .keep_alive(
-                KeepAlive::new()
-                    .interval(Duration::from_secs(heartbeat_seconds))
-                    .text("heartbeat"),
-            )
-            .into_response();
-    }
-
-    waiting_response(false, heartbeat_seconds)
+    let _ = stream_requested;
+    let _ = heartbeat_seconds;
+    let _ = model;
+    gateway_failure_response(false, heartbeat_seconds, reason)
 }
 
 fn parse_responses_ws_create(message: &str) -> Result<ResponsesRequest, String> {
@@ -1097,9 +1218,10 @@ fn parse_responses_ws_create(message: &str) -> Result<ResponsesRequest, String> 
     let Some(object) = value.as_object_mut() else {
         return Err("invalid websocket payload: expected a JSON object".to_string());
     };
-    let Some(event_type) = object.remove("type").and_then(|value| {
-        value.as_str().map(str::to_string)
-    }) else {
+    let Some(event_type) = object
+        .remove("type")
+        .and_then(|value| value.as_str().map(str::to_string))
+    else {
         return Err("invalid websocket payload: missing type".to_string());
     };
     if event_type != "response.create" {
@@ -1247,14 +1369,23 @@ async fn send_ws_record(socket: &mut WebSocket, record: &str) -> Result<(), ()> 
         .map_err(|_| ())
 }
 
-async fn send_ws_waiting_response(socket: &mut WebSocket, model: &str) -> Result<(), ()> {
-    for value in websocket_text_response_events(
-        model,
-        "Gateway queue active. Waiting for an exact-capability account.",
-    ) {
-        send_ws_json(socket, &value).await?;
-    }
-    Ok(())
+async fn send_ws_gateway_failure_response(
+    socket: &mut WebSocket,
+    reason: GatewayFailureReason,
+) -> Result<(), ()> {
+    let response_id = format!("resp_ws_failed_{}", uuid::Uuid::new_v4().simple());
+    send_ws_json(
+        socket,
+        &json!({
+            "type": "response.failed",
+            "response": {
+                "id": response_id,
+                "status": "failed",
+                "error": gateway_error_value(reason),
+            }
+        }),
+    )
+    .await
 }
 
 async fn send_ws_empty_response(socket: &mut WebSocket, model: &str) -> Result<(), ()> {
@@ -1308,7 +1439,10 @@ async fn send_ws_failure_response(
     send_ws_json(
         socket,
         &Value::Object(serde_json::Map::from_iter([
-            ("type".to_string(), Value::String("response.failed".to_string())),
+            (
+                "type".to_string(),
+                Value::String("response.failed".to_string()),
+            ),
             ("response".to_string(), Value::Object(response)),
         ])),
     )
@@ -1322,97 +1456,16 @@ async fn send_ws_json(socket: &mut WebSocket, value: &Value) -> Result<(), ()> {
         .map_err(|_| ())
 }
 
-fn websocket_text_response_events(model: &str, text: &str) -> Vec<Value> {
-    let response_id = format!("resp_ws_{}", uuid::Uuid::new_v4().simple());
-    let item_id = format!("msg_ws_{}", uuid::Uuid::new_v4().simple());
-    let part = json!({
-        "type": "output_text",
-        "text": "",
-    });
-    let item = json!({
-        "id": item_id,
-        "type": "message",
-        "role": "assistant",
-        "status": "in_progress",
-        "content": [part.clone()],
-    });
-    let final_item = json!({
-        "id": item_id,
-        "type": "message",
-        "role": "assistant",
-        "status": "completed",
-        "content": [{
-            "type": "output_text",
-            "text": text,
-        }],
-    });
-    vec![
-        json!({
-            "type": "response.created",
-            "response": {
-                "id": response_id,
-                "model": model,
-                "status": "in_progress",
-                "output": [],
-            }
-        }),
-        json!({
-            "type": "response.output_item.added",
-            "response_id": response_id,
-            "output_index": 0,
-            "item": item,
-        }),
-        json!({
-            "type": "response.content_part.added",
-            "response_id": response_id,
-            "item_id": item_id,
-            "output_index": 0,
-            "content_index": 0,
-            "part": part,
-        }),
-        json!({
-            "type": "response.output_text.delta",
-            "response_id": response_id,
-            "item_id": item_id,
-            "output_index": 0,
-            "content_index": 0,
-            "delta": text,
-        }),
-        json!({
-            "type": "response.output_text.done",
-            "response_id": response_id,
-            "item_id": item_id,
-            "output_index": 0,
-            "content_index": 0,
-            "text": text,
-        }),
-        json!({
-            "type": "response.content_part.done",
-            "response_id": response_id,
-            "item_id": item_id,
-            "output_index": 0,
-            "content_index": 0,
-            "part": {
-                "type": "output_text",
-                "text": text,
-            },
-        }),
-        json!({
-            "type": "response.output_item.done",
-            "response_id": response_id,
-            "output_index": 0,
-            "item": final_item.clone(),
-        }),
-        json!({
-            "type": "response.completed",
-            "response": {
-                "id": response_id,
-                "model": model,
-                "status": "completed",
-                "output": [final_item],
-            }
-        }),
-    ]
+fn websocket_failure_response_event(reason: GatewayFailureReason) -> Value {
+    let response_id = format!("resp_ws_failed_{}", uuid::Uuid::new_v4().simple());
+    json!({
+        "type": "response.failed",
+        "response": {
+            "id": response_id,
+            "status": "failed",
+            "error": gateway_error_value(reason),
+        }
+    })
 }
 
 async fn upstream_json_response(
@@ -1481,7 +1534,8 @@ async fn upstream_responses_json_to_chat_response(
     }
     let output_summary = extract_response_output_text(&value);
     let usage = request_usage_from_value(&value);
-    let observed_model = observed_model_from_value(&value).or_else(|| observed_model_from_headers(&headers));
+    let observed_model =
+        observed_model_from_value(&value).or_else(|| observed_model_from_headers(&headers));
     let response_id = response_id_from_value(&value);
     let response_output_items = response_output_items_from_value(&value);
     let payload = responses_json_to_chat_completion(&value, fallback_model);
@@ -1517,7 +1571,8 @@ async fn upstream_stream_to_json_response(
 
     let output_summary = extract_response_output_text(&value);
     let usage = request_usage_from_value(&value);
-    let observed_model = observed_model_from_value(&value).or_else(|| observed_model_from_headers(&headers));
+    let observed_model =
+        observed_model_from_value(&value).or_else(|| observed_model_from_headers(&headers));
     let response_id = response_id_from_value(&value);
     let response_output_items = response_output_items_from_value(&value);
     let bytes = serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec());
@@ -1555,7 +1610,8 @@ async fn upstream_stream_to_chat_json_response(
 
     let output_summary = extract_response_output_text(&value);
     let usage = request_usage_from_value(&value);
-    let observed_model = observed_model_from_value(&value).or_else(|| observed_model_from_headers(&headers));
+    let observed_model =
+        observed_model_from_value(&value).or_else(|| observed_model_from_headers(&headers));
     let response_id = response_id_from_value(&value);
     let response_output_items = response_output_items_from_value(&value);
     let payload = responses_json_to_chat_completion(&value, fallback_model);
@@ -1665,6 +1721,9 @@ async fn upstream_stream_response(
             }
         }
 
+        if had_hidden_failure {
+            state.discard_pending_context_turn(&principal_id).await;
+        }
         if !had_hidden_failure {
             let _ = state
                 .record_route_event(
@@ -1771,6 +1830,9 @@ fn passthrough_stream_response(
                     yield Ok::<Bytes, std::io::Error>(chunk);
                 }
 
+                if had_error {
+                    state.discard_pending_context_turn(&principal_id).await;
+                }
                 if !had_error {
                     let _ = state
                         .record_route_event(
@@ -1913,7 +1975,7 @@ async fn upstream_responses_stream_to_chat_response(
                 break;
             }
         }
-        if !adapter_state.finished {
+        if !adapter_state.finished && !had_hidden_failure {
             yield Ok::<Event, Infallible>(chat_completion_sse_event(chat_completion_chunk(
                 &adapter_state.chat_id,
                 &adapter_state.model,
@@ -1922,6 +1984,9 @@ async fn upstream_responses_stream_to_chat_response(
                 Some("stop"),
             )));
             yield Ok::<Event, Infallible>(Event::default().data("[DONE]"));
+        }
+        if had_hidden_failure {
+            gateway_state.discard_pending_context_turn(&principal_id).await;
         }
         if !had_hidden_failure {
             let _ = gateway_state
@@ -2072,9 +2137,13 @@ async fn collect_completed_response_from_stream(
         }
     }
 
-    finalize_stream_response(completed_response, streamed_response_id, streamed_output_items)
-        .map(|value| (status, headers, value))
-        .ok_or(UpstreamFailureKind::Generic)
+    finalize_stream_response(
+        completed_response,
+        streamed_response_id,
+        streamed_output_items,
+    )
+    .map(|value| (status, headers, value))
+    .ok_or(UpstreamFailureKind::Generic)
 }
 
 async fn handle_hidden_failure(state: &AppState, lease: &CliLease, kind: UpstreamFailureKind) {
@@ -2373,6 +2442,306 @@ fn copy_upstream_headers_to_response(out: &mut HeaderMap, headers: &reqwest::hea
     }
 }
 
+fn behavior_hints_from_responses_request(payload: &ResponsesRequest) -> BehaviorHints {
+    detect_behavior_hints(&collect_responses_behavior_text(payload))
+}
+
+fn behavior_hints_from_chat_request(payload: &ChatCompletionsRequest) -> BehaviorHints {
+    detect_behavior_hints(&collect_chat_behavior_text(payload))
+}
+
+fn collect_responses_behavior_text(payload: &ResponsesRequest) -> String {
+    let mut segments = normalize_responses_input(payload.input.clone())
+        .into_iter()
+        .map(|item| responses_input_message_text(&item))
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>();
+    if let Some(instructions) = payload
+        .extra
+        .get("instructions")
+        .and_then(instruction_text_from_value)
+    {
+        segments.push(instructions);
+    }
+    segments.join("\n")
+}
+
+fn collect_chat_behavior_text(payload: &ChatCompletionsRequest) -> String {
+    let mut segments = payload
+        .messages
+        .iter()
+        .map(|message| responses_input_message_text(&chat_message_to_responses_input(message)))
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>();
+    if let Some(instructions) = payload
+        .extra
+        .get("instructions")
+        .and_then(instruction_text_from_value)
+    {
+        segments.push(instructions);
+    }
+    segments.join("\n")
+}
+
+fn detect_behavior_hints(text: &str) -> BehaviorHints {
+    BehaviorHints {
+        output_language: detect_explicit_output_language(text),
+        execution_mode: detect_execution_mode(text),
+        tool_policy: detect_tool_policy(text),
+        verbosity_policy: detect_verbosity_policy(text),
+    }
+}
+
+fn detect_explicit_output_language(text: &str) -> Option<String> {
+    let lowered = text.to_ascii_lowercase();
+    let zh_patterns = [
+        "以后用中文",
+        "以后都用中文",
+        "请用中文",
+        "只用中文",
+        "中文回答",
+        "用中文回答",
+        "请回复中文",
+        "respond in chinese",
+        "answer in chinese",
+        "use chinese",
+        "speak chinese",
+        "reply in chinese",
+    ];
+    if zh_patterns
+        .iter()
+        .any(|pattern| text.contains(pattern) || lowered.contains(pattern))
+    {
+        return Some("zh-CN".to_string());
+    }
+
+    let en_patterns = [
+        "以后用英文",
+        "以后都用英文",
+        "请用英文",
+        "只用英文",
+        "英文回答",
+        "用英文回答",
+        "respond in english",
+        "answer in english",
+        "use english",
+        "speak english",
+        "reply in english",
+    ];
+    en_patterns
+        .iter()
+        .any(|pattern| text.contains(pattern) || lowered.contains(pattern))
+        .then(|| "en-US".to_string())
+}
+
+fn detect_execution_mode(text: &str) -> Option<ExecutionMode> {
+    let lowered = text.to_ascii_lowercase();
+    [
+        "直接执行",
+        "先执行",
+        "先做再说",
+        "先执行再说",
+        "先调用工具",
+        "不要先解释",
+        "少解释",
+        "execute first",
+        "run it first",
+        "do it first",
+        "tool first",
+        "don't explain first",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern) || lowered.contains(pattern))
+    .then_some(ExecutionMode::ToolFirst)
+}
+
+fn detect_tool_policy(text: &str) -> Option<ToolPolicy> {
+    detect_execution_mode(text).map(|_| ToolPolicy::PreferTools)
+}
+
+fn detect_verbosity_policy(text: &str) -> Option<VerbosityPolicy> {
+    let lowered = text.to_ascii_lowercase();
+    [
+        "简短回答",
+        "简洁一点",
+        "简洁回答",
+        "简单回答",
+        "be brief",
+        "be concise",
+        "keep it short",
+        "concise",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern) || lowered.contains(pattern))
+    .then_some(VerbosityPolicy::Brief)
+}
+
+fn behavior_instruction_from_profile(profile: &BehaviorProfile) -> Option<String> {
+    let mut rules = Vec::new();
+    if let Some(language) = profile.output_language.as_deref() {
+        rules.push(match language {
+            "zh-CN" => {
+                "Always answer in Simplified Chinese unless the user explicitly asks to switch languages."
+            }
+            "en-US" => {
+                "Always answer in English unless the user explicitly asks to switch languages."
+            }
+            _ => "Respect the user's explicitly requested output language.",
+        });
+    }
+    if profile.execution_mode == ExecutionMode::ToolFirst {
+        rules.push(
+            "When the user requests an actionable task and tools are available, execute the relevant tools before giving narrative explanation.",
+        );
+    }
+    if profile.tool_policy == ToolPolicy::PreferTools {
+        rules.push("Prefer tool execution over speculative narrative replies when a tool can verify or complete the task.");
+    }
+    if profile.verbosity_policy == VerbosityPolicy::Brief {
+        rules.push("Keep the final written answer brief.");
+    }
+    (!rules.is_empty()).then(|| rules.join("\n"))
+}
+
+fn prepend_context_messages(
+    input: Vec<Value>,
+    behavior_instruction: Option<&str>,
+    replay_context: Option<&str>,
+) -> Value {
+    let mut prefixed = Vec::new();
+    if let Some(instruction) = behavior_instruction
+        && !instruction.trim().is_empty()
+    {
+        prefixed.push(system_text_message(instruction));
+    }
+    if let Some(replay_context) = replay_context
+        && !replay_context.trim().is_empty()
+    {
+        prefixed.push(replay_context_message(replay_context));
+    }
+    prefixed.extend(input);
+    Value::Array(prefixed)
+}
+
+fn system_text_message(text: &str) -> Value {
+    json!({
+        "role": "system",
+        "content": [{"type": "input_text", "text": text}]
+    })
+}
+
+fn responses_cache_affinity_key(
+    tenant_id: Uuid,
+    payload: &ResponsesRequest,
+    behavior_profile: &BehaviorProfile,
+) -> String {
+    exact_prefix_cache_affinity_key(
+        tenant_id,
+        &payload.model,
+        behavior_profile,
+        payload.extra.get("instructions"),
+        payload.extra.get("tools"),
+        &normalize_responses_input(payload.input.clone()),
+    )
+}
+
+fn chat_cache_affinity_key(
+    tenant_id: Uuid,
+    payload: &ChatCompletionsRequest,
+    behavior_profile: &BehaviorProfile,
+) -> String {
+    let input = payload
+        .messages
+        .iter()
+        .map(chat_message_to_responses_input)
+        .collect::<Vec<_>>();
+    exact_prefix_cache_affinity_key(
+        tenant_id,
+        &payload.model,
+        behavior_profile,
+        payload.extra.get("instructions"),
+        payload.extra.get("tools"),
+        &input,
+    )
+}
+
+fn exact_prefix_cache_affinity_key(
+    tenant_id: Uuid,
+    model: &str,
+    behavior_profile: &BehaviorProfile,
+    explicit_instructions: Option<&Value>,
+    tools: Option<&Value>,
+    input: &[Value],
+) -> String {
+    let system_messages = input
+        .iter()
+        .filter(|item| {
+            item.get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role.eq_ignore_ascii_case("system"))
+        })
+        .map(responses_input_message_text)
+        .collect::<Vec<_>>();
+    let seed = json!({
+        "tenant_id": tenant_id,
+        "model": model,
+        "behavior_fingerprint": behavior_profile.fingerprint(),
+        "instructions": {
+            "explicit": explicit_instructions.cloned(),
+            "system_messages": system_messages,
+        },
+        "tools": tools.cloned(),
+        "gateway_policy": "quality-first-v1",
+    });
+    format!("tenant:{tenant_id}/prefix:{}", stable_value_digest(&seed))
+}
+
+fn stable_value_digest(value: &Value) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(
+        serde_json::to_vec(&canonicalize_json(value)).unwrap_or_else(|_| b"stable-value".to_vec()),
+    );
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5]
+    )
+}
+
+fn canonicalize_json(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json).collect()),
+        Value::Object(map) => {
+            let mut object = serde_json::Map::new();
+            for (key, value) in map.iter().collect::<BTreeMap<_, _>>() {
+                object.insert(key.clone(), canonicalize_json(value));
+            }
+            Value::Object(object)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn success_response_summary(
+    output_summary: Option<String>,
+    response_output_items: &[Value],
+    fallback: &str,
+) -> String {
+    if let Some(output_summary) = output_summary
+        .map(|summary| summary.trim().to_string())
+        .filter(|summary| !summary.is_empty())
+    {
+        return truncate_text(output_summary, 240);
+    }
+    if response_output_items
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+    {
+        return "assistant tool response delivered".to_string();
+    }
+    fallback.to_string()
+}
+
 fn is_codex_chatgpt_backend(base_url: &str) -> bool {
     base_url.to_ascii_lowercase().contains("/backend-api/codex")
 }
@@ -2383,18 +2752,27 @@ fn responses_payload_for_upstream(
     replay_context: Option<&str>,
     codex_protocol: bool,
     codex_input_prefix: &[Value],
+    behavior_profile: &BehaviorProfile,
 ) -> Value {
     if codex_protocol {
-        return codex_responses_payload(payload, cache_key, replay_context, codex_input_prefix);
+        return codex_responses_payload(
+            payload,
+            cache_key,
+            replay_context,
+            codex_input_prefix,
+            behavior_profile,
+        );
     }
 
     let mut upstream_payload = payload.clone();
     if upstream_payload.prompt_cache_key.is_none() {
         upstream_payload.prompt_cache_key = Some(cache_key);
     }
-    if let Some(replay_context) = replay_context {
-        upstream_payload.input = attach_replay_context_to_responses_input(
-            upstream_payload.input.clone(),
+    let behavior_instruction = behavior_instruction_from_profile(behavior_profile);
+    if behavior_instruction.is_some() || replay_context.is_some() {
+        upstream_payload.input = prepend_context_messages(
+            normalize_responses_input(upstream_payload.input.clone()),
+            behavior_instruction.as_deref(),
             replay_context,
         );
     }
@@ -2412,6 +2790,7 @@ fn codex_responses_payload(
     cache_key: String,
     replay_context: Option<&str>,
     codex_input_prefix: &[Value],
+    behavior_profile: &BehaviorProfile,
 ) -> Value {
     let mut normalized_input = normalize_responses_input(payload.input.clone());
     if !codex_input_prefix.is_empty() {
@@ -2419,9 +2798,11 @@ fn codex_responses_payload(
         prefixed.extend(normalized_input);
         normalized_input = prefixed;
     }
-    let input = replay_context
-        .map(|context| attach_replay_context_to_responses_input(Value::Array(normalized_input.clone()), context))
-        .unwrap_or_else(|| Value::Array(normalized_input));
+    let input = prepend_context_messages(
+        normalized_input,
+        behavior_instruction_from_profile(behavior_profile).as_deref(),
+        replay_context,
+    );
     let (instructions, input) =
         codex_instructions_and_input(input, payload.extra.get("instructions"));
 
@@ -2439,8 +2820,7 @@ fn codex_responses_payload(
         object.insert("reasoning".to_string(), reasoning);
     }
     for (key, value) in &payload.extra {
-        if codex_passthrough_extra_key(key) && !object.contains_key(key)
-        {
+        if codex_passthrough_extra_key(key) && !object.contains_key(key) {
             object.insert(key.clone(), value.clone());
         }
     }
@@ -2546,6 +2926,7 @@ fn responses_payload_from_chat_request(
     cache_key: String,
     replay_context: Option<&str>,
     codex_protocol: bool,
+    behavior_profile: &BehaviorProfile,
 ) -> Value {
     let mut object = serde_json::Map::new();
     let mut input = payload
@@ -2553,9 +2934,14 @@ fn responses_payload_from_chat_request(
         .iter()
         .map(chat_message_to_responses_input)
         .collect::<Vec<_>>();
-    if let Some(replay_context) = replay_context {
-        input.insert(0, replay_context_message(replay_context));
-    }
+    input = prepend_context_messages(
+        input,
+        behavior_instruction_from_profile(behavior_profile).as_deref(),
+        replay_context,
+    )
+    .as_array()
+    .cloned()
+    .unwrap_or_default();
     object.insert("model".to_string(), Value::String(payload.model.clone()));
     if codex_protocol {
         let (instructions, input) =
@@ -2581,26 +2967,22 @@ fn responses_payload_from_chat_request(
         );
     }
     for (key, value) in &payload.extra {
-        if !object.contains_key(key)
-            && (!codex_protocol || codex_passthrough_extra_key(key))
-        {
+        if !object.contains_key(key) && (!codex_protocol || codex_passthrough_extra_key(key)) {
             object.insert(key.clone(), value.clone());
         }
     }
     Value::Object(object)
 }
 
-fn attach_replay_context_to_responses_input(input: Value, replay_context: &str) -> Value {
-    let mut normalized = normalize_responses_input(input);
-    normalized.insert(0, replay_context_message(replay_context));
-    Value::Array(normalized)
-}
-
 fn responses_input_function_call_output_call_ids(input: &Value) -> Vec<String> {
     normalize_responses_input(input.clone())
         .into_iter()
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
-        .filter_map(|item| item.get("call_id").and_then(Value::as_str).map(str::to_string))
+        .filter_map(|item| {
+            item.get("call_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .collect::<Vec<_>>()
 }
 
@@ -2645,7 +3027,10 @@ fn capture_stream_response_metadata(
     if let Some((index, item)) = response_output_item_from_stream_value(value) {
         output_items.insert(index, item);
     }
-    for (index, item) in response_output_items_from_value(value).into_iter().enumerate() {
+    for (index, item) in response_output_items_from_value(value)
+        .into_iter()
+        .enumerate()
+    {
         output_items.insert(index, item);
     }
     if response_status_is_completed(value) {
@@ -3328,24 +3713,99 @@ fn chat_completion_sse_event(value: Value) -> Event {
     Event::default().data(value.to_string())
 }
 
-fn forward_context(headers: &HeaderMap, principal_id: &str) -> ForwardContext {
+async fn resolve_request_scope(
+    state: &AppState,
+    auth: &GatewayAuthContext,
+    headers: &HeaderMap,
+    model: &str,
+) -> RequestRoutingScope {
+    let Some(window_id) = header_str(headers, "x-codex-window-id")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        let principal_id = derive_legacy_principal_id(headers, auth.tenant.slug.as_str());
+        return RequestRoutingScope {
+            placement_affinity_key: principal_id.clone(),
+            principal_id,
+            window_id: None,
+            parent_thread_id: None,
+        };
+    };
+
+    let parent_thread_id = header_str(headers, "x-codex-parent-thread-id")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let thread = state
+        .ensure_conversation_thread(
+            &auth.tenant,
+            &window_id,
+            parent_thread_id.as_deref(),
+            Some(model),
+            "codex_window",
+        )
+        .await;
+    RequestRoutingScope {
+        principal_id: thread.principal_id.clone(),
+        placement_affinity_key: format!(
+            "tenant:{}/thread-family:{}",
+            auth.tenant.id, thread.root_thread_id
+        ),
+        window_id: Some(thread.thread_id.clone()),
+        parent_thread_id: thread.parent_thread_id.clone(),
+    }
+}
+
+fn forward_context(
+    headers: &HeaderMap,
+    routing: &RequestRoutingScope,
+    session_epoch: u32,
+) -> ForwardContext {
     let conversation_id = header_str(headers, "x-client-request-id")
         .or_else(|| header_str(headers, "session_id"))
         .or_else(|| header_str(headers, "x-codex-cli-affinity-id"))
-        .unwrap_or(principal_id)
+        .or(routing.window_id.as_deref())
+        .unwrap_or(routing.principal_id.as_str())
         .to_string();
     let request_id = header_str(headers, "x-client-request-id")
         .unwrap_or(conversation_id.as_str())
         .to_string();
     ForwardContext {
-        conversation_id,
-        request_id,
+        conversation_id: session_scoped_id(&conversation_id, session_epoch),
+        request_id: session_scoped_id(&request_id, session_epoch),
         subagent: header_str(headers, "x-openai-subagent").map(str::to_string),
         originator: header_str(headers, "originator").map(str::to_string),
+        window_id: routing.window_id.clone(),
+        parent_thread_id: routing.parent_thread_id.clone(),
     }
 }
 
-fn derive_principal_id(headers: &HeaderMap, tenant_slug: &str) -> String {
+fn session_scoped_forward_context(context: &ForwardContext, session_epoch: u32) -> ForwardContext {
+    ForwardContext {
+        conversation_id: session_scoped_id(&context.conversation_id, session_epoch),
+        request_id: session_scoped_id(&context.request_id, session_epoch),
+        subagent: context.subagent.clone(),
+        originator: context.originator.clone(),
+        window_id: context.window_id.clone(),
+        parent_thread_id: context.parent_thread_id.clone(),
+    }
+}
+
+fn session_scoped_id(base: &str, session_epoch: u32) -> String {
+    let trimmed = base
+        .rsplit_once("::e")
+        .and_then(|(prefix, suffix)| {
+            suffix
+                .chars()
+                .all(|char| char.is_ascii_digit())
+                .then_some(prefix)
+        })
+        .unwrap_or(base);
+    format!("{trimmed}::e{}", session_epoch.max(1))
+}
+
+fn derive_legacy_principal_id(headers: &HeaderMap, tenant_slug: &str) -> String {
     let affinity = header_str(headers, "x-codex-cli-affinity-id")
         .or_else(|| header_str(headers, "session_id"))
         .or_else(|| header_str(headers, "x-openai-subagent"))
@@ -3438,6 +3898,81 @@ fn truncate_text(text: impl Into<String>, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        sync::Arc,
+    };
+
+    use http::Request;
+    use tokio::sync::{RwLock, mpsc};
+    use tower::util::ServiceExt;
+
+    use crate::{
+        config::Config, models::CacheMetrics, state::RuntimeState, upstream::UpstreamClient,
+    };
+
+    fn test_state() -> AppState {
+        let (writer_tx, _writer_rx) = mpsc::channel(8);
+        AppState {
+            config: Config {
+                bind_addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                data_port: 8080,
+                admin_port: 8081,
+                max_data_plane_body_bytes: 64 * 1024 * 1024,
+                postgres_url: "postgres://localhost/test".to_string(),
+                redis_url: "redis://127.0.0.1:6379".to_string(),
+                redis_channel: "cmgr:test".to_string(),
+                instance_id: "cmgr-test".to_string(),
+                browser_assist_url: "http://127.0.0.1:8090".to_string(),
+                heartbeat_seconds: 5,
+                enable_demo_seed: false,
+                direct_proxy_url: None,
+                warp_proxy_url: None,
+                browser_assist_direct_proxy_url: None,
+                browser_assist_warp_proxy_url: None,
+            },
+            runtime: Arc::new(RuntimeState {
+                cache_metrics: RwLock::new(CacheMetrics {
+                    cached_tokens: 0,
+                    replay_tokens: 0,
+                    prefix_hit_ratio: 0.0,
+                    warmup_roi: 0.0,
+                    static_prefix_tokens: 0,
+                }),
+                ..RuntimeState::default()
+            }),
+            upstream: UpstreamClient::default(),
+            writer_tx,
+            bus_tx: None,
+            persistence: None,
+            redis_connected: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_route_accepts_review_sized_bodies_without_413() {
+        let app = router(test_state());
+        let oversized_for_axum_default = "x".repeat(3 * 1024 * 1024);
+        let body = serde_json::to_vec(&json!({
+            "model": "gpt-5.4",
+            "input": oversized_for_axum_default
+        }))
+        .expect("serialize request");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 
     #[test]
     fn chat_request_maps_to_responses_payload() {
@@ -3458,8 +3993,13 @@ mod tests {
             extra: serde_json::Map::from_iter([("tool_choice".to_string(), json!("auto"))]),
         };
 
-        let mapped =
-            responses_payload_from_chat_request(&payload, "cache-123".to_string(), None, false);
+        let mapped = responses_payload_from_chat_request(
+            &payload,
+            "cache-123".to_string(),
+            None,
+            false,
+            &BehaviorProfile::default(),
+        );
         assert_eq!(mapped.get("model").and_then(Value::as_str), Some("gpt-5.4"));
         assert_eq!(mapped.get("stream").and_then(Value::as_bool), Some(true));
         assert_eq!(
@@ -3501,6 +4041,7 @@ mod tests {
             "cache-123".to_string(),
             Some("[cmgr replay context]\nrecent_turns=1"),
             false,
+            &BehaviorProfile::default(),
         );
         let input = mapped
             .get("input")
@@ -3529,8 +4070,13 @@ mod tests {
             extra: serde_json::Map::new(),
         };
 
-        let mapped =
-            responses_payload_from_chat_request(&payload, "cache-123".to_string(), None, true);
+        let mapped = responses_payload_from_chat_request(
+            &payload,
+            "cache-123".to_string(),
+            None,
+            true,
+            &BehaviorProfile::default(),
+        );
         assert_eq!(mapped.get("stream").and_then(Value::as_bool), Some(true));
         assert_eq!(mapped.get("store").and_then(Value::as_bool), Some(false));
         assert_eq!(
@@ -3554,8 +4100,14 @@ mod tests {
             extra: serde_json::Map::new(),
         };
 
-        let mapped =
-            responses_payload_for_upstream(&payload, "cache-123".to_string(), None, true, &[]);
+        let mapped = responses_payload_for_upstream(
+            &payload,
+            "cache-123".to_string(),
+            None,
+            true,
+            &[],
+            &BehaviorProfile::default(),
+        );
         assert_eq!(mapped.get("stream").and_then(Value::as_bool), Some(true));
         assert_eq!(mapped.get("store").and_then(Value::as_bool), Some(false));
         assert_eq!(
@@ -3582,8 +4134,14 @@ mod tests {
             ]),
         };
 
-        let mapped =
-            responses_payload_for_upstream(&payload, "cache-123".to_string(), None, true, &[]);
+        let mapped = responses_payload_for_upstream(
+            &payload,
+            "cache-123".to_string(),
+            None,
+            true,
+            &[],
+            &BehaviorProfile::default(),
+        );
         assert!(mapped.get("max_output_tokens").is_none());
         assert_eq!(
             mapped
@@ -3608,8 +4166,14 @@ mod tests {
             ]),
         };
 
-        let mapped =
-            responses_payload_for_upstream(&payload, "cache-123".to_string(), None, true, &[]);
+        let mapped = responses_payload_for_upstream(
+            &payload,
+            "cache-123".to_string(),
+            None,
+            true,
+            &[],
+            &BehaviorProfile::default(),
+        );
         assert!(mapped.get("previous_response_id").is_none());
         assert_eq!(
             mapped
@@ -3634,8 +4198,14 @@ mod tests {
             )]),
         };
 
-        let mapped =
-            responses_payload_for_upstream(&payload, "cache-123".to_string(), None, false, &[]);
+        let mapped = responses_payload_for_upstream(
+            &payload,
+            "cache-123".to_string(),
+            None,
+            false,
+            &[],
+            &BehaviorProfile::default(),
+        );
         assert_eq!(
             mapped.get("previous_response_id").and_then(Value::as_str),
             Some("resp_prev_123")
@@ -3668,6 +4238,7 @@ mod tests {
                 "name": "update_plan",
                 "arguments": "{\"plan\":[{\"step\":\"Inspect logs\",\"status\":\"completed\"}]}"
             })],
+            &BehaviorProfile::default(),
         );
         let input = mapped
             .get("input")
@@ -3675,7 +4246,10 @@ mod tests {
             .expect("input");
 
         assert_eq!(input.len(), 2);
-        assert_eq!(input[0].get("type").and_then(Value::as_str), Some("function_call"));
+        assert_eq!(
+            input[0].get("type").and_then(Value::as_str),
+            Some("function_call")
+        );
         assert_eq!(
             input[0].get("call_id").and_then(Value::as_str),
             Some("call_plan_123")
@@ -3731,42 +4305,44 @@ mod tests {
     }
 
     #[test]
-    fn websocket_text_response_events_include_active_item_sequence() {
-        let events = websocket_text_response_events("gpt-5.4", "OK");
-        let kinds = events
-            .iter()
-            .filter_map(|value| value.get("type").and_then(Value::as_str))
-            .collect::<Vec<_>>();
+    fn websocket_failure_response_event_emits_failed_status() {
+        let event = websocket_failure_response_event(GatewayFailureReason::Queue);
+        assert_eq!(
+            event.get("type").and_then(Value::as_str),
+            Some("response.failed")
+        );
+        assert_eq!(event["response"]["status"].as_str(), Some("failed"));
+        assert_eq!(event["response"]["error"]["reason"].as_str(), Some("queue"));
+    }
 
-        assert_eq!(
-            kinds,
-            vec![
-                "response.created",
-                "response.output_item.added",
-                "response.content_part.added",
-                "response.output_text.delta",
-                "response.output_text.done",
-                "response.content_part.done",
-                "response.output_item.done",
-                "response.completed",
-            ]
-        );
-        assert_eq!(
-            events[3].get("delta").and_then(Value::as_str),
-            Some("OK")
-        );
-        assert_eq!(
-            events[7]
-                .get("response")
-                .and_then(|response| response.get("output"))
-                .and_then(Value::as_array)
-                .and_then(|items| items.first())
-                .and_then(|item| item.get("content"))
-                .and_then(Value::as_array)
-                .and_then(|parts| parts.first())
-                .and_then(|part| part.get("text"))
-                .and_then(Value::as_str),
-            Some("OK")
+    #[test]
+    fn session_scoped_id_replaces_existing_epoch_suffix() {
+        assert_eq!(session_scoped_id("sess-123", 2), "sess-123::e2");
+        assert_eq!(session_scoped_id("sess-123::e1", 3), "sess-123::e3");
+    }
+
+    #[test]
+    fn cache_affinity_key_changes_on_language_preference() {
+        let payload = ResponsesRequest {
+            model: "gpt-5.4".to_string(),
+            input: json!("hello"),
+            stream: Some(false),
+            reasoning: None,
+            prompt_cache_key: None,
+            extra: serde_json::Map::new(),
+        };
+        let zh = BehaviorProfile {
+            output_language: Some("zh-CN".to_string()),
+            ..BehaviorProfile::default()
+        };
+        let en = BehaviorProfile {
+            output_language: Some("en-US".to_string()),
+            ..BehaviorProfile::default()
+        };
+
+        assert_ne!(
+            responses_cache_affinity_key(Uuid::nil(), &payload, &zh),
+            responses_cache_affinity_key(Uuid::nil(), &payload, &en)
         );
     }
 

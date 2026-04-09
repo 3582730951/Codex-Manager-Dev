@@ -6,6 +6,7 @@ pub struct Config {
     pub bind_addr: IpAddr,
     pub data_port: u16,
     pub admin_port: u16,
+    pub max_data_plane_body_bytes: usize,
     pub postgres_url: String,
     pub redis_url: String,
     pub redis_channel: String,
@@ -34,6 +35,10 @@ impl Config {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(8081),
+            max_data_plane_body_bytes: std::env::var("CMGR_SERVER_MAX_DATA_BODY_BYTES")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(64 * 1024 * 1024),
             postgres_url: std::env::var("CMGR_POSTGRES_URL").unwrap_or_else(|_| {
                 "postgres://codex_manager:codex_manager@localhost:5432/codex_manager".to_string()
             }),

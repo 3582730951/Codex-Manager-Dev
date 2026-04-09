@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
+fn default_session_epoch() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RouteMode {
@@ -155,16 +159,126 @@ pub struct CliLease {
     pub last_used_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionMode {
+    #[default]
+    Balanced,
+    ToolFirst,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPolicy {
+    #[default]
+    Auto,
+    PreferTools,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerbosityPolicy {
+    Brief,
+    #[default]
+    Normal,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOutcome {
+    Pending,
+    #[default]
+    Success,
+    Failed,
+    Queue,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BehaviorHints {
+    pub output_language: Option<String>,
+    pub execution_mode: Option<ExecutionMode>,
+    pub tool_policy: Option<ToolPolicy>,
+    pub verbosity_policy: Option<VerbosityPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BehaviorProfile {
+    pub output_language: Option<String>,
+    #[serde(default)]
+    pub execution_mode: ExecutionMode,
+    #[serde(default)]
+    pub tool_policy: ToolPolicy,
+    #[serde(default)]
+    pub verbosity_policy: VerbosityPolicy,
+    #[serde(default = "default_session_epoch")]
+    pub session_epoch: u32,
+}
+
+impl Default for BehaviorProfile {
+    fn default() -> Self {
+        Self {
+            output_language: None,
+            execution_mode: ExecutionMode::Balanced,
+            tool_policy: ToolPolicy::Auto,
+            verbosity_policy: VerbosityPolicy::Normal,
+            session_epoch: default_session_epoch(),
+        }
+    }
+}
+
+impl BehaviorProfile {
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+
+        let digest = Sha256::digest(
+            serde_json::to_vec(&serde_json::json!({
+                "outputLanguage": self.output_language,
+                "executionMode": self.execution_mode,
+                "toolPolicy": self.tool_policy,
+                "verbosityPolicy": self.verbosity_policy,
+            }))
+            .unwrap_or_else(|_| b"behavior-profile".to_vec()),
+        );
+        format!(
+            "bhv-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            digest[0], digest[1], digest[2], digest[3], digest[4], digest[5]
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingContextTurn {
+    pub generation: u32,
+    pub request_summary: String,
+    #[serde(default = "default_session_epoch")]
+    pub session_epoch: u32,
+    #[serde(default)]
+    pub behavior_fingerprint: String,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextTurn {
     pub generation: u32,
     pub request_summary: String,
     pub response_summary: Option<String>,
+    #[serde(default = "default_session_epoch")]
+    pub session_epoch: u32,
+    #[serde(default)]
+    pub behavior_fingerprint: String,
+    #[serde(default)]
+    pub turn_outcome: TurnOutcome,
     #[serde(default)]
     pub response_id: Option<String>,
     #[serde(default)]
     pub response_output_items: Vec<Value>,
+    #[serde(default)]
+    pub tool_replay_safe: bool,
     pub created_at: DateTime<Utc>,
 }
 
@@ -174,8 +288,103 @@ pub struct ConversationContext {
     pub principal_id: String,
     pub model: String,
     pub workflow_spine: String,
+    #[serde(default)]
+    pub behavior_profile: BehaviorProfile,
+    #[serde(default)]
+    pub pending_turn: Option<PendingContextTurn>,
     pub turns: Vec<ContextTurn>,
     pub updated_at: Option<DateTime<Utc>>,
+}
+
+fn default_thread_source() -> String {
+    "gateway".to_string()
+}
+
+fn default_thread_status() -> String {
+    "active".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationThread {
+    pub thread_id: String,
+    pub tenant_id: Uuid,
+    pub principal_id: String,
+    pub root_thread_id: String,
+    #[serde(default)]
+    pub parent_thread_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_thread_source")]
+    pub source: String,
+    #[serde(default = "default_thread_status")]
+    pub status: String,
+    #[serde(default)]
+    pub compaction_summary: Option<String>,
+    #[serde(default)]
+    pub last_compaction_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadEdge {
+    pub parent_thread_id: String,
+    pub child_thread_id: String,
+    pub relation: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationThreadView {
+    pub thread: ConversationThread,
+    #[serde(default)]
+    pub context: Option<ConversationContext>,
+    #[serde(default)]
+    pub children: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartConversationThreadRequest {
+    pub tenant_id: Uuid,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub behavior_hints: BehaviorHints,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkConversationThreadRequest {
+    pub tenant_id: Uuid,
+    pub parent_thread_id: String,
+    #[serde(default)]
+    pub child_thread_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactConversationThreadRequest {
+    pub thread_id: String,
+    #[serde(default)]
+    pub preserve_turns: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -562,6 +771,8 @@ pub struct LeaseSelectionRequest {
     pub model: String,
     pub reasoning_effort: Option<String>,
     pub subagent_count: u32,
+    pub cache_affinity_key: String,
+    pub placement_affinity_key: String,
 }
 
 #[cfg(test)]

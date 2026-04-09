@@ -11,20 +11,22 @@ pub struct ReplayPack {
 }
 
 pub fn compile_replay_pack(
-    principal_id: &str,
+    cache_affinity_key: &str,
     model: &str,
     generation: u32,
     input: &Value,
 ) -> ReplayPack {
-    let input_tokens = estimate_tokens(input);
-    let static_prefix_tokens = 3072;
-    let workflow_tokens = 768;
-    let live_tail_tokens = input_tokens.max(96);
-    let digest = Sha256::digest(format!("{principal_id}:{model}:{generation}").as_bytes());
+    let input_tokens = estimate_tokens(input).max(96);
+    let static_prefix_tokens =
+        (1024 + ((cache_affinity_key.len() + model.len()) as u64 / 4)).min(4096);
+    let workflow_tokens = (128 + generation.saturating_sub(1) as u64 * 32).min(1024);
+    let live_tail_tokens = input_tokens.min(8192);
+    let digest =
+        Sha256::digest(format!("{cache_affinity_key}:{model}:quality-first-v2").as_bytes());
     ReplayPack {
         cache_key: format!(
-            "replay-{:02x}{:02x}{:02x}{:02x}-g{}",
-            digest[0], digest[1], digest[2], digest[3], generation
+            "prefix-{:02x}{:02x}{:02x}{:02x}",
+            digest[0], digest[1], digest[2], digest[3]
         ),
         static_prefix_tokens,
         workflow_tokens,
@@ -47,9 +49,17 @@ mod tests {
     #[test]
     fn cache_key_is_stable_for_same_inputs() {
         let input = serde_json::json!({"role":"user","content":"hello"});
-        let a = compile_replay_pack("principal-1", "gpt-5.4", 3, &input);
-        let b = compile_replay_pack("principal-1", "gpt-5.4", 3, &input);
+        let a = compile_replay_pack("tenant:test/prefix:abc", "gpt-5.4", 3, &input);
+        let b = compile_replay_pack("tenant:test/prefix:abc", "gpt-5.4", 3, &input);
         assert_eq!(a.cache_key, b.cache_key);
         assert_eq!(a.total_tokens, b.total_tokens);
+    }
+
+    #[test]
+    fn cache_key_is_shared_for_same_prefix_scope_across_principals() {
+        let input = serde_json::json!({"role":"user","content":"hello"});
+        let a = compile_replay_pack("tenant:test/prefix:shared", "gpt-5.4", 2, &input);
+        let b = compile_replay_pack("tenant:test/prefix:shared", "gpt-5.4", 9, &input);
+        assert_eq!(a.cache_key, b.cache_key);
     }
 }

@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: codex_manager_test
+      POSTGRES_USER: codex_manager
+      POSTGRES_PASSWORD: codex_manager
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codex_manager -d codex_manager_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  server-test:
+    build:
+      context: .
+      dockerfile: infra/docker/server.test.Dockerfile
+    environment:
+      CMGR_SERVER_BIND_ADDR: 0.0.0.0
+      CMGR_SERVER_DATA_PORT: 8080
+      CMGR_SERVER_ADMIN_PORT: 8081
+      CMGR_SERVER_MAX_DATA_BODY_BYTES: 67108864
+      CMGR_POSTGRES_URL: postgres://codex_manager:codex_manager@postgres:5432/codex_manager_test
+      CMGR_REDIS_URL: redis://redis:6379
+      CMGR_REDIS_CHANNEL: cmgr:test-control-events
+      CMGR_BROWSER_ASSIST_URL: http://browser-assist:8090
+      CMGR_GATEWAY_HEARTBEAT_SECONDS: 5
+      CMGR_ENABLE_DEMO_SEED: "false"
+      RUST_LOG: warn
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["cargo", "test", "-p", "codex-manager-server", "--", "--nocapture"]
