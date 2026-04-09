@@ -10,6 +10,9 @@ use crate::{
     models::{RouteMode, UpstreamCredential},
 };
 
+const UNARY_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const MODEL_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone)]
 pub struct ForwardContext {
     pub conversation_id: String,
@@ -113,6 +116,10 @@ impl UpstreamClient {
             .header("x-client-request-id", &context.request_id)
             .json(payload);
 
+        if let Some(timeout) = request_timeout_for_stream(stream) {
+            request = request.timeout(timeout);
+        }
+
         if stream {
             request = request.header(ACCEPT, "text/event-stream");
         }
@@ -164,7 +171,8 @@ impl UpstreamClient {
         let mut request = self
             .client_for_route_mode(route_mode)
             .get(url)
-            .bearer_auth(&credential.bearer_token);
+            .bearer_auth(&credential.bearer_token)
+            .timeout(MODEL_CATALOG_TIMEOUT);
 
         if let Some(account_id) = credential.chatgpt_account_id.as_deref() {
             request = request.header("ChatGPT-Account-ID", account_id);
@@ -227,13 +235,16 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, reqwest::Error> {
         .connect_timeout(Duration::from_secs(5))
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(8)
-        .timeout(Duration::from_secs(300))
         .tcp_nodelay(true)
         .user_agent("codex-manager/0.1");
     if let Some(proxy_url) = proxy_url {
         builder = builder.proxy(Proxy::all(proxy_url)?);
     }
     builder.build()
+}
+
+fn request_timeout_for_stream(stream: bool) -> Option<Duration> {
+    (!stream).then_some(UNARY_REQUEST_TIMEOUT)
 }
 
 pub fn endpoint_url(base_url: &str, path: &str) -> String {
@@ -495,6 +506,15 @@ mod tests {
         assert_eq!(
             endpoint_url("https://api.openai.com/v1/responses", "responses"),
             "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn streaming_requests_do_not_use_total_timeout() {
+        assert_eq!(request_timeout_for_stream(true), None);
+        assert_eq!(
+            request_timeout_for_stream(false),
+            Some(UNARY_REQUEST_TIMEOUT)
         );
     }
 
