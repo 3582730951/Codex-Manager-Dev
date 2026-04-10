@@ -229,35 +229,13 @@ impl Default for BehaviorProfile {
     }
 }
 
-impl BehaviorProfile {
-    pub fn fingerprint(&self) -> String {
-        use sha2::{Digest, Sha256};
-
-        let digest = Sha256::digest(
-            serde_json::to_vec(&serde_json::json!({
-                "outputLanguage": self.output_language,
-                "executionMode": self.execution_mode,
-                "toolPolicy": self.tool_policy,
-                "verbosityPolicy": self.verbosity_policy,
-            }))
-            .unwrap_or_else(|_| b"behavior-profile".to_vec()),
-        );
-        format!(
-            "bhv-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            digest[0], digest[1], digest[2], digest[3], digest[4], digest[5]
-        )
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingContextTurn {
     pub generation: u32,
     pub request_summary: String,
-    #[serde(default = "default_session_epoch")]
-    pub session_epoch: u32,
     #[serde(default)]
-    pub behavior_fingerprint: String,
+    pub request_input_items: Vec<Value>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -267,10 +245,8 @@ pub struct ContextTurn {
     pub generation: u32,
     pub request_summary: String,
     pub response_summary: Option<String>,
-    #[serde(default = "default_session_epoch")]
-    pub session_epoch: u32,
     #[serde(default)]
-    pub behavior_fingerprint: String,
+    pub request_input_items: Vec<Value>,
     #[serde(default)]
     pub turn_outcome: TurnOutcome,
     #[serde(default)]
@@ -279,6 +255,8 @@ pub struct ContextTurn {
     pub response_output_items: Vec<Value>,
     #[serde(default)]
     pub tool_replay_safe: bool,
+    #[serde(default)]
+    pub synthetic_kind: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 

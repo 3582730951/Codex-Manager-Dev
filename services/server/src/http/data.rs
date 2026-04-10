@@ -22,11 +22,11 @@ use uuid::Uuid;
 
 use crate::{
     models::{
-        BehaviorHints, BehaviorProfile, ChatCompletionsRequest, ChatMessage, CliLease,
-        ExecutionMode, GatewayApiKey, LeaseSelectionRequest, RequestLogEntry, RequestLogUsage,
-        ResponsesRequest, RouteEventRequest, ToolPolicy, VerbosityPolicy,
+        ChatCompletionsRequest, ChatMessage, CliLease, GatewayApiKey, LeaseSelectionRequest,
+        RequestLogEntry, RequestLogUsage, ResponsesRequest, RouteEventRequest,
     },
-    state::{AppState, GatewayAuthContext},
+    openai_auth::DEFAULT_ORIGINATOR,
+    state::{AppState, GatewayAuthContext, ReplayPlan},
     upstream::{ForwardContext, UpstreamFailureKind, classify_failure_body},
 };
 
@@ -69,8 +69,33 @@ struct RequestLogSeed {
 struct RequestRoutingScope {
     principal_id: String,
     placement_affinity_key: String,
+    session_key: String,
     window_id: Option<String>,
     parent_thread_id: Option<String>,
+    thread_family_id: Option<String>,
+    continuity_mode: ContinuityMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContinuityMode {
+    CodexWindow,
+    SessionAffinity,
+    EphemeralRequest,
+}
+
+impl ContinuityMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexWindow => "codex_window",
+            Self::SessionAffinity => "session_affinity",
+            Self::EphemeralRequest => "ephemeral_request",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ContinuityError {
+    message: String,
 }
 
 enum ForwardOutcome {
@@ -126,6 +151,18 @@ async fn models(State(state): State<AppState>, headers: HeaderMap) -> impl IntoR
     }
 }
 
+fn invalid_request(message: &str) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error"
+            }
+        })),
+    )
+}
+
 async fn responses(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -137,6 +174,7 @@ async fn responses(
     let subagent_count = headers.get("x-openai-subagent").map(|_| 1_u32).unwrap_or(0);
     let requested_model = payload.model.clone();
     let effective_model = resolve_effective_model(&auth.api_key, &requested_model);
+    log_model_resolution(&auth.api_key, &requested_model, &effective_model);
     let effective_reasoning_effort =
         resolve_effective_reasoning_for_responses(&auth.api_key, &payload);
     let payload = apply_responses_policy(
@@ -145,17 +183,13 @@ async fn responses(
         effective_reasoning_effort.as_deref(),
     );
     let model = payload.model.clone();
-    let routing = resolve_request_scope(&state, &auth, &headers, &model).await;
+    let routing = match resolve_request_scope(&state, &auth, &headers, &model).await {
+        Ok(routing) => routing,
+        Err(error) => return invalid_request(&error.message).into_response(),
+    };
     let principal_id = routing.principal_id.clone();
-    let behavior_profile = state
-        .reconcile_behavior_profile(
-            &principal_id,
-            &model,
-            behavior_hints_from_responses_request(&payload),
-        )
-        .await;
     let cache_affinity_key =
-        responses_cache_affinity_key(auth.tenant.id, &payload, &behavior_profile);
+        responses_cache_affinity_key(auth.tenant.id, cache_continuity_anchor(&routing), &payload);
     let input_summary = summarize_value(&payload.input);
     let request_log = RequestLogSeed {
         api_key: auth.api_key.clone(),
@@ -179,10 +213,11 @@ async fn responses(
     let mut selection = state.resolve_lease(selection_request.clone()).await;
     let stream_requested = payload.stream.unwrap_or(false);
     let mut recorded_input = false;
-    let context = forward_context(&headers, &routing, behavior_profile.session_epoch);
+    let context = forward_context(&headers, &routing);
 
     for attempt in 0..2 {
-        let Some((lease, replay, _warmup)) = selection.take() else {
+        let Some((lease, prompt_cache_key, _warmup)) = selection.take() else {
+            log_queue_unavailable(&request_log, &routing, &context, subagent_count);
             return gateway_failure_response(
                 stream_requested,
                 state.config.heartbeat_seconds,
@@ -196,13 +231,11 @@ async fn responses(
                     &model,
                     lease.generation,
                     input_summary.clone(),
+                    normalize_responses_input(payload.input.clone()),
                 )
                 .await;
             recorded_input = true;
         }
-        let replay_context = state
-            .replay_context_for(&principal_id, lease.generation)
-            .await;
         let Some(credential) = state.credential_for_account(&lease.account_id).await else {
             let _ = state
                 .failover_account(&lease.account_id, "credential-missing", 300, true)
@@ -223,13 +256,23 @@ async fn responses(
                 GatewayFailureReason::Queue,
             );
         };
-
         let codex_protocol = is_codex_chatgpt_backend(&credential.base_url);
         let previous_response_id = payload
             .extra
             .get("previous_response_id")
             .and_then(Value::as_str);
-        let replayed_tool_calls = if codex_protocol {
+        let replay_plan = state
+            .replay_plan_for_request(&principal_id, lease.generation, previous_response_id)
+            .await;
+        log_request_attempt(
+            &request_log,
+            &routing,
+            &context,
+            &lease,
+            replay_plan.fallback_text.as_deref(),
+            attempt,
+        );
+        let replayed_tool_calls = if codex_protocol && replay_plan.input_items.is_empty() {
             state
                 .replay_tool_call_items_for(
                     &principal_id,
@@ -242,11 +285,10 @@ async fn responses(
         };
         let upstream_value = responses_payload_for_upstream(
             &payload,
-            replay.cache_key.clone(),
-            replay_context.as_deref(),
+            prompt_cache_key,
+            &replay_plan,
             codex_protocol,
             &replayed_tool_calls,
-            &behavior_profile,
         );
         let upstream_stream = codex_protocol || stream_requested;
 
@@ -512,6 +554,7 @@ async fn forward_responses_ws(
 
     let requested_model = payload.model.clone();
     let effective_model = resolve_effective_model(&auth.api_key, &requested_model);
+    log_model_resolution(&auth.api_key, &requested_model, &effective_model);
     let effective_reasoning_effort =
         resolve_effective_reasoning_for_responses(&auth.api_key, &payload);
     let mut payload = apply_responses_policy(
@@ -523,21 +566,17 @@ async fn forward_responses_ws(
     payload.extra.remove("background");
 
     let model = payload.model.clone();
-    let routing = resolve_request_scope(state, auth, headers, &model).await;
+    let routing = match resolve_request_scope(state, auth, headers, &model).await {
+        Ok(routing) => routing,
+        Err(error) => {
+            send_ws_failure_response(socket, None, "invalid_request_error", &error.message).await?;
+            return Ok(());
+        }
+    };
     let principal_id = routing.principal_id.clone();
-    let behavior_profile = state
-        .reconcile_behavior_profile(
-            &principal_id,
-            &model,
-            behavior_hints_from_responses_request(&payload),
-        )
-        .await;
     let cache_affinity_key =
-        responses_cache_affinity_key(auth.tenant.id, &payload, &behavior_profile);
-    let scoped_context = session_scoped_forward_context(
-        &forward_context(headers, &routing, 1),
-        behavior_profile.session_epoch,
-    );
+        responses_cache_affinity_key(auth.tenant.id, cache_continuity_anchor(&routing), &payload);
+    let scoped_context = forward_context(headers, &routing);
     let input_summary = summarize_value(&payload.input);
     let request_log = RequestLogSeed {
         api_key: auth.api_key.clone(),
@@ -562,7 +601,8 @@ async fn forward_responses_ws(
     let mut recorded_input = false;
 
     for attempt in 0..2 {
-        let Some((lease, replay, _warmup)) = selection.take() else {
+        let Some((lease, prompt_cache_key, _warmup)) = selection.take() else {
+            log_queue_unavailable(&request_log, &routing, &scoped_context, subagent_count);
             send_ws_gateway_failure_response(socket, GatewayFailureReason::Queue).await?;
             return Ok(());
         };
@@ -573,13 +613,11 @@ async fn forward_responses_ws(
                     &model,
                     lease.generation,
                     input_summary.clone(),
+                    normalize_responses_input(payload.input.clone()),
                 )
                 .await;
             recorded_input = true;
         }
-        let replay_context = state
-            .replay_context_for(&principal_id, lease.generation)
-            .await;
         let Some(credential) = state.credential_for_account(&lease.account_id).await else {
             let _ = state
                 .failover_account(&lease.account_id, "credential-missing", 300, true)
@@ -597,13 +635,23 @@ async fn forward_responses_ws(
             send_ws_gateway_failure_response(socket, GatewayFailureReason::Queue).await?;
             return Ok(());
         };
-
         let codex_protocol = is_codex_chatgpt_backend(&credential.base_url);
         let previous_response_id = payload
             .extra
             .get("previous_response_id")
             .and_then(Value::as_str);
-        let replayed_tool_calls = if codex_protocol {
+        let replay_plan = state
+            .replay_plan_for_request(&principal_id, lease.generation, previous_response_id)
+            .await;
+        log_request_attempt(
+            &request_log,
+            &routing,
+            &scoped_context,
+            &lease,
+            replay_plan.fallback_text.as_deref(),
+            attempt,
+        );
+        let replayed_tool_calls = if codex_protocol && replay_plan.input_items.is_empty() {
             state
                 .replay_tool_call_items_for(
                     &principal_id,
@@ -616,11 +664,10 @@ async fn forward_responses_ws(
         };
         let upstream_value = responses_payload_for_upstream(
             &payload,
-            replay.cache_key.clone(),
-            replay_context.as_deref(),
+            prompt_cache_key,
+            &replay_plan,
             codex_protocol,
             &replayed_tool_calls,
-            &behavior_profile,
         );
 
         match state
@@ -704,6 +751,7 @@ async fn chat_completions(
     let subagent_count = headers.get("x-openai-subagent").map(|_| 1_u32).unwrap_or(0);
     let requested_model = payload.model.clone();
     let effective_model = resolve_effective_model(&auth.api_key, &requested_model);
+    log_model_resolution(&auth.api_key, &requested_model, &effective_model);
     let effective_reasoning_effort = resolve_effective_reasoning_for_chat(&auth.api_key, &payload);
     let payload = apply_chat_policy(
         &payload,
@@ -711,16 +759,13 @@ async fn chat_completions(
         effective_reasoning_effort.as_deref(),
     );
     let model = payload.model.clone();
-    let routing = resolve_request_scope(&state, &auth, &headers, &model).await;
+    let routing = match resolve_request_scope(&state, &auth, &headers, &model).await {
+        Ok(routing) => routing,
+        Err(error) => return invalid_request(&error.message).into_response(),
+    };
     let principal_id = routing.principal_id.clone();
-    let behavior_profile = state
-        .reconcile_behavior_profile(
-            &principal_id,
-            &model,
-            behavior_hints_from_chat_request(&payload),
-        )
-        .await;
-    let cache_affinity_key = chat_cache_affinity_key(auth.tenant.id, &payload, &behavior_profile);
+    let cache_affinity_key =
+        chat_cache_affinity_key(auth.tenant.id, cache_continuity_anchor(&routing), &payload);
     let message_summary = summarize_messages(&payload.messages);
     let request_log = RequestLogSeed {
         api_key: auth.api_key.clone(),
@@ -742,12 +787,13 @@ async fn chat_completions(
         placement_affinity_key: routing.placement_affinity_key.clone(),
     };
     let mut selection = state.resolve_lease(selection_request.clone()).await;
-    let context = forward_context(&headers, &routing, behavior_profile.session_epoch);
+    let context = forward_context(&headers, &routing);
     let stream_requested = payload.stream.unwrap_or(false);
     let mut recorded_input = false;
 
     for attempt in 0..2 {
-        let Some((lease, replay, _warmup)) = selection.take() else {
+        let Some((lease, prompt_cache_key, _warmup)) = selection.take() else {
+            log_queue_unavailable(&request_log, &routing, &context, subagent_count);
             return gateway_chat_failure_response(
                 stream_requested,
                 state.config.heartbeat_seconds,
@@ -762,14 +808,15 @@ async fn chat_completions(
                     &model,
                     lease.generation,
                     message_summary.clone(),
+                    payload
+                        .messages
+                        .iter()
+                        .map(chat_message_to_responses_input)
+                        .collect::<Vec<_>>(),
                 )
                 .await;
             recorded_input = true;
         }
-        let replay_context = state
-            .replay_context_for(&principal_id, lease.generation)
-            .await;
-
         let Some(credential) = state.credential_for_account(&lease.account_id).await else {
             let _ = state
                 .failover_account(&lease.account_id, "credential-missing", 300, true)
@@ -791,14 +838,23 @@ async fn chat_completions(
                 GatewayFailureReason::Queue,
             );
         };
-
         let codex_protocol = is_codex_chatgpt_backend(&credential.base_url);
+        let replay_plan = state
+            .replay_plan_for_request(&principal_id, lease.generation, None)
+            .await;
+        log_request_attempt(
+            &request_log,
+            &routing,
+            &context,
+            &lease,
+            replay_plan.fallback_text.as_deref(),
+            attempt,
+        );
         let upstream_value = responses_payload_from_chat_request(
             &payload,
-            replay.cache_key.clone(),
-            replay_context.as_deref(),
+            prompt_cache_key,
+            &replay_plan,
             codex_protocol,
-            &behavior_profile,
         );
         let upstream_stream = codex_protocol || stream_requested;
 
@@ -957,15 +1013,54 @@ async fn authenticated_context(
 }
 
 fn resolve_effective_model(api_key: &GatewayApiKey, requested_model: &str) -> String {
+    let requested_model = requested_model.trim();
+    let default_model = api_key
+        .default_model
+        .clone()
+        .filter(|value| !value.trim().is_empty());
     if api_key.force_model_override {
-        api_key
-            .default_model
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| requested_model.to_string())
-    } else {
-        requested_model.to_string()
+        return default_model.unwrap_or_else(|| requested_model.to_string());
     }
+
+    codex_worker_model_fallback(requested_model, default_model.as_deref())
+        .unwrap_or_else(|| requested_model.to_string())
+}
+
+fn codex_worker_model_fallback(
+    requested_model: &str,
+    default_model: Option<&str>,
+) -> Option<String> {
+    let normalized = requested_model.trim().to_ascii_lowercase();
+    if normalized == "gpt-5.1-codex-mini"
+        || normalized.starts_with("gpt-5.1-codex-mini-")
+        || normalized.contains("-codex-mini-")
+    {
+        return default_model
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| Some("gpt-5.3-codex".to_string()));
+    }
+    None
+}
+
+fn log_model_resolution(api_key: &GatewayApiKey, requested_model: &str, effective_model: &str) {
+    if requested_model == effective_model {
+        return;
+    }
+    let resolution_reason = if api_key.force_model_override {
+        "forced_api_key_override"
+    } else {
+        "codex_worker_model_fallback"
+    };
+    tracing::info!(
+        requested_model = requested_model,
+        effective_model = effective_model,
+        resolution_reason,
+        default_model = ?api_key.default_model,
+        force_model_override = api_key.force_model_override,
+        "resolved gateway effective model"
+    );
 }
 
 fn resolve_effective_reasoning_for_chat(
@@ -2442,178 +2537,13 @@ fn copy_upstream_headers_to_response(out: &mut HeaderMap, headers: &reqwest::hea
     }
 }
 
-fn behavior_hints_from_responses_request(payload: &ResponsesRequest) -> BehaviorHints {
-    detect_behavior_hints(&collect_responses_behavior_text(payload))
-}
-
-fn behavior_hints_from_chat_request(payload: &ChatCompletionsRequest) -> BehaviorHints {
-    detect_behavior_hints(&collect_chat_behavior_text(payload))
-}
-
-fn collect_responses_behavior_text(payload: &ResponsesRequest) -> String {
-    let mut segments = normalize_responses_input(payload.input.clone())
-        .into_iter()
-        .map(|item| responses_input_message_text(&item))
-        .filter(|text| !text.trim().is_empty())
-        .collect::<Vec<_>>();
-    if let Some(instructions) = payload
-        .extra
-        .get("instructions")
-        .and_then(instruction_text_from_value)
-    {
-        segments.push(instructions);
-    }
-    segments.join("\n")
-}
-
-fn collect_chat_behavior_text(payload: &ChatCompletionsRequest) -> String {
-    let mut segments = payload
-        .messages
-        .iter()
-        .map(|message| responses_input_message_text(&chat_message_to_responses_input(message)))
-        .filter(|text| !text.trim().is_empty())
-        .collect::<Vec<_>>();
-    if let Some(instructions) = payload
-        .extra
-        .get("instructions")
-        .and_then(instruction_text_from_value)
-    {
-        segments.push(instructions);
-    }
-    segments.join("\n")
-}
-
-fn detect_behavior_hints(text: &str) -> BehaviorHints {
-    BehaviorHints {
-        output_language: detect_explicit_output_language(text),
-        execution_mode: detect_execution_mode(text),
-        tool_policy: detect_tool_policy(text),
-        verbosity_policy: detect_verbosity_policy(text),
-    }
-}
-
-fn detect_explicit_output_language(text: &str) -> Option<String> {
-    let lowered = text.to_ascii_lowercase();
-    let zh_patterns = [
-        "以后用中文",
-        "以后都用中文",
-        "请用中文",
-        "只用中文",
-        "中文回答",
-        "用中文回答",
-        "请回复中文",
-        "respond in chinese",
-        "answer in chinese",
-        "use chinese",
-        "speak chinese",
-        "reply in chinese",
-    ];
-    if zh_patterns
-        .iter()
-        .any(|pattern| text.contains(pattern) || lowered.contains(pattern))
-    {
-        return Some("zh-CN".to_string());
-    }
-
-    let en_patterns = [
-        "以后用英文",
-        "以后都用英文",
-        "请用英文",
-        "只用英文",
-        "英文回答",
-        "用英文回答",
-        "respond in english",
-        "answer in english",
-        "use english",
-        "speak english",
-        "reply in english",
-    ];
-    en_patterns
-        .iter()
-        .any(|pattern| text.contains(pattern) || lowered.contains(pattern))
-        .then(|| "en-US".to_string())
-}
-
-fn detect_execution_mode(text: &str) -> Option<ExecutionMode> {
-    let lowered = text.to_ascii_lowercase();
-    [
-        "直接执行",
-        "先执行",
-        "先做再说",
-        "先执行再说",
-        "先调用工具",
-        "不要先解释",
-        "少解释",
-        "execute first",
-        "run it first",
-        "do it first",
-        "tool first",
-        "don't explain first",
-    ]
-    .iter()
-    .any(|pattern| text.contains(pattern) || lowered.contains(pattern))
-    .then_some(ExecutionMode::ToolFirst)
-}
-
-fn detect_tool_policy(text: &str) -> Option<ToolPolicy> {
-    detect_execution_mode(text).map(|_| ToolPolicy::PreferTools)
-}
-
-fn detect_verbosity_policy(text: &str) -> Option<VerbosityPolicy> {
-    let lowered = text.to_ascii_lowercase();
-    [
-        "简短回答",
-        "简洁一点",
-        "简洁回答",
-        "简单回答",
-        "be brief",
-        "be concise",
-        "keep it short",
-        "concise",
-    ]
-    .iter()
-    .any(|pattern| text.contains(pattern) || lowered.contains(pattern))
-    .then_some(VerbosityPolicy::Brief)
-}
-
-fn behavior_instruction_from_profile(profile: &BehaviorProfile) -> Option<String> {
-    let mut rules = Vec::new();
-    if let Some(language) = profile.output_language.as_deref() {
-        rules.push(match language {
-            "zh-CN" => {
-                "Always answer in Simplified Chinese unless the user explicitly asks to switch languages."
-            }
-            "en-US" => {
-                "Always answer in English unless the user explicitly asks to switch languages."
-            }
-            _ => "Respect the user's explicitly requested output language.",
-        });
-    }
-    if profile.execution_mode == ExecutionMode::ToolFirst {
-        rules.push(
-            "When the user requests an actionable task and tools are available, execute the relevant tools before giving narrative explanation.",
-        );
-    }
-    if profile.tool_policy == ToolPolicy::PreferTools {
-        rules.push("Prefer tool execution over speculative narrative replies when a tool can verify or complete the task.");
-    }
-    if profile.verbosity_policy == VerbosityPolicy::Brief {
-        rules.push("Keep the final written answer brief.");
-    }
-    (!rules.is_empty()).then(|| rules.join("\n"))
-}
-
 fn prepend_context_messages(
     input: Vec<Value>,
-    behavior_instruction: Option<&str>,
+    replay_prefix_items: &[Value],
     replay_context: Option<&str>,
 ) -> Value {
     let mut prefixed = Vec::new();
-    if let Some(instruction) = behavior_instruction
-        && !instruction.trim().is_empty()
-    {
-        prefixed.push(system_text_message(instruction));
-    }
+    prefixed.extend(replay_prefix_items.iter().cloned());
     if let Some(replay_context) = replay_context
         && !replay_context.trim().is_empty()
     {
@@ -2623,22 +2553,15 @@ fn prepend_context_messages(
     Value::Array(prefixed)
 }
 
-fn system_text_message(text: &str) -> Value {
-    json!({
-        "role": "system",
-        "content": [{"type": "input_text", "text": text}]
-    })
-}
-
 fn responses_cache_affinity_key(
     tenant_id: Uuid,
+    continuity_anchor: Option<&str>,
     payload: &ResponsesRequest,
-    behavior_profile: &BehaviorProfile,
 ) -> String {
     exact_prefix_cache_affinity_key(
         tenant_id,
+        continuity_anchor,
         &payload.model,
-        behavior_profile,
         payload.extra.get("instructions"),
         payload.extra.get("tools"),
         &normalize_responses_input(payload.input.clone()),
@@ -2647,8 +2570,8 @@ fn responses_cache_affinity_key(
 
 fn chat_cache_affinity_key(
     tenant_id: Uuid,
+    continuity_anchor: Option<&str>,
     payload: &ChatCompletionsRequest,
-    behavior_profile: &BehaviorProfile,
 ) -> String {
     let input = payload
         .messages
@@ -2657,8 +2580,8 @@ fn chat_cache_affinity_key(
         .collect::<Vec<_>>();
     exact_prefix_cache_affinity_key(
         tenant_id,
+        continuity_anchor,
         &payload.model,
-        behavior_profile,
         payload.extra.get("instructions"),
         payload.extra.get("tools"),
         &input,
@@ -2667,8 +2590,8 @@ fn chat_cache_affinity_key(
 
 fn exact_prefix_cache_affinity_key(
     tenant_id: Uuid,
+    continuity_anchor: Option<&str>,
     model: &str,
-    behavior_profile: &BehaviorProfile,
     explicit_instructions: Option<&Value>,
     tools: Option<&Value>,
     input: &[Value],
@@ -2684,8 +2607,8 @@ fn exact_prefix_cache_affinity_key(
         .collect::<Vec<_>>();
     let seed = json!({
         "tenant_id": tenant_id,
+        "continuity_anchor": continuity_anchor,
         "model": model,
-        "behavior_fingerprint": behavior_profile.fingerprint(),
         "instructions": {
             "explicit": explicit_instructions.cloned(),
             "system_messages": system_messages,
@@ -2694,6 +2617,15 @@ fn exact_prefix_cache_affinity_key(
         "gateway_policy": "quality-first-v1",
     });
     format!("tenant:{tenant_id}/prefix:{}", stable_value_digest(&seed))
+}
+
+fn cache_continuity_anchor(routing: &RequestRoutingScope) -> Option<&str> {
+    match routing.continuity_mode {
+        ContinuityMode::CodexWindow | ContinuityMode::SessionAffinity => {
+            Some(routing.session_key.as_str())
+        }
+        ContinuityMode::EphemeralRequest => None,
+    }
 }
 
 fn stable_value_digest(value: &Value) -> String {
@@ -2733,13 +2665,51 @@ fn success_response_summary(
     {
         return truncate_text(output_summary, 240);
     }
-    if response_output_items
-        .iter()
-        .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
-    {
-        return "assistant tool response delivered".to_string();
+    if let Some(output_summary) = summarize_response_output_items(response_output_items) {
+        return output_summary;
     }
     fallback.to_string()
+}
+
+fn summarize_response_output_items(response_output_items: &[Value]) -> Option<String> {
+    let assistant_text = response_output_items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+        .filter(|item| item.get("role").and_then(Value::as_str) == Some("assistant"))
+        .map(responses_input_message_text)
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !assistant_text.trim().is_empty() {
+        return Some(truncate_text(assistant_text, 240));
+    }
+
+    let tool_calls = response_output_items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .take(3)
+        .map(tool_call_summary)
+        .collect::<Vec<_>>();
+    if !tool_calls.is_empty() {
+        return Some(truncate_text(
+            format!("assistant requested tools: {}", tool_calls.join("; ")),
+            240,
+        ));
+    }
+    None
+}
+
+fn tool_call_summary(item: &Value) -> String {
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+    let arguments = item
+        .get("arguments")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match arguments {
+        Some(arguments) => format!("{name}({})", truncate_text(arguments, 80)),
+        None => format!("{name}()"),
+    }
 }
 
 fn is_codex_chatgpt_backend(base_url: &str) -> bool {
@@ -2749,31 +2719,26 @@ fn is_codex_chatgpt_backend(base_url: &str) -> bool {
 fn responses_payload_for_upstream(
     payload: &ResponsesRequest,
     cache_key: String,
-    replay_context: Option<&str>,
+    replay_plan: &ReplayPlan,
     codex_protocol: bool,
     codex_input_prefix: &[Value],
-    behavior_profile: &BehaviorProfile,
 ) -> Value {
     if codex_protocol {
-        return codex_responses_payload(
-            payload,
-            cache_key,
-            replay_context,
-            codex_input_prefix,
-            behavior_profile,
-        );
+        return codex_responses_payload(payload, cache_key, replay_plan, codex_input_prefix);
     }
 
     let mut upstream_payload = payload.clone();
     if upstream_payload.prompt_cache_key.is_none() {
         upstream_payload.prompt_cache_key = Some(cache_key);
     }
-    let behavior_instruction = behavior_instruction_from_profile(behavior_profile);
-    if behavior_instruction.is_some() || replay_context.is_some() {
+    if replay_plan.drop_previous_response_id {
+        upstream_payload.extra.remove("previous_response_id");
+    }
+    if !replay_plan.input_items.is_empty() || replay_plan.fallback_text.is_some() {
         upstream_payload.input = prepend_context_messages(
             normalize_responses_input(upstream_payload.input.clone()),
-            behavior_instruction.as_deref(),
-            replay_context,
+            &replay_plan.input_items,
+            replay_plan.fallback_text.as_deref(),
         );
     }
     serde_json::to_value(&upstream_payload).unwrap_or_else(|_| {
@@ -2788,9 +2753,8 @@ fn responses_payload_for_upstream(
 fn codex_responses_payload(
     payload: &ResponsesRequest,
     cache_key: String,
-    replay_context: Option<&str>,
+    replay_plan: &ReplayPlan,
     codex_input_prefix: &[Value],
-    behavior_profile: &BehaviorProfile,
 ) -> Value {
     let mut normalized_input = normalize_responses_input(payload.input.clone());
     if !codex_input_prefix.is_empty() {
@@ -2800,8 +2764,8 @@ fn codex_responses_payload(
     }
     let input = prepend_context_messages(
         normalized_input,
-        behavior_instruction_from_profile(behavior_profile).as_deref(),
-        replay_context,
+        &replay_plan.input_items,
+        replay_plan.fallback_text.as_deref(),
     );
     let (instructions, input) =
         codex_instructions_and_input(input, payload.extra.get("instructions"));
@@ -2820,25 +2784,51 @@ fn codex_responses_payload(
         object.insert("reasoning".to_string(), reasoning);
     }
     for (key, value) in &payload.extra {
-        if codex_passthrough_extra_key(key) && !object.contains_key(key) {
+        if codex_passthrough_extra_key(key, replay_plan.drop_previous_response_id)
+            && !object.contains_key(key)
+        {
             object.insert(key.clone(), value.clone());
         }
     }
+    let reasoning_requested = object.contains_key("reasoning");
+    ensure_reasoning_include_field(&mut object, reasoning_requested);
     Value::Object(object)
 }
 
-fn codex_passthrough_extra_key(key: &str) -> bool {
+fn codex_passthrough_extra_key(key: &str, replay_active: bool) -> bool {
     !matches!(
         key,
-        // The ChatGPT Codex backend does not accept client-side response chaining.
-        // Gateway replay/session affinity already preserves continuity for failover.
-        "instructions"
-            | "store"
-            | "stream"
-            | "prompt_cache_key"
-            | "max_output_tokens"
-            | "previous_response_id"
-    )
+        // Gateway-owned instructions/streaming fields must stay canonical.
+        "instructions" | "store" | "stream" | "prompt_cache_key" | "max_output_tokens"
+    ) && !(replay_active && key == "previous_response_id")
+}
+
+fn ensure_reasoning_include_field(
+    object: &mut serde_json::Map<String, Value>,
+    reasoning_requested: bool,
+) {
+    if !reasoning_requested {
+        return;
+    }
+    let mut include = object
+        .remove("include")
+        .map(normalize_include_field)
+        .unwrap_or_default();
+    if !include
+        .iter()
+        .any(|entry| entry.as_str() == Some("reasoning.encrypted_content"))
+    {
+        include.push(Value::String("reasoning.encrypted_content".to_string()));
+    }
+    object.insert("include".to_string(), Value::Array(include));
+}
+
+fn normalize_include_field(value: Value) -> Vec<Value> {
+    match value {
+        Value::Array(items) => items,
+        Value::String(item) => vec![Value::String(item)],
+        _ => Vec::new(),
+    }
 }
 
 fn codex_instructions_and_input(
@@ -2924,9 +2914,8 @@ fn responses_input_message_text(message: &Value) -> String {
 fn responses_payload_from_chat_request(
     payload: &ChatCompletionsRequest,
     cache_key: String,
-    replay_context: Option<&str>,
+    replay_plan: &ReplayPlan,
     codex_protocol: bool,
-    behavior_profile: &BehaviorProfile,
 ) -> Value {
     let mut object = serde_json::Map::new();
     let mut input = payload
@@ -2936,8 +2925,8 @@ fn responses_payload_from_chat_request(
         .collect::<Vec<_>>();
     input = prepend_context_messages(
         input,
-        behavior_instruction_from_profile(behavior_profile).as_deref(),
-        replay_context,
+        &replay_plan.input_items,
+        replay_plan.fallback_text.as_deref(),
     )
     .as_array()
     .cloned()
@@ -2967,10 +2956,15 @@ fn responses_payload_from_chat_request(
         );
     }
     for (key, value) in &payload.extra {
-        if !object.contains_key(key) && (!codex_protocol || codex_passthrough_extra_key(key)) {
+        if !object.contains_key(key)
+            && (!codex_protocol
+                || codex_passthrough_extra_key(key, replay_plan.drop_previous_response_id))
+        {
             object.insert(key.clone(), value.clone());
         }
     }
+    let reasoning_requested = object.contains_key("reasoning");
+    ensure_reasoning_include_field(&mut object, reasoning_requested);
     Value::Object(object)
 }
 
@@ -3718,62 +3712,84 @@ async fn resolve_request_scope(
     auth: &GatewayAuthContext,
     headers: &HeaderMap,
     model: &str,
-) -> RequestRoutingScope {
-    let Some(window_id) = header_str(headers, "x-codex-window-id")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-    else {
-        let principal_id = derive_legacy_principal_id(headers, auth.tenant.slug.as_str());
-        return RequestRoutingScope {
-            placement_affinity_key: principal_id.clone(),
+) -> Result<RequestRoutingScope, ContinuityError> {
+    let window_id = nonempty_header_str(headers, "x-codex-window-id");
+    if window_id.is_none() && requires_codex_window_id(headers) {
+        let error = ContinuityError {
+            message: "Codex CLI requests must include x-codex-window-id; refusing to fall back to request-scoped continuity.".to_string(),
+        };
+        tracing::warn!(
+            originator = ?nonempty_header_str(headers, "originator"),
+            session_id = ?nonempty_header_str(headers, "session_id"),
+            request_id = ?nonempty_header_str(headers, "x-client-request-id"),
+            subagent = ?nonempty_header_str(headers, "x-openai-subagent"),
+            "rejected codex request without x-codex-window-id"
+        );
+        return Err(error);
+    }
+
+    let Some(window_id) = window_id else {
+        if let Some(affinity) = legacy_affinity_key(headers) {
+            let principal_id = format!("tenant:{}/principal:{affinity}", auth.tenant.slug);
+            return Ok(RequestRoutingScope {
+                placement_affinity_key: principal_id.clone(),
+                principal_id,
+                session_key: affinity.to_string(),
+                window_id: None,
+                parent_thread_id: None,
+                thread_family_id: None,
+                continuity_mode: ContinuityMode::SessionAffinity,
+            });
+        }
+
+        let request_key = ephemeral_request_key(headers);
+        let principal_id = format!("tenant:{}/request:{request_key}", auth.tenant.slug);
+        return Ok(RequestRoutingScope {
+            placement_affinity_key: format!("tenant:{}/request:{request_key}", auth.tenant.id),
             principal_id,
+            session_key: request_key,
             window_id: None,
             parent_thread_id: None,
-        };
+            thread_family_id: None,
+            continuity_mode: ContinuityMode::EphemeralRequest,
+        });
     };
 
-    let parent_thread_id = header_str(headers, "x-codex-parent-thread-id")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
+    let parsed_window_id = parse_codex_window_id(window_id)?;
+    let parent_thread_id = nonempty_header_str(headers, "x-codex-parent-thread-id")
+        .map(normalize_header_thread_id)
+        .filter(|value| !value.is_empty());
     let thread = state
         .ensure_conversation_thread(
             &auth.tenant,
-            &window_id,
+            &parsed_window_id.thread_id,
             parent_thread_id.as_deref(),
             Some(model),
             "codex_window",
         )
         .await;
-    RequestRoutingScope {
+    Ok(RequestRoutingScope {
         principal_id: thread.principal_id.clone(),
         placement_affinity_key: format!(
             "tenant:{}/thread-family:{}",
             auth.tenant.id, thread.root_thread_id
         ),
-        window_id: Some(thread.thread_id.clone()),
+        session_key: thread.thread_id.clone(),
+        window_id: Some(parsed_window_id.canonical),
         parent_thread_id: thread.parent_thread_id.clone(),
-    }
+        thread_family_id: Some(thread.root_thread_id.clone()),
+        continuity_mode: ContinuityMode::CodexWindow,
+    })
 }
 
-fn forward_context(
-    headers: &HeaderMap,
-    routing: &RequestRoutingScope,
-    session_epoch: u32,
-) -> ForwardContext {
-    let conversation_id = header_str(headers, "x-client-request-id")
-        .or_else(|| header_str(headers, "session_id"))
-        .or_else(|| header_str(headers, "x-codex-cli-affinity-id"))
-        .or(routing.window_id.as_deref())
-        .unwrap_or(routing.principal_id.as_str())
-        .to_string();
-    let request_id = header_str(headers, "x-client-request-id")
+fn forward_context(headers: &HeaderMap, routing: &RequestRoutingScope) -> ForwardContext {
+    let conversation_id = routing.session_key.clone();
+    let request_id = nonempty_header_str(headers, "x-client-request-id")
         .unwrap_or(conversation_id.as_str())
         .to_string();
     ForwardContext {
-        conversation_id: session_scoped_id(&conversation_id, session_epoch),
-        request_id: session_scoped_id(&request_id, session_epoch),
+        conversation_id,
+        request_id,
         subagent: header_str(headers, "x-openai-subagent").map(str::to_string),
         originator: header_str(headers, "originator").map(str::to_string),
         window_id: routing.window_id.clone(),
@@ -3781,37 +3797,148 @@ fn forward_context(
     }
 }
 
-fn session_scoped_forward_context(context: &ForwardContext, session_epoch: u32) -> ForwardContext {
-    ForwardContext {
-        conversation_id: session_scoped_id(&context.conversation_id, session_epoch),
-        request_id: session_scoped_id(&context.request_id, session_epoch),
-        subagent: context.subagent.clone(),
-        originator: context.originator.clone(),
-        window_id: context.window_id.clone(),
-        parent_thread_id: context.parent_thread_id.clone(),
+fn legacy_affinity_key(headers: &HeaderMap) -> Option<&str> {
+    nonempty_header_str(headers, "x-codex-cli-affinity-id")
+        .or_else(|| nonempty_header_str(headers, "session_id"))
+        .or_else(|| nonempty_header_str(headers, "x-openai-subagent"))
+}
+
+fn requires_codex_window_id(headers: &HeaderMap) -> bool {
+    nonempty_header_str(headers, "x-codex-parent-thread-id").is_some()
+        || nonempty_header_str(headers, "originator").is_some_and(is_codex_cli_originator)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedCodexWindowId {
+    thread_id: String,
+    generation: u32,
+    canonical: String,
+}
+
+fn parse_codex_window_id(value: &str) -> Result<ParsedCodexWindowId, ContinuityError> {
+    let trimmed = value.trim();
+    let Some((thread_id, generation)) = trimmed.rsplit_once(':') else {
+        return Err(ContinuityError {
+            message: "x-codex-window-id must use the official <thread_id>:<generation> format."
+                .to_string(),
+        });
+    };
+    let thread_id = normalize_header_thread_id(thread_id);
+    if thread_id.is_empty() {
+        return Err(ContinuityError {
+            message: "x-codex-window-id must include a non-empty thread id.".to_string(),
+        });
     }
+    let generation = generation.parse::<u32>().map_err(|_| ContinuityError {
+        message: "x-codex-window-id generation must be an unsigned integer.".to_string(),
+    })?;
+    Ok(ParsedCodexWindowId {
+        canonical: format!("{thread_id}:{generation}"),
+        thread_id,
+        generation,
+    })
 }
 
-fn session_scoped_id(base: &str, session_epoch: u32) -> String {
-    let trimmed = base
-        .rsplit_once("::e")
-        .and_then(|(prefix, suffix)| {
-            suffix
-                .chars()
-                .all(|char| char.is_ascii_digit())
-                .then_some(prefix)
+fn normalize_header_thread_id(value: &str) -> String {
+    value.trim().replace(' ', "_")
+}
+
+fn is_codex_cli_originator(originator: &str) -> bool {
+    originator.eq_ignore_ascii_case(DEFAULT_ORIGINATOR)
+        || originator
+            .strip_prefix("codex_cli")
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('_'))
+}
+
+fn ephemeral_request_key(headers: &HeaderMap) -> String {
+    let nonce = Uuid::new_v4().simple().to_string();
+    nonempty_header_str(headers, "x-client-request-id")
+        .map(|request_id| format!("{request_id}::req:{nonce}"))
+        .unwrap_or_else(|| format!("req_{nonce}"))
+}
+
+fn replay_turn_count(replay_context: Option<&str>) -> usize {
+    replay_context
+        .map(|context| {
+            if let Some(turns_line) = context.lines().find(|line| line.starts_with("turns=")) {
+                return turns_line
+                    .trim_start_matches("turns=")
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap_or(0);
+            }
+            context
+                .lines()
+                .filter(|line| {
+                    line.split_once(". ").is_some_and(|(index, rest)| {
+                        index.chars().all(|char| char.is_ascii_digit())
+                            && rest.trim_start().starts_with('g')
+                    })
+                })
+                .count()
         })
-        .unwrap_or(base);
-    format!("{trimmed}::e{}", session_epoch.max(1))
+        .unwrap_or(0)
 }
 
-fn derive_legacy_principal_id(headers: &HeaderMap, tenant_slug: &str) -> String {
-    let affinity = header_str(headers, "x-codex-cli-affinity-id")
-        .or_else(|| header_str(headers, "session_id"))
-        .or_else(|| header_str(headers, "x-openai-subagent"))
-        .or_else(|| header_str(headers, "x-client-request-id"))
-        .unwrap_or("anonymous");
-    format!("tenant:{tenant_slug}/principal:{affinity}")
+fn log_request_attempt(
+    request_log: &RequestLogSeed,
+    routing: &RequestRoutingScope,
+    context: &ForwardContext,
+    lease: &CliLease,
+    replay_context: Option<&str>,
+    attempt: usize,
+) {
+    tracing::info!(
+        endpoint = request_log.endpoint,
+        method = request_log.method,
+        attempt = attempt + 1,
+        continuity_mode = routing.continuity_mode.as_str(),
+        principal_id = %routing.principal_id,
+        window_id = ?routing.window_id,
+        thread_family_id = ?routing.thread_family_id,
+        parent_thread_id = ?routing.parent_thread_id,
+        session_id = %context.conversation_id,
+        request_id = %context.request_id,
+        subagent = ?context.subagent,
+        selected_account_id = %lease.account_id,
+        selected_account_label = %lease.account_label,
+        generation = lease.generation,
+        route_mode = %lease.route_mode.as_str(),
+        replay_injected = replay_context.is_some(),
+        replay_turns = replay_turn_count(replay_context),
+        "forwarding gateway request"
+    );
+}
+
+fn log_queue_unavailable(
+    request_log: &RequestLogSeed,
+    routing: &RequestRoutingScope,
+    context: &ForwardContext,
+    subagent_count: u32,
+) {
+    tracing::warn!(
+        endpoint = request_log.endpoint,
+        method = request_log.method,
+        requested_model = %request_log.requested_model,
+        effective_model = %request_log.effective_model,
+        reasoning_effort = ?request_log.reasoning_effort,
+        continuity_mode = routing.continuity_mode.as_str(),
+        principal_id = %routing.principal_id,
+        window_id = ?routing.window_id,
+        thread_family_id = ?routing.thread_family_id,
+        parent_thread_id = ?routing.parent_thread_id,
+        session_id = %context.conversation_id,
+        request_id = %context.request_id,
+        subagent = ?context.subagent,
+        subagent_count,
+        "gateway lease selection returned no candidates"
+    );
+}
+
+fn nonempty_header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    header_str(headers, name)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -3908,7 +4035,10 @@ mod tests {
     use tower::util::ServiceExt;
 
     use crate::{
-        config::Config, models::CacheMetrics, state::RuntimeState, upstream::UpstreamClient,
+        config::Config,
+        models::{CacheMetrics, GatewayUserRole},
+        state::RuntimeState,
+        upstream::UpstreamClient,
     };
 
     fn test_state() -> AppState {
@@ -3996,9 +4126,8 @@ mod tests {
         let mapped = responses_payload_from_chat_request(
             &payload,
             "cache-123".to_string(),
-            None,
+            &ReplayPlan::default(),
             false,
-            &BehaviorProfile::default(),
         );
         assert_eq!(mapped.get("model").and_then(Value::as_str), Some("gpt-5.4"));
         assert_eq!(mapped.get("stream").and_then(Value::as_bool), Some(true));
@@ -4036,12 +4165,16 @@ mod tests {
             extra: serde_json::Map::new(),
         };
 
+        let replay_plan = ReplayPlan {
+            input_items: Vec::new(),
+            fallback_text: Some("[cmgr replay context]\nrecent_turns=1".to_string()),
+            drop_previous_response_id: false,
+        };
         let mapped = responses_payload_from_chat_request(
             &payload,
             "cache-123".to_string(),
-            Some("[cmgr replay context]\nrecent_turns=1"),
+            &replay_plan,
             false,
-            &BehaviorProfile::default(),
         );
         let input = mapped
             .get("input")
@@ -4073,9 +4206,8 @@ mod tests {
         let mapped = responses_payload_from_chat_request(
             &payload,
             "cache-123".to_string(),
-            None,
+            &ReplayPlan::default(),
             true,
-            &BehaviorProfile::default(),
         );
         assert_eq!(mapped.get("stream").and_then(Value::as_bool), Some(true));
         assert_eq!(mapped.get("store").and_then(Value::as_bool), Some(false));
@@ -4103,10 +4235,9 @@ mod tests {
         let mapped = responses_payload_for_upstream(
             &payload,
             "cache-123".to_string(),
-            None,
+            &ReplayPlan::default(),
             true,
             &[],
-            &BehaviorProfile::default(),
         );
         assert_eq!(mapped.get("stream").and_then(Value::as_bool), Some(true));
         assert_eq!(mapped.get("store").and_then(Value::as_bool), Some(false));
@@ -4137,10 +4268,9 @@ mod tests {
         let mapped = responses_payload_for_upstream(
             &payload,
             "cache-123".to_string(),
-            None,
+            &ReplayPlan::default(),
             true,
             &[],
-            &BehaviorProfile::default(),
         );
         assert!(mapped.get("max_output_tokens").is_none());
         assert_eq!(
@@ -4153,7 +4283,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_responses_payload_drops_previous_response_id() {
+    fn codex_responses_payload_preserves_previous_response_id_without_replay() {
         let payload = ResponsesRequest {
             model: "gpt-5.2".to_string(),
             input: json!("hello"),
@@ -4169,18 +4299,85 @@ mod tests {
         let mapped = responses_payload_for_upstream(
             &payload,
             "cache-123".to_string(),
-            None,
+            &ReplayPlan::default(),
             true,
             &[],
-            &BehaviorProfile::default(),
         );
-        assert!(mapped.get("previous_response_id").is_none());
+        assert_eq!(
+            mapped.get("previous_response_id").and_then(Value::as_str),
+            Some("resp_prev_123")
+        );
         assert_eq!(
             mapped
                 .get("metadata")
                 .and_then(|value| value.get("source"))
                 .and_then(Value::as_str),
             Some("test")
+        );
+    }
+
+    #[test]
+    fn codex_responses_payload_drops_previous_response_id_when_replay_is_injected() {
+        let payload = ResponsesRequest {
+            model: "gpt-5.2".to_string(),
+            input: json!("hello"),
+            stream: Some(false),
+            reasoning: None,
+            prompt_cache_key: None,
+            extra: serde_json::Map::from_iter([(
+                "previous_response_id".to_string(),
+                json!("resp_prev_123"),
+            )]),
+        };
+
+        let replay_plan = ReplayPlan {
+            input_items: Vec::new(),
+            fallback_text: Some(
+                "[cmgr replay context]\nrecent_turns=\n1. g1 user: hello".to_string(),
+            ),
+            drop_previous_response_id: true,
+        };
+        let mapped = responses_payload_for_upstream(
+            &payload,
+            "cache-123".to_string(),
+            &replay_plan,
+            true,
+            &[],
+        );
+        assert!(mapped.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn codex_responses_payload_adds_reasoning_include() {
+        let payload = ResponsesRequest {
+            model: "gpt-5.2".to_string(),
+            input: json!("hello"),
+            stream: Some(false),
+            reasoning: Some(json!({"effort": "high"})),
+            prompt_cache_key: None,
+            extra: serde_json::Map::from_iter([("include".to_string(), json!(["output_text"]))]),
+        };
+
+        let mapped = responses_payload_for_upstream(
+            &payload,
+            "cache-123".to_string(),
+            &ReplayPlan::default(),
+            true,
+            &[],
+        );
+        let include = mapped
+            .get("include")
+            .and_then(Value::as_array)
+            .expect("include array");
+        assert!(
+            include
+                .iter()
+                .any(|item| item.as_str() == Some("output_text"))
+        );
+        assert!(
+            include
+                .iter()
+                .any(|item| item.as_str() == Some("reasoning.encrypted_content"))
         );
     }
 
@@ -4201,10 +4398,9 @@ mod tests {
         let mapped = responses_payload_for_upstream(
             &payload,
             "cache-123".to_string(),
-            None,
+            &ReplayPlan::default(),
             false,
             &[],
-            &BehaviorProfile::default(),
         );
         assert_eq!(
             mapped.get("previous_response_id").and_then(Value::as_str),
@@ -4230,7 +4426,7 @@ mod tests {
         let mapped = responses_payload_for_upstream(
             &payload,
             "cache-123".to_string(),
-            None,
+            &ReplayPlan::default(),
             true,
             &[json!({
                 "type": "function_call",
@@ -4238,7 +4434,6 @@ mod tests {
                 "name": "update_plan",
                 "arguments": "{\"plan\":[{\"step\":\"Inspect logs\",\"status\":\"completed\"}]}"
             })],
-            &BehaviorProfile::default(),
         );
         let input = mapped
             .get("input")
@@ -4316,13 +4511,110 @@ mod tests {
     }
 
     #[test]
-    fn session_scoped_id_replaces_existing_epoch_suffix() {
-        assert_eq!(session_scoped_id("sess-123", 2), "sess-123::e2");
-        assert_eq!(session_scoped_id("sess-123::e1", 3), "sess-123::e3");
+    fn resolve_effective_model_maps_codex_worker_model_to_default() {
+        let api_key = GatewayApiKey {
+            id: Uuid::nil(),
+            tenant_id: Uuid::nil(),
+            name: "test".to_string(),
+            email: "test@example.com".to_string(),
+            role: GatewayUserRole::Admin,
+            token: "token".to_string(),
+            default_model: Some("gpt-5.4".to_string()),
+            reasoning_effort: None,
+            force_model_override: false,
+            force_reasoning_effort: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        assert_eq!(
+            resolve_effective_model(&api_key, "gpt-5.1-codex-mini"),
+            "gpt-5.4"
+        );
     }
 
     #[test]
-    fn cache_affinity_key_changes_on_language_preference() {
+    fn resolve_effective_model_keeps_supported_requested_model() {
+        let api_key = GatewayApiKey {
+            id: Uuid::nil(),
+            tenant_id: Uuid::nil(),
+            name: "test".to_string(),
+            email: "test@example.com".to_string(),
+            role: GatewayUserRole::Admin,
+            token: "token".to_string(),
+            default_model: Some("gpt-5.4".to_string()),
+            reasoning_effort: None,
+            force_model_override: false,
+            force_reasoning_effort: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        assert_eq!(resolve_effective_model(&api_key, "gpt-5.4"), "gpt-5.4");
+    }
+
+    #[test]
+    fn codex_worker_model_fallback_uses_codex_default_when_missing_api_key_default() {
+        assert_eq!(
+            codex_worker_model_fallback("gpt-5.1-codex-mini", None).as_deref(),
+            Some("gpt-5.3-codex")
+        );
+    }
+
+    #[test]
+    fn legacy_affinity_key_ignores_request_id_only_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-client-request-id", HeaderValue::from_static("req-123"));
+        assert!(legacy_affinity_key(&headers).is_none());
+        assert!(ephemeral_request_key(&headers).starts_with("req-123::req:"));
+    }
+
+    #[test]
+    fn codex_cli_originator_requires_window_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert("originator", HeaderValue::from_static(DEFAULT_ORIGINATOR));
+        assert!(requires_codex_window_id(&headers));
+    }
+
+    #[test]
+    fn affinity_only_requests_do_not_require_window_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-codex-cli-affinity-id",
+            HeaderValue::from_static("cli-affinity"),
+        );
+        assert!(!requires_codex_window_id(&headers));
+    }
+
+    #[test]
+    fn forward_context_uses_stable_session_key_before_request_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-client-request-id", HeaderValue::from_static("req-123"));
+        let routing = RequestRoutingScope {
+            principal_id: "tenant:test/principal:thread-1".to_string(),
+            placement_affinity_key: "tenant:test/thread-family:root-1".to_string(),
+            session_key: "root-1".to_string(),
+            window_id: Some("thread-1".to_string()),
+            parent_thread_id: Some("parent-1".to_string()),
+            thread_family_id: Some("root-1".to_string()),
+            continuity_mode: ContinuityMode::CodexWindow,
+        };
+
+        let context = forward_context(&headers, &routing);
+        assert_eq!(context.conversation_id, "root-1");
+        assert_eq!(context.request_id, "req-123");
+        assert_eq!(context.window_id.as_deref(), Some("thread-1"));
+    }
+
+    #[test]
+    fn replay_turn_count_counts_recent_turn_lines() {
+        let replay = "[cmgr replay context]\nrecent_turns=\n1. g1 user: hello\n   assistant: ok\n2. g2 user: ship it\n";
+        assert_eq!(replay_turn_count(Some(replay)), 2);
+        assert_eq!(replay_turn_count(None), 0);
+    }
+
+    #[test]
+    fn cache_affinity_key_is_stable_without_legacy_behavior_profile() {
         let payload = ResponsesRequest {
             model: "gpt-5.4".to_string(),
             input: json!("hello"),
@@ -4331,19 +4623,52 @@ mod tests {
             prompt_cache_key: None,
             extra: serde_json::Map::new(),
         };
-        let zh = BehaviorProfile {
-            output_language: Some("zh-CN".to_string()),
-            ..BehaviorProfile::default()
-        };
-        let en = BehaviorProfile {
-            output_language: Some("en-US".to_string()),
-            ..BehaviorProfile::default()
+
+        assert_eq!(
+            responses_cache_affinity_key(Uuid::nil(), Some("thread-1"), &payload),
+            responses_cache_affinity_key(Uuid::nil(), Some("thread-1"), &payload)
+        );
+    }
+
+    #[test]
+    fn cache_affinity_key_changes_across_continuity_anchors() {
+        let payload = ResponsesRequest {
+            model: "gpt-5.4".to_string(),
+            input: json!("hello"),
+            stream: Some(false),
+            reasoning: None,
+            prompt_cache_key: None,
+            extra: serde_json::Map::new(),
         };
 
         assert_ne!(
-            responses_cache_affinity_key(Uuid::nil(), &payload, &zh),
-            responses_cache_affinity_key(Uuid::nil(), &payload, &en)
+            responses_cache_affinity_key(Uuid::nil(), Some("thread-root"), &payload,),
+            responses_cache_affinity_key(Uuid::nil(), Some("thread-child"), &payload,)
         );
+    }
+
+    #[test]
+    fn parse_codex_window_id_extracts_thread_and_generation() {
+        let parsed = parse_codex_window_id("thread-123:7").expect("parse window id");
+        assert_eq!(parsed.thread_id, "thread-123");
+        assert_eq!(parsed.generation, 7);
+        assert_eq!(parsed.canonical, "thread-123:7");
+    }
+
+    #[test]
+    fn success_response_summary_uses_tool_call_details() {
+        let summary = success_response_summary(
+            None,
+            &[json!({
+                "type": "function_call",
+                "call_id": "call_shell_1",
+                "name": "shell",
+                "arguments": "{\"command\":\"echo hi\"}"
+            })],
+            "fallback",
+        );
+        assert!(summary.contains("shell"));
+        assert_ne!(summary, "assistant tool response delivered");
     }
 
     #[test]

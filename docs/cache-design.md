@@ -25,7 +25,7 @@ Date: 2026-04-06
 - `stable-prefix-first`
 - `dual-candidate cache-aware routing`
 - `dependency-frontier replay`
-- `shared-root-prefix for subagents`
+- `shared-placement with isolated continuity`
 
 ## 2. 问题定义
 
@@ -61,7 +61,7 @@ Date: 2026-04-06
 1. 让最稳定的前缀尽量不变
 2. 让同一个 principal 尽量长期留在同一个账号
 3. 切号时只重放仍被未完成任务依赖的最小上下文边界
-4. 把同一 CLI 下多 agent 的公共前缀统一成一份共享根前缀
+4. 让同一 CLI 下多 agent 共享账号放置，但保持各自独立的连续性状态
 
 一句话概括：
 
@@ -75,7 +75,7 @@ Date: 2026-04-06
 2. `Workflow Spine Packing`
 3. `Live Tail Packing`
 4. `Dependency-Frontier Replay`
-5. `Shared Root Prefix for Subagents`
+5. `Shared Placement, Isolated Continuity`
 6. `Dual-Candidate Cache-Aware Routing`
 
 这 6 层不是可选项，而是一个组合算法。
@@ -177,19 +177,19 @@ Date: 2026-04-06
 
 ## 7. 多 Agent 共享缓存算法
 
-### 7.1 Shared Root Prefix
+### 7.1 Shared Placement, Isolated Continuity
 
-同一 `CLI principal` 下的多 agent 共享同一个 `root prefix`：
+同一 `CLI principal` 下的多 agent 共享账号放置，但不共享连续性状态：
 
-- 所有 agent 共享同一份稳定前缀
-- 所有 agent 共享同一份 workflow spine 基线
-- 子 agent 只附加自己的差异尾部
+- 所有 agent 可以复用同一账号 lease 和同一组静态工具定义
+- 每个 agent 必须拥有自己的 thread/window continuity anchor
+- `fork` 只继承 fork 当下父线程可见上下文，之后各自隔离
 
 这样做的原因：
 
-- 避免每个 agent 重复携带完整系统上下文
-- 提高 principal 内部 shared prefix 命中率
-- 降低多 agent 并发时的总 replay token
+- 避免 sibling agent 共享隐藏状态导致上下文污染
+- 保留官方 Codex 的 thread/window 语义
+- 只在 placement 层共享 locality，不在 continuity 层共享 session
 
 ### 7.2 为什么不拆成多账号
 

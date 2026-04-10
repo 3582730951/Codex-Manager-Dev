@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{Duration as ChronoDuration, Utc};
+use serde_json::{Value, json};
 use tokio::{
     sync::{RwLock, mpsc, mpsc::error::TryRecvError},
     time::Duration,
@@ -10,9 +11,9 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::models::{
-    AccountRouteState, AccountSummary, BehaviorHints, BehaviorProfile, BillingSummary,
-    CacheMetrics, CfIncident, CliLease, CompactConversationThreadRequest, ContextTurn,
-    ConversationContext, ConversationThread, ConversationThreadView, CreateGatewayApiKeyRequest,
+    AccountRouteState, AccountSummary, BehaviorProfile, BillingSummary, CacheMetrics, CfIncident,
+    CliLease, CompactConversationThreadRequest, ContextTurn, ConversationContext,
+    ConversationThread, ConversationThreadView, CreateGatewayApiKeyRequest,
     CreateGatewayUserRequest, CreateTenantRequest, CreatedGatewayApiKey, CreatedGatewayUser,
     DashboardCounts, DashboardSnapshot, EgressSlot, ForkConversationThreadRequest, GatewayApiKey,
     GatewayApiKeyView, GatewayUserRole, GatewayUserView, ImportAccountRequest,
@@ -27,9 +28,8 @@ use crate::reasoning::normalize_reasoning_effort;
 use crate::scheduler::cf_state::{
     is_in_cooldown, reconcile_route_mode, register_cf_hit, register_success,
 };
-use crate::scheduler::replay::{ReplayPack, compile_replay_pack};
 use crate::scheduler::router::{score_candidate, select_dual_candidates, should_reuse_lease};
-use crate::scheduler::token_optimizer::{WarmupDecision, evaluate_prefix_warmup};
+use crate::scheduler::token_optimizer::WarmupDecision;
 use crate::storage::{Persistence, PersistenceMessage, PersistenceSnapshot};
 use crate::upstream::UpstreamClient;
 use crate::{browser_assist, bus, config::Config};
@@ -57,6 +57,13 @@ pub(crate) struct OpenAiLoginSessionState {
     base_url: String,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ReplayPlan {
+    pub input_items: Vec<Value>,
+    pub fallback_text: Option<String>,
+    pub drop_previous_response_id: bool,
 }
 
 impl OpenAiLoginSessionState {
@@ -803,10 +810,6 @@ impl AppState {
                     .unwrap_or_else(|| "internal_start".to_string()),
             )
             .await;
-        if let Some(model) = model.as_deref() {
-            self.reconcile_behavior_profile(&thread.principal_id, model, request.behavior_hints)
-                .await;
-        }
         self.conversation_thread_view(&thread.thread_id)
             .await
             .ok_or_else(|| "Thread not found after creation.".to_string())
@@ -856,27 +859,39 @@ impl AppState {
             .await;
 
         if let Some(parent_context) = parent.context {
+            let inherited_model = model
+                .clone()
+                .unwrap_or_else(|| parent_context.model.clone());
             let inherited_workflow = parent
                 .thread
                 .compaction_summary
                 .clone()
                 .filter(|summary| !summary.trim().is_empty())
                 .unwrap_or_else(|| parent_context.workflow_spine.clone());
+            let inherited_turns = parent_context.turns.clone();
             let snapshot = {
                 let mut contexts = self.runtime.conversation_contexts.write().await;
                 let context = contexts
                     .entry(child.principal_id.clone())
                     .or_insert_with(|| ConversationContext {
                         principal_id: child.principal_id.clone(),
-                        model: model
-                            .clone()
-                            .unwrap_or_else(|| parent_context.model.clone()),
-                        workflow_spine: inherited_workflow,
-                        behavior_profile: parent_context.behavior_profile.clone(),
+                        model: inherited_model.clone(),
+                        workflow_spine: inherited_workflow.clone(),
+                        behavior_profile: BehaviorProfile::default(),
                         pending_turn: None,
-                        turns: Vec::new(),
+                        turns: inherited_turns.clone(),
                         updated_at: Some(Utc::now()),
                     });
+                context.principal_id = child.principal_id.clone();
+                context.model = inherited_model;
+                if context.workflow_spine.trim().is_empty() {
+                    context.workflow_spine = inherited_workflow;
+                }
+                context.behavior_profile = BehaviorProfile::default();
+                if context.turns.is_empty() {
+                    context.turns = inherited_turns;
+                }
+                context.pending_turn = None;
                 context.updated_at = Some(Utc::now());
                 context.clone()
             };
@@ -1179,6 +1194,14 @@ impl AppState {
 
             let summary = summarize_compacted_turns(&archived_turns);
             let merged = merge_compaction_summary(thread.compaction_summary.as_deref(), &summary);
+            let summary_turn_generation = archived_turns
+                .first()
+                .map(|turn| turn.generation)
+                .unwrap_or(1);
+            let mut retained_turns = Vec::with_capacity(context.turns.len() + 1);
+            retained_turns.push(compaction_summary_turn(summary_turn_generation, &merged));
+            retained_turns.extend(context.turns.clone());
+            context.turns = retained_turns;
             context.workflow_spine = format!(
                 "{}\ncompaction_summary=\n{}",
                 workflow_spine_for_model(&context.model),
@@ -2024,7 +2047,7 @@ impl AppState {
     pub async fn resolve_lease(
         &self,
         request: LeaseSelectionRequest,
-    ) -> Option<(CliLease, ReplayPack, WarmupDecision)> {
+    ) -> Option<(CliLease, String, WarmupDecision)> {
         let now = Utc::now();
         let principal_id = request.principal_id.clone();
 
@@ -2125,25 +2148,14 @@ impl AppState {
                         lease.route_mode = route_state.route_mode;
                         lease.clone()
                     };
-                    let replay = compile_replay_pack(
-                        &request.cache_affinity_key,
-                        &request.model,
-                        existing.generation,
-                        &serde_json::json!({
-                            "cache_affinity_key": request.cache_affinity_key,
-                            "model": request.model
-                        }),
+                    let metrics_snapshot = current_cache_metrics_snapshot(
+                        &self.runtime.cache_metrics.read().await.clone(),
+                        &self.list_request_logs().await,
                     );
-                    let warmup = evaluate_prefix_warmup(
-                        3,
-                        replay.static_prefix_tokens,
-                        0.75,
-                        replay.live_tail_tokens,
-                        false,
-                    );
+                    let warmup = observed_warmup_decision(&metrics_snapshot);
                     self.enqueue(PersistenceMessage::LeaseUpsert(lease_snapshot.clone()))
                         .await;
-                    return Some((lease_snapshot, replay, warmup));
+                    return Some((lease_snapshot, request.cache_affinity_key.clone(), warmup));
                 }
             }
         }
@@ -2201,35 +2213,14 @@ impl AppState {
             .await
             .insert(principal_id.clone(), lease.clone());
 
-        let replay = compile_replay_pack(
-            &request.cache_affinity_key,
-            &request.model,
-            generation,
-            &serde_json::json!({
-                "cache_affinity_key": request.cache_affinity_key,
-                "model": request.model
-            }),
-        );
-        let warmup = evaluate_prefix_warmup(
-            4,
-            replay.static_prefix_tokens + replay.workflow_tokens,
-            0.75,
-            replay.live_tail_tokens,
-            false,
-        );
-
         let request_logs = self.list_request_logs().await;
         let metrics_snapshot = {
             let mut metrics = self.runtime.cache_metrics.write().await;
-            metrics.static_prefix_tokens = replay.static_prefix_tokens;
-            if warmup.should_warm {
-                metrics.warmup_roi =
-                    ((metrics.warmup_roi * 4.0) + warmup.expected_saving.max(1.0)) / 5.0;
-            }
-            let derived = derive_cache_metrics_from_logs(&request_logs, &metrics);
+            let derived = current_cache_metrics_snapshot(&metrics.clone(), &request_logs);
             *metrics = derived.clone();
             derived
         };
+        let warmup = observed_warmup_decision(&metrics_snapshot);
 
         self.enqueue_many(vec![
             PersistenceMessage::LeaseUpsert(lease.clone()),
@@ -2237,68 +2228,7 @@ impl AppState {
         ])
         .await;
 
-        Some((lease, replay, warmup))
-    }
-
-    pub async fn reconcile_behavior_profile(
-        &self,
-        principal_id: &str,
-        model: &str,
-        hints: BehaviorHints,
-    ) -> BehaviorProfile {
-        let snapshot = {
-            let mut contexts = self.runtime.conversation_contexts.write().await;
-            let context = ensure_conversation_context(
-                contexts.entry(principal_id.to_string()).or_default(),
-                principal_id,
-                model,
-            );
-            let had_active_session = has_effective_session_state(context);
-            let mut rotate_session = false;
-
-            if let Some(output_language) = hints
-                .output_language
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                && context.behavior_profile.output_language.as_deref()
-                    != Some(output_language.as_str())
-            {
-                context.behavior_profile.output_language = Some(output_language);
-                rotate_session = had_active_session;
-            }
-            if let Some(execution_mode) = hints.execution_mode
-                && context.behavior_profile.execution_mode != execution_mode
-            {
-                context.behavior_profile.execution_mode = execution_mode;
-                rotate_session = rotate_session || had_active_session;
-            }
-            if let Some(tool_policy) = hints.tool_policy
-                && context.behavior_profile.tool_policy != tool_policy
-            {
-                context.behavior_profile.tool_policy = tool_policy;
-                rotate_session = rotate_session || had_active_session;
-            }
-            if let Some(verbosity_policy) = hints.verbosity_policy
-                && context.behavior_profile.verbosity_policy != verbosity_policy
-            {
-                context.behavior_profile.verbosity_policy = verbosity_policy;
-            }
-            if rotate_session {
-                context.behavior_profile.session_epoch = context
-                    .behavior_profile
-                    .session_epoch
-                    .max(1)
-                    .saturating_add(1);
-                context.pending_turn = None;
-            }
-            context.updated_at = Some(Utc::now());
-            context.clone()
-        };
-        self.enqueue(PersistenceMessage::ConversationContextUpsert(
-            snapshot.clone(),
-        ))
-        .await;
-        snapshot.behavior_profile
+        Some((lease, request.cache_affinity_key.clone(), warmup))
     }
 
     pub async fn begin_context_turn(
@@ -2307,6 +2237,7 @@ impl AppState {
         model: &str,
         generation: u32,
         request_summary: String,
+        request_input_items: Vec<Value>,
     ) {
         let snapshot = {
             let mut contexts = self.runtime.conversation_contexts.write().await;
@@ -2318,8 +2249,7 @@ impl AppState {
             context.pending_turn = Some(PendingContextTurn {
                 generation,
                 request_summary,
-                session_epoch: context.behavior_profile.session_epoch.max(1),
-                behavior_fingerprint: context.behavior_profile.fingerprint(),
+                request_input_items,
                 created_at: Utc::now(),
             });
             context.updated_at = Some(Utc::now());
@@ -2350,35 +2280,99 @@ impl AppState {
         .await;
     }
 
+    #[allow(dead_code)]
     pub async fn replay_context_for(&self, principal_id: &str, generation: u32) -> Option<String> {
-        if generation <= 1 {
-            return None;
+        self.replay_context_for_request(principal_id, generation, None)
+            .await
+    }
+
+    pub async fn replay_plan_for_request(
+        &self,
+        principal_id: &str,
+        generation: u32,
+        previous_response_id: Option<&str>,
+    ) -> ReplayPlan {
+        let previous_response_id = previous_response_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if generation <= 1 && previous_response_id.is_none() {
+            return ReplayPlan::default();
         }
+
         let contexts = self.runtime.conversation_contexts.read().await;
-        let context = contexts.get(principal_id)?;
-        let session_epoch = context.behavior_profile.session_epoch.max(1);
-        let effective_turns = context
+        let Some(context) = contexts.get(principal_id) else {
+            return ReplayPlan::default();
+        };
+        let effective_turns = Self::recent_successful_turns(context);
+        if generation > 1 {
+            if let Some(input_items) = Self::build_structured_replay_items(&effective_turns) {
+                return ReplayPlan {
+                    fallback_text: Some(format!(
+                        "[cmgr structured replay]\nturns={}\nitems={}",
+                        effective_turns.len(),
+                        input_items.len()
+                    )),
+                    input_items,
+                    drop_previous_response_id: true,
+                };
+            }
+            return ReplayPlan {
+                input_items: Vec::new(),
+                fallback_text: Self::build_replay_context_block(
+                    context,
+                    generation,
+                    "failover_stabilization",
+                    previous_response_id,
+                    effective_turns,
+                ),
+                drop_previous_response_id: true,
+            };
+        }
+
+        ReplayPlan::default()
+    }
+
+    #[allow(dead_code)]
+    pub async fn replay_context_for_request(
+        &self,
+        principal_id: &str,
+        generation: u32,
+        previous_response_id: Option<&str>,
+    ) -> Option<String> {
+        self.replay_plan_for_request(principal_id, generation, previous_response_id)
+            .await
+            .fallback_text
+    }
+
+    fn recent_successful_turns(context: &ConversationContext) -> Vec<ContextTurn> {
+        context
             .turns
             .iter()
-            .filter(|turn| {
-                turn.turn_outcome == TurnOutcome::Success
-                    && turn.session_epoch.max(1) == session_epoch
-            })
-            .rev()
-            .take(6)
+            .filter(|turn| turn.turn_outcome == TurnOutcome::Success)
             .cloned()
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+    }
+
+    fn build_replay_context_block(
+        context: &ConversationContext,
+        generation: u32,
+        mode: &str,
+        previous_response_id: Option<&str>,
+        effective_turns: Vec<ContextTurn>,
+    ) -> Option<String> {
         if effective_turns.is_empty() {
             return None;
         }
 
         let mut block = String::new();
         block.push_str("[cmgr replay context]\n");
-        block.push_str("mode=failover_stabilization\n");
+        block.push_str(&format!("mode={mode}\n"));
         block.push_str(&format!("principal={}\n", context.principal_id));
         block.push_str(&format!("model={}\n", context.model));
         block.push_str(&format!("generation={generation}\n"));
-        block.push_str(&format!("session_epoch={session_epoch}\n"));
+        if let Some(previous_response_id) = previous_response_id {
+            block.push_str(&format!("previous_response_id={previous_response_id}\n"));
+        }
         if !context.workflow_spine.is_empty() {
             block.push_str("workflow=\n");
             block.push_str(&context.workflow_spine);
@@ -2397,6 +2391,30 @@ impl AppState {
             }
         }
         Some(block)
+    }
+
+    fn build_structured_replay_items(turns: &[ContextTurn]) -> Option<Vec<Value>> {
+        let mut items = Vec::new();
+        for turn in turns {
+            if turn.synthetic_kind.as_deref() == Some("compaction_summary") {
+                if turn.request_input_items.is_empty() {
+                    return None;
+                }
+                items.extend(turn.request_input_items.clone());
+                continue;
+            }
+            if turn.request_input_items.is_empty() {
+                return None;
+            }
+            items.extend(turn.request_input_items.clone());
+            items.extend(
+                turn.response_output_items
+                    .iter()
+                    .filter(|item| item.get("type").and_then(Value::as_str).is_some())
+                    .cloned(),
+            );
+        }
+        (!items.is_empty()).then_some(items)
     }
 
     pub async fn replay_tool_call_items_for(
@@ -2418,13 +2436,11 @@ impl AppState {
             .iter()
             .map(String::as_str)
             .collect::<std::collections::HashSet<_>>();
-        let session_epoch = context.behavior_profile.session_epoch.max(1);
         let matching_turn = previous_response_id
             .and_then(|response_id| {
                 context.turns.iter().rev().find(|turn| {
                     turn.turn_outcome == TurnOutcome::Success
                         && turn.tool_replay_safe
-                        && turn.session_epoch.max(1) == session_epoch
                         && turn.response_id.as_deref() == Some(response_id)
                         && turn.response_output_items.iter().any(|item| {
                             item.get("type").and_then(serde_json::Value::as_str)
@@ -2440,7 +2456,6 @@ impl AppState {
                 context.turns.iter().rev().find(|turn| {
                     turn.turn_outcome == TurnOutcome::Success
                         && turn.tool_replay_safe
-                        && turn.session_epoch.max(1) == session_epoch
                         && turn.response_output_items.iter().any(|item| {
                             item.get("type").and_then(serde_json::Value::as_str)
                                 == Some("function_call")
@@ -2495,14 +2510,14 @@ impl AppState {
                 generation: pending_turn.generation,
                 request_summary: pending_turn.request_summary,
                 response_summary: Some(response_summary),
-                session_epoch: pending_turn.session_epoch.max(1),
-                behavior_fingerprint: pending_turn.behavior_fingerprint,
+                request_input_items: pending_turn.request_input_items,
                 turn_outcome: TurnOutcome::Success,
                 response_id,
                 tool_replay_safe: response_output_items.iter().any(|item| {
                     item.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
                 }),
                 response_output_items,
+                synthetic_kind: None,
                 created_at: Utc::now(),
             });
             context.updated_at = Some(Utc::now());
@@ -2717,10 +2732,10 @@ fn ensure_conversation_context<'a>(
 ) -> &'a mut ConversationContext {
     context.principal_id = principal_id.to_string();
     context.model = model.to_string();
-    context.workflow_spine = workflow_spine_for_model(model);
-    if context.behavior_profile.session_epoch == 0 {
-        context.behavior_profile.session_epoch = 1;
+    if context.workflow_spine.trim().is_empty() {
+        context.workflow_spine = workflow_spine_for_model(model);
     }
+    context.behavior_profile = BehaviorProfile::default();
     context
 }
 
@@ -2728,15 +2743,6 @@ fn workflow_spine_for_model(model: &str) -> String {
     format!(
         "task_continuity=preserve\nmodel={model}\npreserve_tool_state=true\npreserve_decisions=true"
     )
-}
-
-fn has_effective_session_state(context: &ConversationContext) -> bool {
-    let default_behavior = BehaviorProfile::default();
-    !context.turns.is_empty()
-        || context.pending_turn.is_some()
-        || context.behavior_profile.output_language.is_some()
-        || context.behavior_profile.execution_mode != default_behavior.execution_mode
-        || context.behavior_profile.tool_policy != default_behavior.tool_policy
 }
 
 fn default_cache_metrics() -> CacheMetrics {
@@ -2755,12 +2761,14 @@ fn derive_cache_metrics_from_logs(logs: &[RequestLogEntry], base: &CacheMetrics)
     let mut hit_requests = 0_u64;
     let mut total_input_tokens = 0_u64;
     let mut total_cached_input_tokens = 0_u64;
+    let mut max_cached_input_tokens = 0_u64;
 
     for log in logs {
         let input_tokens = log.usage.input_tokens;
         let cached_input_tokens = log.usage.cached_input_tokens.min(input_tokens);
         total_input_tokens += input_tokens;
         total_cached_input_tokens += cached_input_tokens;
+        max_cached_input_tokens = max_cached_input_tokens.max(cached_input_tokens);
 
         if input_tokens > 0 {
             eligible_requests += 1;
@@ -2772,12 +2780,35 @@ fn derive_cache_metrics_from_logs(logs: &[RequestLogEntry], base: &CacheMetrics)
 
     metrics.cached_tokens = total_cached_input_tokens;
     metrics.replay_tokens = total_input_tokens;
+    metrics.static_prefix_tokens = max_cached_input_tokens;
     metrics.prefix_hit_ratio = if eligible_requests > 0 {
         hit_requests as f64 / eligible_requests as f64
     } else {
         0.0
     };
     metrics
+}
+
+fn current_cache_metrics_snapshot(base: &CacheMetrics, logs: &[RequestLogEntry]) -> CacheMetrics {
+    let mut metrics = derive_cache_metrics_from_logs(logs, base);
+    metrics.warmup_roi = observed_warmup_decision(&metrics).expected_saving.max(0.0);
+    metrics
+}
+
+fn observed_warmup_decision(metrics: &CacheMetrics) -> WarmupDecision {
+    if metrics.replay_tokens == 0 || metrics.static_prefix_tokens < 1024 {
+        return WarmupDecision {
+            should_warm: false,
+            expected_saving: 0.0,
+        };
+    }
+
+    let cached_ratio = metrics.cached_tokens as f64 / metrics.replay_tokens as f64;
+    let expected_saving = metrics.static_prefix_tokens as f64 * cached_ratio;
+    WarmupDecision {
+        should_warm: metrics.prefix_hit_ratio < 0.60 && expected_saving >= 1024.0,
+        expected_saving,
+    }
 }
 
 fn default_oauth_models() -> Vec<String> {
@@ -2916,6 +2947,12 @@ fn summarize_compacted_turns(turns: &[ContextTurn]) -> String {
     let mut lines = Vec::new();
     lines.push("[cmgr compacted thread summary]".to_string());
     for turn in turns {
+        if turn.synthetic_kind.as_deref() == Some("compaction_summary") {
+            if let Some(response_summary) = turn.response_summary.as_deref() {
+                lines.push(response_summary.to_string());
+            }
+            continue;
+        }
         lines.push(format!(
             "g{} user: {}",
             turn.generation, turn.request_summary
@@ -2928,6 +2965,27 @@ fn summarize_compacted_turns(turns: &[ContextTurn]) -> String {
         }
     }
     truncate_multiline(lines.join("\n"), 16, 480)
+}
+
+fn compaction_summary_turn(generation: u32, summary: &str) -> ContextTurn {
+    ContextTurn {
+        generation,
+        request_summary: "[compacted context]".to_string(),
+        response_summary: Some(summary.to_string()),
+        request_input_items: vec![json!({
+            "role": "developer",
+            "content": [{
+                "type": "input_text",
+                "text": format!("[cmgr compacted thread summary]\n{summary}")
+            }]
+        })],
+        turn_outcome: TurnOutcome::Success,
+        response_id: None,
+        response_output_items: Vec::new(),
+        tool_replay_safe: false,
+        synthetic_kind: Some("compaction_summary".to_string()),
+        created_at: Utc::now(),
+    }
 }
 
 fn merge_compaction_summary(existing: Option<&str>, next: &str) -> String {
@@ -3033,6 +3091,24 @@ mod tests {
         tenant
     }
 
+    fn item_text(item: &Value) -> String {
+        item.get("content")
+            .map(|content| match content {
+                Value::String(text) => text.clone(),
+                Value::Array(items) => items
+                    .iter()
+                    .filter_map(|part| {
+                        part.as_str().map(str::to_string).or_else(|| {
+                            part.get("text").and_then(Value::as_str).map(str::to_string)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+                other => other.to_string(),
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
     fn cache_metrics_use_real_request_hit_rate() {
         let base = CacheMetrics {
@@ -3054,110 +3130,113 @@ mod tests {
         assert_eq!(derived.replay_tokens, 264);
         assert!((derived.prefix_hit_ratio - (2.0 / 3.0)).abs() < 1e-9);
         assert_eq!(derived.warmup_roi, base.warmup_roi);
-        assert_eq!(derived.static_prefix_tokens, base.static_prefix_tokens);
+        assert_eq!(derived.static_prefix_tokens, 30);
     }
 
     #[tokio::test]
-    async fn explicit_language_switch_rotates_session_epoch_after_success() {
+    async fn failover_replay_plan_prefers_structured_turn_items() {
         let state = test_state();
         let principal = "tenant:test/principal:cli";
 
-        let initial = state
-            .reconcile_behavior_profile(
+        state
+            .begin_context_turn(
                 principal,
                 "gpt-5.4",
-                BehaviorHints {
-                    output_language: Some("en-US".to_string()),
-                    ..BehaviorHints::default()
-                },
+                1,
+                "hello".to_string(),
+                vec![json!({"role": "user", "content": "hello"})],
             )
-            .await;
-        assert_eq!(initial.session_epoch, 1);
-
-        state
-            .begin_context_turn(principal, "gpt-5.4", 1, "hello".to_string())
             .await;
         state
             .record_context_output_with_response(
                 principal,
                 "done".to_string(),
                 Some("resp_1".to_string()),
-                Vec::new(),
+                vec![json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]})],
             )
             .await;
 
-        let switched = state
-            .reconcile_behavior_profile(
+        state
+            .begin_context_turn(
                 principal,
                 "gpt-5.4",
-                BehaviorHints {
-                    output_language: Some("zh-CN".to_string()),
-                    ..BehaviorHints::default()
-                },
+                1,
+                "ship it".to_string(),
+                vec![json!({"role": "user", "content": "ship it"})],
             )
             .await;
-        assert_eq!(switched.session_epoch, 2);
+        state
+            .record_context_output_with_response(
+                principal,
+                "done again".to_string(),
+                Some("resp_2".to_string()),
+                vec![json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done again"}]})],
+            )
+            .await;
+
+        let replay = state.replay_plan_for_request(principal, 2, None).await;
+        assert!(replay.drop_previous_response_id);
+        assert!(
+            replay
+                .fallback_text
+                .as_deref()
+                .is_some_and(|text| text.contains("structured replay"))
+        );
+        assert_eq!(replay.input_items.len(), 4);
+        assert!(replay.input_items.iter().any(|item| {
+            item.get("role").and_then(Value::as_str) == Some("user")
+                && item_text(item).contains("hello")
+        }));
+        assert!(replay.input_items.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && item_text(item).contains("done again")
+        }));
     }
 
     #[tokio::test]
-    async fn replay_context_uses_only_successful_turns_from_current_epoch() {
+    async fn failover_replay_falls_back_to_text_when_old_turns_lack_items() {
         let state = test_state();
-        let principal = "tenant:test/principal:cli";
+        let principal = "tenant:test/principal:legacy";
 
         state
-            .reconcile_behavior_profile(principal, "gpt-5.4", BehaviorHints::default())
-            .await;
-        state
-            .begin_context_turn(principal, "gpt-5.4", 1, "failed turn".to_string())
-            .await;
-        state.discard_pending_context_turn(principal).await;
-        assert!(state.replay_context_for(principal, 2).await.is_none());
-
-        state
-            .begin_context_turn(principal, "gpt-5.4", 1, "english turn".to_string())
-            .await;
-        state
-            .record_context_output_with_response(
-                principal,
-                "english reply".to_string(),
-                Some("resp_en".to_string()),
-                Vec::new(),
-            )
-            .await;
-        let replay = state
-            .replay_context_for(principal, 2)
-            .await
-            .expect("replay");
-        assert!(replay.contains("english turn"));
-
-        state
-            .reconcile_behavior_profile(
+            .begin_context_turn(
                 principal,
                 "gpt-5.4",
-                BehaviorHints {
-                    output_language: Some("zh-CN".to_string()),
-                    ..BehaviorHints::default()
-                },
+                1,
+                "legacy prompt".to_string(),
+                Vec::new(),
             )
-            .await;
-        state
-            .begin_context_turn(principal, "gpt-5.4", 2, "中文轮次".to_string())
             .await;
         state
             .record_context_output_with_response(
                 principal,
-                "中文回复".to_string(),
-                Some("resp_zh".to_string()),
+                "legacy reply".to_string(),
+                Some("resp_legacy".to_string()),
                 Vec::new(),
             )
             .await;
 
-        let replay = state
-            .replay_context_for(principal, 3)
-            .await
-            .expect("replay after switch");
-        assert!(replay.contains("中文轮次"));
-        assert!(!replay.contains("english turn"));
+        let replay = state.replay_plan_for_request(principal, 2, None).await;
+        assert!(replay.input_items.is_empty());
+        let fallback = replay.fallback_text.expect("fallback replay");
+        assert!(fallback.contains("legacy prompt"));
+        assert!(fallback.contains("legacy reply"));
+    }
+
+    #[test]
+    fn ensure_conversation_context_preserves_existing_workflow_spine() {
+        let existing_workflow =
+            "task_continuity=preserve\nmodel=gpt-5.4\ncompaction_summary=\nkeep this summary"
+                .to_string();
+        let mut context = ConversationContext {
+            workflow_spine: existing_workflow.clone(),
+            ..ConversationContext::default()
+        };
+
+        ensure_conversation_context(&mut context, "tenant:test/thread:root", "gpt-5.5");
+
+        assert_eq!(context.workflow_spine, existing_workflow);
+        assert_eq!(context.model, "gpt-5.5");
     }
 
     #[tokio::test]
@@ -3172,7 +3251,7 @@ mod tests {
                 title: Some("root".to_string()),
                 model: Some("gpt-5.4".to_string()),
                 source: Some("test".to_string()),
-                behavior_hints: BehaviorHints::default(),
+                behavior_hints: Default::default(),
             })
             .await
             .expect("start parent");
@@ -3182,6 +3261,7 @@ mod tests {
                 "gpt-5.4",
                 1,
                 "parent request".to_string(),
+                vec![json!({"role": "user", "content": "parent request"})],
             )
             .await;
         state
@@ -3211,17 +3291,82 @@ mod tests {
             Some(parent.thread.thread_id.as_str())
         );
         assert!(child.context.is_some());
+        assert_eq!(
+            child.context.as_ref().map(|context| context.turns.len()),
+            Some(1)
+        );
         assert!(
             child
                 .context
                 .as_ref()
-                .is_some_and(|context| context.turns.is_empty())
+                .and_then(|context| context.turns.first())
+                .is_some_and(|turn| turn.request_summary == "parent request")
+        );
+        let child_replay = state
+            .replay_plan_for_request(&child.thread.principal_id, 2, None)
+            .await
+            .input_items;
+        assert!(child_replay.iter().any(|item| {
+            item.get("role").and_then(Value::as_str) == Some("user")
+                && item_text(item).contains("parent request")
+        }));
+
+        state
+            .begin_context_turn(
+                &child.thread.principal_id,
+                "gpt-5.4",
+                2,
+                "child request".to_string(),
+                vec![json!({"role": "user", "content": "child request"})],
+            )
+            .await;
+        state
+            .record_context_output_with_response(
+                &child.thread.principal_id,
+                "child answer".to_string(),
+                Some("resp_child".to_string()),
+                Vec::new(),
+            )
+            .await;
+
+        let parent_replay = state
+            .replay_plan_for_request(&parent.thread.principal_id, 2, None)
+            .await
+            .input_items;
+        let child_replay = state
+            .replay_plan_for_request(&child.thread.principal_id, 2, None)
+            .await
+            .input_items;
+        assert!(!parent_replay.iter().any(|item| {
+            item.get("role").and_then(Value::as_str) == Some("user")
+                && item_text(item).contains("child request")
+        }));
+        assert!(child_replay.iter().any(|item| {
+            item.get("role").and_then(Value::as_str) == Some("user")
+                && item_text(item).contains("child request")
+        }));
+
+        let parent_view = state
+            .conversation_thread_view(&parent.thread.thread_id)
+            .await
+            .expect("parent view");
+        let child_view = state
+            .conversation_thread_view(&child.thread.thread_id)
+            .await
+            .expect("child view");
+        assert_eq!(
+            parent_view
+                .context
+                .as_ref()
+                .map(|context| context.turns.len()),
+            Some(1)
         );
         assert_eq!(
-            state
-                .replay_context_for(&child.thread.principal_id, 2)
-                .await,
-            None
+            child_view
+                .context
+                .as_ref()
+                .map(|context| context.turns.len()),
+            Some(2)
         );
     }
 
@@ -3236,7 +3381,7 @@ mod tests {
                 title: Some("compact".to_string()),
                 model: Some("gpt-5.4".to_string()),
                 source: Some("test".to_string()),
-                behavior_hints: BehaviorHints::default(),
+                behavior_hints: Default::default(),
             })
             .await
             .expect("start thread");
@@ -3248,6 +3393,7 @@ mod tests {
                     "gpt-5.4",
                     generation,
                     format!("request {generation}"),
+                    vec![json!({"role": "user", "content": format!("request {generation}")})],
                 )
                 .await;
             state
@@ -3269,6 +3415,13 @@ mod tests {
         assert!(context.turns.len() <= 12);
         assert!(context.workflow_spine.contains("compaction_summary"));
         assert!(context.workflow_spine.contains("request 1"));
+        assert_eq!(
+            context
+                .turns
+                .first()
+                .and_then(|turn| turn.synthetic_kind.as_deref()),
+            Some("compaction_summary")
+        );
         assert!(
             context
                 .turns
