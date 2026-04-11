@@ -177,7 +177,7 @@ async fn responses(
     log_model_resolution(&auth.api_key, &requested_model, &effective_model);
     let effective_reasoning_effort =
         resolve_effective_reasoning_for_responses(&auth.api_key, &payload);
-    let payload = apply_responses_policy(
+    let mut payload = apply_responses_policy(
         &payload,
         &effective_model,
         effective_reasoning_effort.as_deref(),
@@ -214,9 +214,18 @@ async fn responses(
     let stream_requested = payload.stream.unwrap_or(false);
     let mut recorded_input = false;
     let context = forward_context(&headers, &routing);
+    let mut queued_same_lease: Option<(CliLease, String)> = None;
+    let mut continuation_recovery = false;
 
-    for attempt in 0..2 {
-        let Some((lease, prompt_cache_key, _warmup)) = selection.take() else {
+    for attempt in 0..4 {
+        let Some((lease, prompt_cache_key)) = queued_same_lease
+            .take()
+            .or_else(|| {
+                selection
+                    .take()
+                    .map(|(lease, prompt_cache_key, _warmup)| (lease, prompt_cache_key))
+            })
+        else {
             log_queue_unavailable(&request_log, &routing, &context, subagent_count);
             return gateway_failure_response(
                 stream_requested,
@@ -224,6 +233,9 @@ async fn responses(
                 GatewayFailureReason::Queue,
             );
         };
+        let execution_guard = state
+            .acquire_execution_guard(auth.tenant.id, &lease.account_id, &model)
+            .await;
         if !recorded_input {
             state
                 .begin_context_turn(
@@ -261,9 +273,15 @@ async fn responses(
             .extra
             .get("previous_response_id")
             .and_then(Value::as_str);
-        let replay_plan = state
-            .replay_plan_for_request(&principal_id, lease.generation, previous_response_id)
-            .await;
+        let replay_plan = if continuation_recovery {
+            state
+                .continuation_recovery_plan_for_request(&principal_id, previous_response_id)
+                .await
+        } else {
+            state
+                .replay_plan_for_request(&principal_id, lease.generation, previous_response_id)
+                .await
+        };
         log_request_attempt(
             &request_log,
             &routing,
@@ -285,7 +303,7 @@ async fn responses(
         };
         let upstream_value = responses_payload_for_upstream(
             &payload,
-            prompt_cache_key,
+            prompt_cache_key.clone(),
             &replay_plan,
             codex_protocol,
             &replayed_tool_calls,
@@ -316,6 +334,7 @@ async fn responses(
                             principal_id.clone(),
                             &model,
                             state.config.heartbeat_seconds,
+                            execution_guard,
                         )
                         .await
                     } else {
@@ -326,12 +345,30 @@ async fn responses(
                             request_log.clone(),
                             principal_id.clone(),
                             &model,
+                            state.config.heartbeat_seconds,
+                            execution_guard,
                         )
+                        .await
                     } {
                         ForwardOutcome::Response(success) => return success.response,
                         ForwardOutcome::HiddenFailure(kind) => {
                             handle_hidden_failure(&state, &lease, kind).await;
-                            if attempt == 0 && kind.requires_failover() {
+                            if previous_response_id.is_some()
+                                && kind == UpstreamFailureKind::Continuation
+                                && !continuation_recovery
+                            {
+                                continuation_recovery = true;
+                                payload.extra.remove("previous_response_id");
+                                queued_same_lease =
+                                    Some((lease.clone(), prompt_cache_key.clone()));
+                                tracing::info!(
+                                    account_id = %lease.account_id,
+                                    principal_id = %principal_id,
+                                    "retrying responses stream on same lease after continuation recovery fallback"
+                                );
+                                continue;
+                            }
+                            if attempt < 3 && kind.requires_failover() {
                                 selection = state.resolve_lease(selection_request.clone()).await;
                                 continue;
                             }
@@ -392,7 +429,21 @@ async fn responses(
                     }
                     ForwardOutcome::HiddenFailure(kind) => {
                         handle_hidden_failure(&state, &lease, kind).await;
-                        if attempt == 0 && kind.requires_failover() {
+                        if previous_response_id.is_some()
+                            && kind == UpstreamFailureKind::Continuation
+                            && !continuation_recovery
+                        {
+                            continuation_recovery = true;
+                            payload.extra.remove("previous_response_id");
+                            queued_same_lease = Some((lease.clone(), prompt_cache_key.clone()));
+                            tracing::info!(
+                                account_id = %lease.account_id,
+                                principal_id = %principal_id,
+                                "retrying responses request on same lease after continuation recovery fallback"
+                            );
+                            continue;
+                        }
+                        if attempt < 3 && kind.requires_failover() {
                             selection = state.resolve_lease(selection_request.clone()).await;
                             continue;
                         }
@@ -415,7 +466,21 @@ async fn responses(
                     body_preview = %truncate_text(error.body.unwrap_or_default(), 160),
                     "responses upstream request failed"
                 );
-                if attempt == 0 && error.kind.requires_failover() {
+                if previous_response_id.is_some()
+                    && error.kind == UpstreamFailureKind::Continuation
+                    && !continuation_recovery
+                {
+                    continuation_recovery = true;
+                    payload.extra.remove("previous_response_id");
+                    queued_same_lease = Some((lease.clone(), prompt_cache_key.clone()));
+                    tracing::info!(
+                        account_id = %lease.account_id,
+                        principal_id = %principal_id,
+                        "retrying responses request on same lease after continuation rejection"
+                    );
+                    continue;
+                }
+                if attempt < 3 && error.kind.requires_failover() {
                     selection = state.resolve_lease(selection_request.clone()).await;
                     continue;
                 }
@@ -599,13 +664,25 @@ async fn forward_responses_ws(
     };
     let mut selection = state.resolve_lease(selection_request.clone()).await;
     let mut recorded_input = false;
+    let mut queued_same_lease: Option<(CliLease, String)> = None;
+    let mut continuation_recovery = false;
 
-    for attempt in 0..2 {
-        let Some((lease, prompt_cache_key, _warmup)) = selection.take() else {
+    for attempt in 0..4 {
+        let Some((lease, prompt_cache_key)) = queued_same_lease
+            .take()
+            .or_else(|| {
+                selection
+                    .take()
+                    .map(|(lease, prompt_cache_key, _warmup)| (lease, prompt_cache_key))
+            })
+        else {
             log_queue_unavailable(&request_log, &routing, &scoped_context, subagent_count);
             send_ws_gateway_failure_response(socket, GatewayFailureReason::Queue).await?;
             return Ok(());
         };
+        let execution_guard = state
+            .acquire_execution_guard(auth.tenant.id, &lease.account_id, &model)
+            .await;
         if !recorded_input {
             state
                 .begin_context_turn(
@@ -640,9 +717,15 @@ async fn forward_responses_ws(
             .extra
             .get("previous_response_id")
             .and_then(Value::as_str);
-        let replay_plan = state
-            .replay_plan_for_request(&principal_id, lease.generation, previous_response_id)
-            .await;
+        let replay_plan = if continuation_recovery {
+            state
+                .continuation_recovery_plan_for_request(&principal_id, previous_response_id)
+                .await
+        } else {
+            state
+                .replay_plan_for_request(&principal_id, lease.generation, previous_response_id)
+                .await
+        };
         log_request_attempt(
             &request_log,
             &routing,
@@ -664,7 +747,7 @@ async fn forward_responses_ws(
         };
         let upstream_value = responses_payload_for_upstream(
             &payload,
-            prompt_cache_key,
+            prompt_cache_key.clone(),
             &replay_plan,
             codex_protocol,
             &replayed_tool_calls,
@@ -690,13 +773,29 @@ async fn forward_responses_ws(
                 request_log.clone(),
                 principal_id.clone(),
                 &model,
+                execution_guard,
+                state.config.heartbeat_seconds,
             )
             .await
             {
                 Ok(()) => return Ok(()),
                 Err(kind) => {
                     handle_hidden_failure(state, &lease, kind).await;
-                    if attempt == 0 && kind.requires_failover() {
+                    if previous_response_id.is_some()
+                        && kind == UpstreamFailureKind::Continuation
+                        && !continuation_recovery
+                    {
+                        continuation_recovery = true;
+                        payload.extra.remove("previous_response_id");
+                        queued_same_lease = Some((lease.clone(), prompt_cache_key.clone()));
+                        tracing::info!(
+                            account_id = %lease.account_id,
+                            principal_id = %principal_id,
+                            "retrying responses websocket on same lease after continuation recovery fallback"
+                        );
+                        continue;
+                    }
+                    if attempt < 3 && kind.requires_failover() {
                         selection = state.resolve_lease(selection_request.clone()).await;
                         continue;
                     }
@@ -719,7 +818,21 @@ async fn forward_responses_ws(
                     body_preview = %truncate_text(error.body.unwrap_or_default(), 160),
                     "responses websocket upstream request failed"
                 );
-                if attempt == 0 && error.kind.requires_failover() {
+                if previous_response_id.is_some()
+                    && error.kind == UpstreamFailureKind::Continuation
+                    && !continuation_recovery
+                {
+                    continuation_recovery = true;
+                    payload.extra.remove("previous_response_id");
+                    queued_same_lease = Some((lease.clone(), prompt_cache_key.clone()));
+                    tracing::info!(
+                        account_id = %lease.account_id,
+                        principal_id = %principal_id,
+                        "retrying responses websocket on same lease after continuation rejection"
+                    );
+                    continue;
+                }
+                if attempt < 3 && error.kind.requires_failover() {
                     selection = state.resolve_lease(selection_request.clone()).await;
                     continue;
                 }
@@ -1171,6 +1284,17 @@ fn request_usage_from_value(value: &Value) -> RequestLogUsage {
                         .or_else(|| details.get("cached_input_tokens"))
                 })
                 .and_then(Value::as_u64)
+                .or_else(|| {
+                    usage
+                        .get("prompt_tokens_details")
+                        .and_then(Value::as_object)
+                        .and_then(|details| {
+                            details
+                                .get("cached_tokens")
+                                .or_else(|| details.get("cached_input_tokens"))
+                        })
+                        .and_then(Value::as_u64)
+                })
                 .or_else(|| usage.get("cache_read_input_tokens").and_then(Value::as_u64))
         })
         .unwrap_or_default();
@@ -1228,7 +1352,10 @@ fn gateway_failure_reason_from_upstream(kind: UpstreamFailureKind) -> GatewayFai
     match kind {
         UpstreamFailureKind::Quota => GatewayFailureReason::Quota,
         UpstreamFailureKind::Capability => GatewayFailureReason::Capability,
-        UpstreamFailureKind::Cf | UpstreamFailureKind::Auth | UpstreamFailureKind::Generic => {
+        UpstreamFailureKind::Cf
+        | UpstreamFailureKind::Auth
+        | UpstreamFailureKind::Continuation
+        | UpstreamFailureKind::Generic => {
             GatewayFailureReason::UpstreamFailure
         }
     }
@@ -1343,6 +1470,8 @@ async fn upstream_stream_to_ws_response(
     request_log: RequestLogSeed,
     principal_id: String,
     expected_model: &str,
+    execution_guard: Option<crate::state::AccountExecutionGuard>,
+    heartbeat_seconds: u64,
 ) -> Result<(), UpstreamFailureKind> {
     let status = response.status();
     let headers = response.headers().clone();
@@ -1350,6 +1479,7 @@ async fn upstream_stream_to_ws_response(
         return Err(kind);
     }
 
+    let _execution_guard = execution_guard;
     let (mut upstream, buffered_records, mut buffer) =
         preflight_response_stream(response, expected_model).await?;
     let mut output_summary = String::new();
@@ -1358,6 +1488,9 @@ async fn upstream_stream_to_ws_response(
     let mut streamed_response_id = None;
     let mut streamed_output_items = BTreeMap::new();
     let mut completed_response = None;
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(heartbeat_seconds.max(1)));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let _ = heartbeat.tick().await;
 
     for record in buffered_records {
         if let Some(value) = response_value_from_sse_record(&record) {
@@ -1380,31 +1513,44 @@ async fn upstream_stream_to_ws_response(
             .map_err(|_| UpstreamFailureKind::Generic)?;
     }
 
-    while let Some(chunk) = upstream.next().await {
-        let chunk = chunk.map_err(|_| UpstreamFailureKind::Generic)?;
-        buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()).replace("\r\n", "\n"));
-        while let Some(record) = take_sse_record(&mut buffer) {
-            if let Some(kind) = hidden_failure_kind_from_sse_record(&record, expected_model) {
-                return Err(kind);
-            }
-            if let Some(value) = response_value_from_sse_record(&record) {
-                merge_request_usage(&mut usage, request_usage_from_value(&value));
-                if observed_model.is_none() {
-                    observed_model = observed_model_from_value(&value);
+    loop {
+        tokio::select! {
+            maybe_chunk = upstream.next() => {
+                let Some(chunk) = maybe_chunk else {
+                    break;
+                };
+                let chunk = chunk.map_err(|_| UpstreamFailureKind::Generic)?;
+                buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()).replace("\r\n", "\n"));
+                while let Some(record) = take_sse_record(&mut buffer) {
+                    if let Some(kind) = hidden_failure_kind_from_sse_record(&record, expected_model) {
+                        return Err(kind);
+                    }
+                    if let Some(value) = response_value_from_sse_record(&record) {
+                        merge_request_usage(&mut usage, request_usage_from_value(&value));
+                        if observed_model.is_none() {
+                            observed_model = observed_model_from_value(&value);
+                        }
+                        capture_stream_response_metadata(
+                            &value,
+                            &mut streamed_response_id,
+                            &mut streamed_output_items,
+                            &mut completed_response,
+                        );
+                    }
+                    if let Some(delta) = response_delta_text(&record) {
+                        output_summary.push_str(delta.as_str());
+                    }
+                    send_ws_record(socket, &record)
+                        .await
+                        .map_err(|_| UpstreamFailureKind::Generic)?;
                 }
-                capture_stream_response_metadata(
-                    &value,
-                    &mut streamed_response_id,
-                    &mut streamed_output_items,
-                    &mut completed_response,
-                );
             }
-            if let Some(delta) = response_delta_text(&record) {
-                output_summary.push_str(delta.as_str());
+            _ = heartbeat.tick() => {
+                socket
+                    .send(Message::Ping(Bytes::new()))
+                    .await
+                    .map_err(|_| UpstreamFailureKind::Generic)?;
             }
-            send_ws_record(socket, &record)
-                .await
-                .map_err(|_| UpstreamFailureKind::Generic)?;
         }
     }
 
@@ -1551,6 +1697,7 @@ async fn send_ws_json(socket: &mut WebSocket, value: &Value) -> Result<(), ()> {
         .map_err(|_| ())
 }
 
+#[cfg(test)]
 fn websocket_failure_response_event(reason: GatewayFailureReason) -> Value {
     let response_id = format!("resp_ws_failed_{}", uuid::Uuid::new_v4().simple());
     json!({
@@ -1736,7 +1883,8 @@ async fn upstream_stream_response(
     request_log: RequestLogSeed,
     principal_id: String,
     expected_model: &str,
-    _heartbeat_seconds: u64,
+    heartbeat_seconds: u64,
+    execution_guard: Option<crate::state::AccountExecutionGuard>,
 ) -> ForwardOutcome {
     let status = response.status();
     let headers = response.headers().clone();
@@ -1752,6 +1900,7 @@ async fn upstream_stream_response(
     let mut builder = Response::builder().status(status);
     copy_upstream_headers(&mut builder, &headers);
     let stream = stream! {
+        let _execution_guard = execution_guard;
         let mut upstream = upstream;
         let mut buffer = initial_buffer;
         let mut had_hidden_failure = false;
@@ -1761,6 +1910,9 @@ async fn upstream_stream_response(
         let mut streamed_response_id = None;
         let mut streamed_output_items = BTreeMap::new();
         let mut completed_response = None;
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(heartbeat_seconds.max(1)));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let _ = heartbeat.tick().await;
 
         for record in buffered_records {
             if let Some(value) = response_value_from_sse_record(&record) {
@@ -1781,38 +1933,48 @@ async fn upstream_stream_response(
             yield Ok::<Bytes, Infallible>(Bytes::from(format!("{record}\n\n")));
         }
 
-        while let Some(chunk) = upstream.next().await {
-            let Ok(chunk) = chunk else {
-                had_hidden_failure = true;
-                handle_hidden_failure(&state, &lease, UpstreamFailureKind::Generic).await;
-                break;
-            };
-            buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()).replace("\r\n", "\n"));
-            while let Some(record) = take_sse_record(&mut buffer) {
-                if let Some(kind) = hidden_failure_kind_from_sse_record(&record, &expected_model) {
-                    had_hidden_failure = true;
-                    handle_hidden_failure(&state, &lease, kind).await;
-                    break;
-                }
-                if let Some(value) = response_value_from_sse_record(&record) {
-                    merge_request_usage(&mut usage, request_usage_from_value(&value));
-                    if observed_model.is_none() {
-                        observed_model = observed_model_from_value(&value);
+        loop {
+            tokio::select! {
+                maybe_chunk = upstream.next() => {
+                    let Some(chunk) = maybe_chunk else {
+                        break;
+                    };
+                    let Ok(chunk) = chunk else {
+                        had_hidden_failure = true;
+                        handle_hidden_failure(&state, &lease, UpstreamFailureKind::Generic).await;
+                        break;
+                    };
+                    buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()).replace("\r\n", "\n"));
+                    while let Some(record) = take_sse_record(&mut buffer) {
+                        if let Some(kind) = hidden_failure_kind_from_sse_record(&record, &expected_model) {
+                            had_hidden_failure = true;
+                            handle_hidden_failure(&state, &lease, kind).await;
+                            break;
+                        }
+                        if let Some(value) = response_value_from_sse_record(&record) {
+                            merge_request_usage(&mut usage, request_usage_from_value(&value));
+                            if observed_model.is_none() {
+                                observed_model = observed_model_from_value(&value);
+                            }
+                            capture_stream_response_metadata(
+                                &value,
+                                &mut streamed_response_id,
+                                &mut streamed_output_items,
+                                &mut completed_response,
+                            );
+                        }
+                        if let Some(delta) = response_delta_text(&record) {
+                            output_summary.push_str(delta.as_str());
+                        }
+                        yield Ok::<Bytes, Infallible>(Bytes::from(format!("{record}\n\n")));
                     }
-                    capture_stream_response_metadata(
-                        &value,
-                        &mut streamed_response_id,
-                        &mut streamed_output_items,
-                        &mut completed_response,
-                    );
+                    if had_hidden_failure {
+                        break;
+                    }
                 }
-                if let Some(delta) = response_delta_text(&record) {
-                    output_summary.push_str(delta.as_str());
+                _ = heartbeat.tick() => {
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(b": heartbeat\n\n"));
                 }
-                yield Ok::<Bytes, Infallible>(Bytes::from(format!("{record}\n\n")));
-            }
-            if had_hidden_failure {
-                break;
             }
         }
 
@@ -1870,112 +2032,27 @@ async fn upstream_stream_response(
     })
 }
 
-fn passthrough_stream_response(
+async fn passthrough_stream_response(
     response: reqwest::Response,
     state: AppState,
     lease: CliLease,
     request_log: RequestLogSeed,
     principal_id: String,
     expected_model: &str,
+    heartbeat_seconds: u64,
+    execution_guard: Option<crate::state::AccountExecutionGuard>,
 ) -> ForwardOutcome {
-    let status = response.status();
-    let headers = response.headers().clone();
-    if let Some(kind) = hidden_failure_kind_from_headers(&headers, expected_model) {
-        return ForwardOutcome::HiddenFailure(kind);
-    }
-    let mut builder = Response::builder().status(status);
-    copy_upstream_headers(&mut builder, &headers);
-    let response = builder
-        .body(Body::from_stream({
-            let headers = headers.clone();
-            stream! {
-                let mut upstream = response.bytes_stream();
-                let mut buffer = String::new();
-                let mut had_error = false;
-                let mut output_summary = String::new();
-                let mut usage = RequestLogUsage::default();
-                let mut observed_model = observed_model_from_headers(&headers);
-                let mut streamed_response_id = None;
-                let mut streamed_output_items = BTreeMap::new();
-                let mut completed_response = None;
-
-                while let Some(chunk) = upstream.next().await {
-                    let Ok(chunk) = chunk else {
-                        had_error = true;
-                        break;
-                    };
-                    buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()).replace("\r\n", "\n"));
-                    while let Some(record) = take_sse_record(&mut buffer) {
-                        if let Some(value) = response_value_from_sse_record(&record) {
-                            merge_request_usage(&mut usage, request_usage_from_value(&value));
-                            if observed_model.is_none() {
-                                observed_model = observed_model_from_value(&value);
-                            }
-                            capture_stream_response_metadata(
-                                &value,
-                                &mut streamed_response_id,
-                                &mut streamed_output_items,
-                                &mut completed_response,
-                            );
-                        }
-                        if let Some(delta) = response_delta_text(&record) {
-                            output_summary.push_str(delta.as_str());
-                        }
-                    }
-                    yield Ok::<Bytes, std::io::Error>(chunk);
-                }
-
-                if had_error {
-                    state.discard_pending_context_turn(&principal_id).await;
-                }
-                if !had_error {
-                    let _ = state
-                        .record_route_event(
-                            &lease.account_id,
-                            RouteEventRequest {
-                                mode: lease.route_mode,
-                                kind: "success".to_string(),
-                            },
-                        )
-                        .await;
-                    let summary = if output_summary.trim().is_empty() {
-                        "streamed assistant response delivered".to_string()
-                    } else {
-                        truncate_text(output_summary, 240)
-                    };
-                    let completed_response = finalize_stream_response(
-                        completed_response,
-                        streamed_response_id,
-                        streamed_output_items,
-                    );
-                    state
-                        .record_context_output_with_response(
-                            &principal_id,
-                            summary,
-                            completed_response.as_ref().and_then(response_id_from_value),
-                            completed_response
-                                .as_ref()
-                                .map(response_output_items_from_value)
-                                .unwrap_or_default(),
-                        )
-                        .await;
-                    state
-                        .record_request_log(build_request_log_entry(
-                            &request_log,
-                            &lease,
-                            status.as_u16(),
-                            usage,
-                            observed_model,
-                        ))
-                        .await;
-                }
-            }
-        }))
-        .unwrap_or_else(|_| Response::new(Body::from("upstream stream error")));
-    ForwardOutcome::Response(ForwardSuccess {
+    upstream_stream_response(
         response,
-        ..ForwardSuccess::default()
-    })
+        state,
+        lease,
+        request_log,
+        principal_id,
+        expected_model,
+        heartbeat_seconds,
+        execution_guard,
+    )
+    .await
 }
 
 async fn upstream_responses_stream_to_chat_response(
@@ -2274,6 +2351,7 @@ async fn handle_hidden_failure(state: &AppState, lease: &CliLease, kind: Upstrea
                 )
                 .await;
         }
+        UpstreamFailureKind::Continuation => {}
         UpstreamFailureKind::Generic => {}
     }
 }
@@ -2406,6 +2484,17 @@ fn hidden_failure_kind_from_code(value: &str) -> Option<UpstreamFailureKind> {
         return Some(UpstreamFailureKind::Auth);
     }
     if [
+        "previous_response_id",
+        "previous response id",
+        "previous_response_not_found",
+        "previous response not found",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+    {
+        return Some(UpstreamFailureKind::Continuation);
+    }
+    if [
         "does not support",
         "unsupported",
         "unknown_model",
@@ -2452,7 +2541,9 @@ fn sse_resolved_event_name(record: &str) -> Option<String> {
 fn is_stream_release_event(event_name: &str) -> bool {
     matches!(
         event_name,
-        "response.output_text.delta"
+        "response.created"
+            | "response.in_progress"
+            | "response.output_text.delta"
             | "response.output_item.added"
             | "response.output_item.done"
             | "response.function_call_arguments.delta"
@@ -4056,6 +4147,7 @@ mod tests {
                 browser_assist_url: "http://127.0.0.1:8090".to_string(),
                 heartbeat_seconds: 5,
                 enable_demo_seed: false,
+                account_encryption_key: None,
                 direct_proxy_url: None,
                 warp_proxy_url: None,
                 browser_assist_direct_proxy_url: None,
@@ -4102,6 +4194,25 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn request_usage_reads_cached_tokens_from_prompt_details() {
+        let usage = request_usage_from_value(&json!({
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 48,
+                "total_tokens": 168,
+                "prompt_tokens_details": {
+                    "cached_tokens": 32
+                }
+            }
+        }));
+
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.cached_input_tokens, 32);
+        assert_eq!(usage.output_tokens, 48);
+        assert_eq!(usage.total_tokens, 168);
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub struct Config {
     pub browser_assist_url: String,
     pub heartbeat_seconds: u64,
     pub enable_demo_seed: bool,
+    pub account_encryption_key: Option<String>,
     pub direct_proxy_url: Option<String>,
     pub warp_proxy_url: Option<String>,
     pub browser_assist_direct_proxy_url: Option<String>,
@@ -58,6 +59,10 @@ impl Config {
                 .ok()
                 .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
                 .unwrap_or(false),
+            account_encryption_key: std::env::var("CMGR_ACCOUNT_ENCRYPTION_KEY")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             direct_proxy_url: read_proxy_env("CMGR_DIRECT_PROXY_URL"),
             warp_proxy_url: read_proxy_env("CMGR_WARP_PROXY_URL"),
             browser_assist_direct_proxy_url: read_proxy_env("CMGR_BROWSER_ASSIST_DIRECT_PROXY_URL"),

@@ -29,6 +29,7 @@ pub enum UpstreamFailureKind {
     Auth,
     Quota,
     Capability,
+    Continuation,
     Generic,
 }
 
@@ -43,6 +44,7 @@ impl UpstreamFailureKind {
             Self::Auth => 300,
             Self::Quota => 1800,
             Self::Capability => 300,
+            Self::Continuation => 0,
             Self::Generic => 0,
         }
     }
@@ -53,6 +55,7 @@ impl UpstreamFailureKind {
             Self::Auth => "auth",
             Self::Quota => "quota",
             Self::Capability => "capability",
+            Self::Continuation => "continuation",
             Self::Generic => "generic",
         }
     }
@@ -382,6 +385,17 @@ pub fn classify_failure_body(body: &str) -> Option<UpstreamFailureKind> {
         return Some(UpstreamFailureKind::Quota);
     }
     if [
+        "previous_response_id",
+        "previous response id",
+        "previous_response_not_found",
+        "previous response not found",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+    {
+        return Some(UpstreamFailureKind::Continuation);
+    }
+    if [
         "reasoning_effort",
         "does not support",
         "unsupported",
@@ -475,6 +489,7 @@ mod tests {
             browser_assist_url: "http://127.0.0.1:8090".to_string(),
             heartbeat_seconds: 5,
             enable_demo_seed: false,
+            account_encryption_key: None,
             direct_proxy_url: None,
             warp_proxy_url: None,
             browser_assist_direct_proxy_url: None,
@@ -486,6 +501,7 @@ mod tests {
             bearer_token: "secret".to_string(),
             chatgpt_account_id: Some("acct-live".to_string()),
             extra_headers: vec![("x-test-header".to_string(), "present".to_string())],
+            managed_auth: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -574,6 +590,7 @@ mod tests {
             browser_assist_url: "http://127.0.0.1:8090".to_string(),
             heartbeat_seconds: 5,
             enable_demo_seed: false,
+            account_encryption_key: None,
             direct_proxy_url: None,
             warp_proxy_url: None,
             browser_assist_direct_proxy_url: None,
@@ -585,6 +602,7 @@ mod tests {
             bearer_token: "secret".to_string(),
             chatgpt_account_id: None,
             extra_headers: Vec::new(),
+            managed_auth: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -710,6 +728,29 @@ mod tests {
             ),
             UpstreamFailureKind::Capability
         );
+    }
+
+    #[test]
+    fn classify_failure_detects_continuation_rejections() {
+        let headers = reqwest::header::HeaderMap::new();
+
+        assert_eq!(
+            classify_failure(
+                StatusCode::BAD_REQUEST,
+                &headers,
+                "{\"error\":{\"message\":\"Unsupported parameter: previous_response_id\"}}"
+            ),
+            UpstreamFailureKind::Continuation
+        );
+        assert_eq!(
+            classify_failure(
+                StatusCode::BAD_REQUEST,
+                &headers,
+                "{\"error\":{\"code\":\"previous_response_not_found\",\"message\":\"Previous response not found\"}}"
+            ),
+            UpstreamFailureKind::Continuation
+        );
+        assert!(!UpstreamFailureKind::Continuation.requires_failover());
     }
 
     #[test]

@@ -1,23 +1,24 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{Value, json};
 use tokio::{
-    sync::{RwLock, mpsc, mpsc::error::TryRecvError},
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore, mpsc, mpsc::error::TryRecvError},
     time::Duration,
 };
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::models::{
-    AccountRouteState, AccountSummary, BehaviorProfile, BillingSummary, CacheMetrics, CfIncident,
-    CliLease, CompactConversationThreadRequest, ContextTurn, ConversationContext,
-    ConversationThread, ConversationThreadView, CreateGatewayApiKeyRequest,
-    CreateGatewayUserRequest, CreateTenantRequest, CreatedGatewayApiKey, CreatedGatewayUser,
-    DashboardCounts, DashboardSnapshot, EgressSlot, ForkConversationThreadRequest, GatewayApiKey,
-    GatewayApiKeyView, GatewayUserRole, GatewayUserView, ImportAccountRequest,
-    LeaseSelectionRequest, OpenAiLoginCompleteRequest, OpenAiLoginSessionView,
+    AccountRouteState, AccountSummary, BehaviorProfile, BillingSummary, CacheMetrics,
+    CodexAppSessionRequest, CodexAppSessionResponse, CfIncident, CliLease,
+    CompactConversationThreadRequest, ContextTurn, ConversationContext, ConversationThread,
+    ConversationThreadView, CreateGatewayApiKeyRequest, CreateGatewayUserRequest,
+    CreateTenantRequest, CreatedGatewayApiKey, CreatedGatewayUser, DashboardCounts,
+    DashboardLiveSnapshot, DashboardSnapshot, EgressSlot, ForkConversationThreadRequest,
+    GatewayApiKey, GatewayApiKeyView, GatewayUserRole, GatewayUserView, ImportAccountRequest,
+    LeaseSelectionRequest, ManagedAuthState, OpenAiLoginCompleteRequest, OpenAiLoginSessionView,
     OpenAiLoginStartRequest, OpenAiLoginStartResponse, PendingContextTurn, RequestLogEntry,
     RouteEventRequest, RouteMode, SchedulingSignals, StartConversationThreadRequest, Tenant,
     ThreadEdge, TopologyNode, TurnOutcome, UpdateGatewayUserRequest, UpstreamAccount,
@@ -57,6 +58,32 @@ pub(crate) struct OpenAiLoginSessionState {
     base_url: String,
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CodexAppSessionState {
+    pub(crate) tenant_id: Uuid,
+    pub(crate) account_id: String,
+    pub(crate) expires_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug)]
+pub struct AccountExecutionGuard {
+    account_id: String,
+    inflight: Arc<StdMutex<HashMap<String, u32>>>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Drop for AccountExecutionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut inflight) = self.inflight.lock() {
+            let entry = inflight.entry(self.account_id.clone()).or_default();
+            *entry = entry.saturating_sub(1);
+            if *entry == 0 {
+                inflight.remove(&self.account_id);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -100,6 +127,10 @@ pub struct RuntimeState {
     pub thread_edges: RwLock<Vec<ThreadEdge>>,
     pub request_logs: RwLock<Vec<RequestLogEntry>>,
     pub(crate) openai_login_sessions: RwLock<HashMap<String, OpenAiLoginSessionState>>,
+    pub(crate) codex_app_sessions: RwLock<HashMap<String, CodexAppSessionState>>,
+    pub(crate) execution_gates: Arc<StdMutex<HashMap<String, Arc<Semaphore>>>>,
+    pub(crate) execution_inflight: Arc<StdMutex<HashMap<String, u32>>>,
+    pub(crate) ephemeral_refresh_tokens: RwLock<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -475,6 +506,7 @@ impl AppState {
                         0
                     },
                     cooldown_until: None,
+                    cooldown_reason: None,
                     warp_entered_at: if account.current_mode == RouteMode::Warp {
                         Some(Utc::now())
                     } else {
@@ -573,6 +605,7 @@ impl AppState {
             subtitle:
                 "Responses-first, lease-bound routing, dual-candidate selection, and warp-aware recovery."
                     .to_string(),
+            refreshed_at: Utc::now(),
             topology: vec![
                 TopologyNode {
                     name: "web".to_string(),
@@ -1567,10 +1600,17 @@ impl AppState {
                     egress_stability: Some(0.85),
                     base_url: Some(session.base_url.clone()),
                     bearer_token: Some(tokens.access_token),
-                    chatgpt_account_id,
+                    chatgpt_account_id: chatgpt_account_id.clone(),
                     extra_headers: None,
                 })
                 .await;
+            self.attach_managed_openai_auth(
+                &account.id,
+                claims.email.clone(),
+                chatgpt_account_id.clone(),
+                tokens.refresh_token.clone(),
+            )
+            .await?;
             Ok::<UpstreamAccount, String>(account)
         }
         .await;
@@ -1623,6 +1663,7 @@ impl AppState {
             warp_cf_streak: 0,
             cooldown_level: 0,
             cooldown_until: None,
+            cooldown_reason: None,
             warp_entered_at: None,
             last_cf_at: None,
             success_streak: 0,
@@ -1669,6 +1710,453 @@ impl AppState {
             .await
             .get(account_id)
             .cloned()
+    }
+
+    pub async fn attach_managed_openai_auth(
+        &self,
+        account_id: &str,
+        email: Option<String>,
+        chatgpt_account_id: Option<String>,
+        refresh_token: Option<String>,
+    ) -> Result<(), String> {
+        let refresh_token = refresh_token
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let refresh_token_encrypted = match (
+            refresh_token.as_deref(),
+            self.config.account_encryption_key.as_deref(),
+        ) {
+            (Some(token), Some(secret)) => Some(openai_auth::encrypt_secret(secret, token)?),
+            (Some(token), None) => {
+                self.runtime
+                    .ephemeral_refresh_tokens
+                    .write()
+                    .await
+                    .insert(account_id.to_string(), token.to_string());
+                None
+            }
+            (None, _) => None,
+        };
+
+        let snapshot = {
+            let mut credentials = self.runtime.credentials.write().await;
+            let credential = credentials
+                .get_mut(account_id)
+                .ok_or_else(|| "账号凭证不存在。".to_string())?;
+            if let Some(chatgpt_account_id) = chatgpt_account_id
+                .filter(|value| !value.trim().is_empty())
+            {
+                credential.chatgpt_account_id = Some(chatgpt_account_id);
+            }
+            let mut managed_auth = credential.managed_auth.clone().unwrap_or_default();
+            managed_auth.email = email;
+            managed_auth.refresh_token_encrypted = refresh_token_encrypted;
+            credential.managed_auth = Some(managed_auth);
+            credential.updated_at = Utc::now();
+            credential.clone()
+        };
+
+        self.enqueue(PersistenceMessage::CredentialUpsert(snapshot.clone()))
+            .await;
+        self.refresh_managed_account(account_id, false).await?;
+        Ok(())
+    }
+
+    pub async fn refresh_stale_managed_accounts(
+        &self,
+        max_staleness: Duration,
+    ) -> Result<(), String> {
+        let threshold = Utc::now()
+            - ChronoDuration::from_std(max_staleness)
+                .unwrap_or_else(|_| ChronoDuration::seconds(0));
+        let account_ids = self
+            .runtime
+            .credentials
+            .read()
+            .await
+            .values()
+            .filter(|credential| {
+                credential
+                    .managed_auth
+                    .as_ref()
+                    .and_then(|managed| managed.last_refreshed_at)
+                    .map(|refreshed_at| refreshed_at < threshold)
+                    .unwrap_or(true)
+            })
+            .map(|credential| credential.account_id.clone())
+            .collect::<Vec<_>>();
+
+        for account_id in account_ids {
+            let _ = self.refresh_managed_account(&account_id, false).await;
+        }
+        Ok(())
+    }
+
+    pub async fn refresh_managed_account(
+        &self,
+        account_id: &str,
+        force_token_refresh: bool,
+    ) -> Result<(), String> {
+        let Some(mut credential) = self.credential_for_account(account_id).await else {
+            return Err("账号凭证不存在。".to_string());
+        };
+        if credential.managed_auth.is_none() {
+            return Ok(());
+        }
+
+        let maybe_refresh_token = self.managed_refresh_token_for(&credential).await?;
+        let mut access_token = credential.bearer_token.clone();
+        let mut refreshed_access_token = false;
+
+        if force_token_refresh {
+            if let Some(refresh_token) = maybe_refresh_token.as_deref() {
+                let refreshed = openai_auth::refresh_access_token(refresh_token).await?;
+                if let Some(rotated_refresh_token) = refreshed.refresh_token.as_deref() {
+                    self.attach_rotated_refresh_token(account_id, rotated_refresh_token)
+                        .await?;
+                }
+                if credential.chatgpt_account_id.is_none() {
+                    credential.chatgpt_account_id = openai_auth::extract_chatgpt_account_id(
+                        &refreshed.access_token,
+                    );
+                }
+                if let Some(plan_type) =
+                    openai_auth::extract_plan_type_from_token(&refreshed.access_token)
+                {
+                    if let Some(managed) = credential.managed_auth.as_mut() {
+                        managed.plan_type = Some(plan_type);
+                    }
+                }
+                access_token = refreshed.access_token;
+                refreshed_access_token = true;
+            }
+        }
+
+        let fetched = openai_auth::fetch_managed_chatgpt_snapshot(
+            &credential.base_url,
+            &access_token,
+            credential.chatgpt_account_id.as_deref(),
+        )
+        .await;
+
+        let snapshot = match fetched {
+            Ok(snapshot) => snapshot,
+            Err(error) if error.unauthorized && maybe_refresh_token.is_some() && !refreshed_access_token => {
+                let refreshed =
+                    openai_auth::refresh_access_token(maybe_refresh_token.as_deref().unwrap_or_default())
+                        .await?;
+                access_token = refreshed.access_token;
+                if let Some(rotated_refresh_token) = refreshed.refresh_token.as_deref() {
+                    self.attach_rotated_refresh_token(account_id, rotated_refresh_token)
+                        .await?;
+                }
+                openai_auth::fetch_managed_chatgpt_snapshot(
+                    &credential.base_url,
+                    &access_token,
+                    credential.chatgpt_account_id.as_deref(),
+                )
+                .await
+                .map_err(|error| error.message)?
+            }
+            Err(error) => return Err(error.message),
+        };
+
+        let managed_snapshot = {
+            let mut credentials = self.runtime.credentials.write().await;
+            let credential = credentials
+                .get_mut(account_id)
+                .ok_or_else(|| "账号凭证不存在。".to_string())?;
+            credential.bearer_token = access_token;
+            if let Some(chatgpt_account_id) = snapshot.chatgpt_account_id.clone() {
+                credential.chatgpt_account_id = Some(chatgpt_account_id);
+            }
+            let managed = credential.managed_auth.get_or_insert_with(ManagedAuthState::default);
+            managed.email = snapshot.email.or_else(|| managed.email.clone());
+            managed.plan_type = snapshot.plan_type.or_else(|| managed.plan_type.clone());
+            managed.workspace_role = snapshot.workspace_role.or_else(|| managed.workspace_role.clone());
+            managed.is_workspace_owner = snapshot
+                .is_workspace_owner
+                .or(managed.is_workspace_owner);
+            managed.rate_limits = snapshot.rate_limits.clone();
+            managed.rate_limits_by_limit_id = snapshot.rate_limits_by_limit_id.clone();
+            managed.last_refreshed_at = Some(Utc::now());
+            credential.updated_at = Utc::now();
+            credential.clone()
+        };
+
+        self.apply_managed_rate_limits_to_account(account_id, managed_snapshot.managed_auth.as_ref())
+            .await;
+        self.enqueue(PersistenceMessage::CredentialUpsert(managed_snapshot))
+            .await;
+        Ok(())
+    }
+
+    async fn attach_rotated_refresh_token(
+        &self,
+        account_id: &str,
+        refresh_token: &str,
+    ) -> Result<(), String> {
+        let refresh_token_encrypted = match self.config.account_encryption_key.as_deref() {
+            Some(secret) => Some(openai_auth::encrypt_secret(secret, refresh_token)?),
+            None => {
+                self.runtime
+                    .ephemeral_refresh_tokens
+                    .write()
+                    .await
+                    .insert(account_id.to_string(), refresh_token.to_string());
+                None
+            }
+        };
+
+        let snapshot = {
+            let mut credentials = self.runtime.credentials.write().await;
+            let credential = credentials
+                .get_mut(account_id)
+                .ok_or_else(|| "账号凭证不存在。".to_string())?;
+            let managed = credential
+                .managed_auth
+                .get_or_insert_with(ManagedAuthState::default);
+            managed.refresh_token_encrypted = refresh_token_encrypted;
+            credential.updated_at = Utc::now();
+            credential.clone()
+        };
+
+        self.enqueue(PersistenceMessage::CredentialUpsert(snapshot))
+            .await;
+        Ok(())
+    }
+
+    async fn managed_refresh_token_for(
+        &self,
+        credential: &UpstreamCredential,
+    ) -> Result<Option<String>, String> {
+        if let Some(token) = self
+            .runtime
+            .ephemeral_refresh_tokens
+            .read()
+            .await
+            .get(&credential.account_id)
+            .cloned()
+        {
+            return Ok(Some(token));
+        }
+        let Some(managed) = credential.managed_auth.as_ref() else {
+            return Ok(None);
+        };
+        let Some(ciphertext) = managed.refresh_token_encrypted.as_deref() else {
+            return Ok(None);
+        };
+        let Some(secret) = self.config.account_encryption_key.as_deref() else {
+            return Ok(None);
+        };
+        openai_auth::decrypt_secret(secret, ciphertext).map(Some)
+    }
+
+    async fn apply_managed_rate_limits_to_account(
+        &self,
+        account_id: &str,
+        managed_auth: Option<&ManagedAuthState>,
+    ) {
+        let Some(rate_limits) = managed_auth.and_then(|managed| managed.rate_limits.as_ref()) else {
+            return;
+        };
+        let primary = rate_limits.primary.as_ref();
+        let secondary = rate_limits.secondary.as_ref();
+        let default_headroom = primary
+            .map(|window| 1.0 - (window.used_percent as f64 / 100.0))
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        let mut quota_headroom_5h = default_headroom;
+        let mut quota_headroom_7d = default_headroom;
+        for window in [primary, secondary].into_iter().flatten() {
+            let headroom = (1.0 - (window.used_percent as f64 / 100.0)).clamp(0.0, 1.0);
+            match window.window_duration_mins {
+                Some(minutes) if minutes <= 300 => quota_headroom_5h = headroom,
+                Some(minutes) if minutes >= 10_080 => quota_headroom_7d = headroom,
+                _ => {}
+            }
+        }
+
+        let updated = {
+            let mut accounts = self.runtime.accounts.write().await;
+            let Some(account) = accounts.get_mut(account_id) else {
+                return;
+            };
+            account.signals.quota_headroom = default_headroom;
+            account.signals.quota_headroom_5h = quota_headroom_5h;
+            account.signals.quota_headroom_7d = quota_headroom_7d;
+            account.clone()
+        };
+
+        self.enqueue(PersistenceMessage::AccountUpsert(updated)).await;
+    }
+
+    pub async fn dashboard_live_snapshot(&self) -> DashboardLiveSnapshot {
+        let _ = self
+            .refresh_stale_managed_accounts(Duration::from_secs(30))
+            .await;
+        let snapshot = self.dashboard_snapshot().await;
+        DashboardLiveSnapshot {
+            refreshed_at: Utc::now(),
+            cache_metrics: snapshot.cache_metrics,
+            accounts: snapshot.accounts,
+            leases: snapshot.leases,
+            request_logs: snapshot.request_logs,
+            billing: snapshot.billing,
+        }
+    }
+
+    pub async fn create_codex_app_session(
+        &self,
+        request: CodexAppSessionRequest,
+        authorized_tenant_id: Uuid,
+        websocket_url: String,
+    ) -> Result<CodexAppSessionResponse, String> {
+        let tenant_id = if let Some(tenant_id) = request.tenant_id {
+            if tenant_id != authorized_tenant_id {
+                return Err("指定租户与当前 API Key 不匹配。".to_string());
+            }
+            tenant_id
+        } else {
+            authorized_tenant_id
+        };
+        let account_id = if let Some(account_id) = request.account_id {
+            let accounts = self.runtime.accounts.read().await;
+            let credentials = self.runtime.credentials.read().await;
+            let account = accounts
+                .get(&account_id)
+                .ok_or_else(|| "指定账号不存在。".to_string())?;
+            if account.tenant_id != tenant_id {
+                return Err("指定账号不属于当前租户。".to_string());
+            }
+            let credential = credentials
+                .get(&account_id)
+                .ok_or_else(|| "指定账号缺少凭证。".to_string())?;
+            if credential.managed_auth.is_none() {
+                return Err("指定账号不是 ChatGPT 受管账号。".to_string());
+            }
+            account_id
+        } else {
+            let accounts = self.runtime.accounts.read().await.clone();
+            self.runtime
+                .credentials
+                .read()
+                .await
+                .values()
+                .find(|credential| {
+                    credential
+                        .managed_auth
+                        .is_some()
+                        && accounts
+                            .get(&credential.account_id)
+                            .is_some_and(|account| account.tenant_id == tenant_id)
+                })
+                .map(|credential| credential.account_id.clone())
+                .ok_or_else(|| "没有可用的 ChatGPT 受管账号。".to_string())?
+        };
+        self.refresh_managed_account(&account_id, false).await?;
+        let token = openai_auth::generate_state();
+        let expires_at = Utc::now() + ChronoDuration::minutes(10);
+        let session = CodexAppSessionState {
+            tenant_id,
+            account_id: account_id.clone(),
+            expires_at,
+        };
+        self.runtime
+            .codex_app_sessions
+            .write()
+            .await
+            .insert(token.clone(), session);
+        Ok(CodexAppSessionResponse {
+            account_id,
+            remote_app_server_url: websocket_url,
+            remote_app_server_auth_token: token,
+            expires_at,
+        })
+    }
+
+    pub(crate) async fn codex_app_session_for_token(
+        &self,
+        token: &str,
+    ) -> Option<CodexAppSessionState> {
+        let now = Utc::now();
+        let mut sessions = self.runtime.codex_app_sessions.write().await;
+        sessions.retain(|_, session| session.expires_at > now);
+        sessions.get(token).cloned()
+    }
+
+    pub async fn acquire_execution_guard(
+        &self,
+        tenant_id: Uuid,
+        account_id: &str,
+        model: &str,
+    ) -> Option<AccountExecutionGuard> {
+        if !self
+            .should_serialize_account_execution(tenant_id, account_id, model)
+            .await
+        {
+            return None;
+        }
+
+        let semaphore = {
+            let mut gates = self.runtime.execution_gates.lock().ok()?;
+            gates.entry(account_id.to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(1)))
+                .clone()
+        };
+        let permit = semaphore.acquire_owned().await.ok()?;
+        if let Ok(mut inflight) = self.runtime.execution_inflight.lock() {
+            *inflight.entry(account_id.to_string()).or_default() += 1;
+        }
+        Some(AccountExecutionGuard {
+            account_id: account_id.to_string(),
+            inflight: self.runtime.execution_inflight.clone(),
+            _permit: permit,
+        })
+    }
+
+    async fn should_serialize_account_execution(
+        &self,
+        tenant_id: Uuid,
+        account_id: &str,
+        model: &str,
+    ) -> bool {
+        let credentials = self.runtime.credentials.read().await;
+        let accounts = self.runtime.accounts.read().await;
+        let matching = accounts
+            .values()
+            .filter(|account| {
+                account.tenant_id == tenant_id
+                    && account.models.iter().any(|candidate| candidate == model)
+                    && credentials.contains_key(&account.id)
+            })
+            .count();
+        matching == 1 && accounts.contains_key(account_id)
+    }
+
+    async fn should_protect_sole_account(
+        &self,
+        account_id: &str,
+        model: Option<&str>,
+    ) -> bool {
+        let Some(account) = self.runtime.accounts.read().await.get(account_id).cloned() else {
+            return false;
+        };
+        let credentials = self.runtime.credentials.read().await;
+        self.runtime
+            .accounts
+            .read()
+            .await
+            .values()
+            .filter(|candidate| {
+                candidate.tenant_id == account.tenant_id
+                    && credentials.contains_key(&candidate.id)
+                    && model
+                        .map(|model| candidate.models.iter().any(|entry| entry == model))
+                        .unwrap_or(true)
+            })
+            .count()
+            == 1
     }
 
     pub async fn near_quota_guard_enabled(&self, account_id: &str) -> bool {
@@ -1881,6 +2369,7 @@ impl AppState {
                 }
                 "success" => {
                     register_success(state, now);
+                    state.cooldown_reason = None;
                     (state.clone(), None, false, false)
                 }
                 _ => return Some(state.clone()),
@@ -1921,7 +2410,8 @@ impl AppState {
         if let Some(incident) = incident {
             messages.push(PersistenceMessage::IncidentInsert(incident));
         }
-        if should_failover {
+        let protected_sole_account = self.should_protect_sole_account(account_id, None).await;
+        if should_failover && !protected_sole_account {
             let evicted_leases = self.evict_leases_for_account(account_id).await;
             messages.extend(
                 evicted_leases
@@ -1968,12 +2458,18 @@ impl AppState {
         should_recover: bool,
     ) -> Option<AccountRouteState> {
         let now = Utc::now();
+        let protected_sole_account = self.should_protect_sole_account(account_id, None).await;
         let state_snapshot = {
             let mut route_states = self.runtime.route_states.write().await;
             let state = route_states.get_mut(account_id)?;
             state.success_streak = 0;
-            state.cooldown_until = Some(now + ChronoDuration::seconds(cooldown_seconds));
+            state.cooldown_until = if protected_sole_account && severity != "quota" {
+                None
+            } else {
+                Some(now + ChronoDuration::seconds(cooldown_seconds))
+            };
             state.cooldown_level = state.cooldown_level.max(1);
+            state.cooldown_reason = Some(severity.to_string());
             state.last_cf_at = Some(now);
             state.clone()
         };
@@ -2001,7 +2497,11 @@ impl AppState {
             incidents.truncate(128);
         }
 
-        let evicted_leases = self.evict_leases_for_account(account_id).await;
+        let evicted_leases = if protected_sole_account && severity != "quota" {
+            Vec::new()
+        } else {
+            self.evict_leases_for_account(account_id).await
+        };
         let mut messages = vec![
             PersistenceMessage::AccountUpsert(account_snapshot),
             PersistenceMessage::RouteStateUpsert(state_snapshot.clone()),
@@ -2113,15 +2613,25 @@ impl AppState {
             .keys()
             .cloned()
             .collect::<HashSet<_>>();
-        let mut candidate_accounts = accounts
+        let tenant_model_accounts = accounts
             .iter()
             .filter(|account| {
                 account.tenant_id == request.tenant_id
                     && credentialed_accounts.contains(account.id.as_str())
                     && account.models.iter().any(|model| model == &request.model)
-                    && route_states
-                        .get(account.id.as_str())
-                        .is_some_and(|route_state| !is_in_cooldown(route_state, now))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let sole_protected_account_id = (tenant_model_accounts.len() == 1)
+            .then(|| tenant_model_accounts[0].id.clone());
+        let mut candidate_accounts = tenant_model_accounts
+            .iter()
+            .filter(|account| {
+                route_states.get(account.id.as_str()).is_some_and(|route_state| {
+                    !is_in_cooldown(route_state, now)
+                        || (sole_protected_account_id.as_deref() == Some(account.id.as_str())
+                            && route_state.cooldown_reason.as_deref() != Some("quota"))
+                })
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -2137,7 +2647,9 @@ impl AppState {
                 route_states.get(existing.account_id.as_str()),
             ) {
                 if credentialed_accounts.contains(account.id.as_str())
-                    && should_reuse_lease(existing, account, route_state)
+                    && (should_reuse_lease(existing, account, route_state)
+                        || (sole_protected_account_id.as_deref() == Some(account.id.as_str())
+                            && route_state.cooldown_reason.as_deref() != Some("quota")))
                     && account.models.contains(&request.model)
                 {
                     let lease_snapshot = {
@@ -2330,6 +2842,46 @@ impl AppState {
         }
 
         ReplayPlan::default()
+    }
+
+    pub async fn continuation_recovery_plan_for_request(
+        &self,
+        principal_id: &str,
+        previous_response_id: Option<&str>,
+    ) -> ReplayPlan {
+        let previous_response_id = previous_response_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let contexts = self.runtime.conversation_contexts.read().await;
+        let Some(context) = contexts.get(principal_id) else {
+            return ReplayPlan {
+                drop_previous_response_id: true,
+                ..ReplayPlan::default()
+            };
+        };
+        let effective_turns = Self::recent_successful_turns(context);
+        if let Some(input_items) = Self::build_structured_replay_items(&effective_turns) {
+            return ReplayPlan {
+                fallback_text: Some(format!(
+                    "[cmgr continuation recovery]\nturns={}\nitems={}",
+                    effective_turns.len(),
+                    input_items.len()
+                )),
+                input_items,
+                drop_previous_response_id: true,
+            };
+        }
+        ReplayPlan {
+            input_items: Vec::new(),
+            fallback_text: Self::build_replay_context_block(
+                context,
+                /*generation*/ 1,
+                "continuation_recovery",
+                previous_response_id,
+                effective_turns,
+            ),
+            drop_previous_response_id: true,
+        }
     }
 
     #[allow(dead_code)]
@@ -2572,12 +3124,19 @@ impl AppState {
         accounts.sort_by(|left, right| left.label.cmp(&right.label));
         let route_states = self.runtime.route_states.read().await.clone();
         let credentials = self.runtime.credentials.read().await.clone();
+        let execution_inflight = self
+            .runtime
+            .execution_inflight
+            .lock()
+            .map(|counts| counts.clone())
+            .unwrap_or_default();
 
         accounts
             .into_iter()
             .map(|account| {
                 let route_state = route_states.get(account.id.as_str()).cloned();
                 let credential = credentials.get(account.id.as_str()).cloned();
+                let managed = credential.as_ref().and_then(|credential| credential.managed_auth.as_ref());
                 let resolved_route_mode = route_state
                     .as_ref()
                     .map(|route_state| route_state.route_mode)
@@ -2614,7 +3173,7 @@ impl AppState {
                     near_quota_guard_enabled: account.signals.near_quota_guard_enabled(),
                     health_score: account.signals.health_score,
                     egress_stability: account.signals.egress_stability,
-                    inflight: account.signals.inflight,
+                    inflight: execution_inflight.get(&account.id).copied().unwrap_or(account.signals.inflight),
                     capacity: account.signals.capacity,
                     has_credential: credential.is_some(),
                     base_url: credential
@@ -2623,6 +3182,16 @@ impl AppState {
                     chatgpt_account_id: credential
                         .as_ref()
                         .and_then(|credential| credential.chatgpt_account_id.clone()),
+                    auth_mode: managed.map(|_| "chatgpt".to_string()),
+                    chatgpt_email: managed.and_then(|managed| managed.email.clone()),
+                    plan_type: managed.and_then(|managed| managed.plan_type.clone()),
+                    workspace_role: managed.and_then(|managed| managed.workspace_role.clone()),
+                    is_workspace_owner: managed.and_then(|managed| managed.is_workspace_owner),
+                    rate_limits: managed.and_then(|managed| managed.rate_limits.clone()),
+                    rate_limits_by_limit_id: managed
+                        .map(|managed| managed.rate_limits_by_limit_id.clone())
+                        .unwrap_or_default(),
+                    managed_state_refreshed_at: managed.and_then(|managed| managed.last_refreshed_at),
                     egress_group: self.egress_group_label(resolved_route_mode),
                     proxy_enabled: self.route_mode_uses_proxy(resolved_route_mode),
                 }
@@ -2874,6 +3443,7 @@ fn build_credential_template(request: &ImportAccountRequest) -> Option<UpstreamC
             .clone()
             .filter(|value| !value.trim().is_empty()),
         extra_headers: request.extra_headers.clone().unwrap_or_default(),
+        managed_auth: None,
         created_at: now,
         updated_at: now,
     })
@@ -3030,6 +3600,7 @@ mod tests {
                 browser_assist_url: "http://127.0.0.1:8090".to_string(),
                 heartbeat_seconds: 5,
                 enable_demo_seed: false,
+                account_encryption_key: None,
                 direct_proxy_url: None,
                 warp_proxy_url: None,
                 browser_assist_direct_proxy_url: None,
@@ -3427,6 +3998,146 @@ mod tests {
                 .turns
                 .iter()
                 .any(|turn| turn.request_summary == "request 13")
+        );
+    }
+
+    #[tokio::test]
+    async fn sole_account_non_quota_failover_stays_selectable() {
+        let state = test_state();
+        let tenant = insert_test_tenant(&state).await;
+        let account = state
+            .import_account(ImportAccountRequest {
+                tenant_id: tenant.id,
+                label: "Managed ChatGPT".to_string(),
+                models: vec!["gpt-5.4".to_string()],
+                quota_headroom: Some(0.8),
+                quota_headroom_5h: Some(0.8),
+                quota_headroom_7d: Some(0.8),
+                health_score: Some(0.9),
+                egress_stability: Some(0.9),
+                base_url: Some("https://chatgpt.com/backend-api/codex".to_string()),
+                bearer_token: Some("token".to_string()),
+                chatgpt_account_id: Some("acct_test".to_string()),
+                extra_headers: None,
+            })
+            .await;
+
+        let route_state = state
+            .failover_account(&account.id, "continuation", 300, false)
+            .await
+            .expect("route state");
+        assert_eq!(route_state.cooldown_until, None);
+        assert_eq!(route_state.cooldown_reason.as_deref(), Some("continuation"));
+
+        let selection = state
+            .resolve_lease(LeaseSelectionRequest {
+                tenant_id: tenant.id,
+                principal_id: "tenant:test/thread:solo".to_string(),
+                model: "gpt-5.4".to_string(),
+                reasoning_effort: None,
+                subagent_count: 0,
+                cache_affinity_key: "affinity".to_string(),
+                placement_affinity_key: "placement".to_string(),
+            })
+            .await;
+
+        assert_eq!(
+            selection.as_ref().map(|(lease, _, _)| lease.account_id.as_str()),
+            Some(account.id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn sole_account_quota_failover_blocks_selection() {
+        let state = test_state();
+        let tenant = insert_test_tenant(&state).await;
+        let account = state
+            .import_account(ImportAccountRequest {
+                tenant_id: tenant.id,
+                label: "Managed ChatGPT".to_string(),
+                models: vec!["gpt-5.4".to_string()],
+                quota_headroom: Some(0.05),
+                quota_headroom_5h: Some(0.05),
+                quota_headroom_7d: Some(0.05),
+                health_score: Some(0.9),
+                egress_stability: Some(0.9),
+                base_url: Some("https://chatgpt.com/backend-api/codex".to_string()),
+                bearer_token: Some("token".to_string()),
+                chatgpt_account_id: Some("acct_test".to_string()),
+                extra_headers: None,
+            })
+            .await;
+
+        let route_state = state
+            .failover_account(&account.id, "quota", 300, false)
+            .await
+            .expect("route state");
+        assert!(route_state.cooldown_until.is_some());
+        assert_eq!(route_state.cooldown_reason.as_deref(), Some("quota"));
+
+        let selection = state
+            .resolve_lease(LeaseSelectionRequest {
+                tenant_id: tenant.id,
+                principal_id: "tenant:test/thread:solo".to_string(),
+                model: "gpt-5.4".to_string(),
+                reasoning_effort: None,
+                subagent_count: 0,
+                cache_affinity_key: "affinity".to_string(),
+                placement_affinity_key: "placement".to_string(),
+            })
+            .await;
+
+        assert!(selection.is_none());
+    }
+
+    #[tokio::test]
+    async fn sole_account_execution_guard_serializes_waiters() {
+        let state = test_state();
+        let tenant = insert_test_tenant(&state).await;
+        let account = state
+            .import_account(ImportAccountRequest {
+                tenant_id: tenant.id,
+                label: "Managed ChatGPT".to_string(),
+                models: vec!["gpt-5.4".to_string()],
+                quota_headroom: Some(0.8),
+                quota_headroom_5h: Some(0.8),
+                quota_headroom_7d: Some(0.8),
+                health_score: Some(0.9),
+                egress_stability: Some(0.9),
+                base_url: Some("https://chatgpt.com/backend-api/codex".to_string()),
+                bearer_token: Some("token".to_string()),
+                chatgpt_account_id: Some("acct_test".to_string()),
+                extra_headers: None,
+            })
+            .await;
+
+        let first_guard = state
+            .acquire_execution_guard(tenant.id, &account.id, "gpt-5.4")
+            .await
+            .expect("first guard");
+        let state_clone = state.clone();
+        let account_id = account.id.clone();
+        let (tx, mut rx) = mpsc::channel(1);
+
+        tokio::spawn(async move {
+            let second_guard = state_clone
+                .acquire_execution_guard(tenant.id, &account_id, "gpt-5.4")
+                .await
+                .expect("second guard");
+            let _ = tx.send(()).await;
+            drop(second_guard);
+        });
+
+        let blocked = tokio::time::timeout(tokio::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(blocked.is_err(), "second guard should wait while first guard is held");
+
+        drop(first_guard);
+
+        let released =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), rx.recv()).await;
+        assert!(
+            matches!(released, Ok(Some(()))),
+            "second guard should proceed after the first guard is released"
         );
     }
 }

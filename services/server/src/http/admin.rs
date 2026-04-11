@@ -1,26 +1,35 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::StatusCode,
+    body::Body,
+    extract::{
+        Path, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
+    http::{HeaderMap, Response, StatusCode},
+    response::IntoResponse,
     routing::{get, post, put},
 };
+use chrono::Utc;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
     browser_assist,
     models::{
         BrowserTaskRequest, CompactConversationThreadRequest, CreateGatewayApiKeyRequest,
-        CreateGatewayUserRequest, CreateTenantRequest, ForkConversationThreadRequest,
-        ImportAccountRequest, OpenAiLoginCompleteRequest, OpenAiLoginStartRequest,
-        RouteEventRequest, StartConversationThreadRequest, UpdateGatewayUserRequest,
+        CodexAppSessionRequest, CreateGatewayUserRequest, CreateTenantRequest,
+        ForkConversationThreadRequest, ImportAccountRequest, ManagedRateLimitSnapshot,
+        OpenAiLoginCompleteRequest, OpenAiLoginStartRequest, RouteEventRequest,
+        StartConversationThreadRequest, UpdateGatewayUserRequest,
     },
-    state::AppState,
+    state::{AppState, CodexAppSessionState, GatewayAuthContext},
 };
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/dashboard", get(dashboard))
+        .route("/api/v1/dashboard/live", get(dashboard_live))
         .route("/api/v1/tenants", get(tenants).post(create_tenant))
         .route("/api/v1/accounts", get(accounts))
         .route(
@@ -49,6 +58,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/openai/login/start", post(openai_login_start))
         .route("/api/v1/openai/login/{login_id}", get(openai_login_status))
         .route("/api/v1/openai/login/complete", post(openai_login_complete))
+        .route("/api/v1/codex/app-session", post(codex_app_session))
+        .route("/api/v1/codex/app-server/ws", get(codex_app_server_ws))
         .route(
             "/api/v1/accounts/{account_id}/route-events",
             post(route_event),
@@ -81,6 +92,12 @@ async fn dashboard(State(state): State<AppState>) -> Json<crate::models::Dashboa
     snapshot.counts.browser_tasks = tasks.len();
     snapshot.browser_tasks = tasks;
     Json(snapshot)
+}
+
+async fn dashboard_live(
+    State(state): State<AppState>,
+) -> Json<crate::models::DashboardLiveSnapshot> {
+    Json(state.dashboard_live_snapshot().await)
 }
 
 async fn tenants(State(state): State<AppState>) -> Json<Vec<crate::models::Tenant>> {
@@ -412,4 +429,504 @@ async fn openai_login_complete(
             })),
         )),
     }
+}
+
+async fn codex_app_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CodexAppSessionRequest>,
+) -> Result<Json<crate::models::CodexAppSessionResponse>, (StatusCode, Json<Value>)> {
+    let Some(auth) = gateway_auth_from_headers(&state, &headers).await else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": {
+                    "message": "缺少有效的 Gateway API Key。",
+                    "type": "unauthorized"
+                }
+            })),
+        ));
+    };
+    let websocket_url = websocket_public_url(&headers).map_err(|message| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": message,
+                    "type": "codex_app_session_failed"
+                }
+            })),
+        )
+    })?;
+    match state
+        .create_codex_app_session(payload, auth.tenant.id, websocket_url)
+        .await
+    {
+        Ok(session) => Ok(Json(session)),
+        Err(message) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": message,
+                    "type": "codex_app_session_failed"
+                }
+            })),
+        )),
+    }
+}
+
+async fn codex_app_server_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let Some(session) = codex_app_session_from_headers(&state, &headers).await else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": {
+                    "message": "Unauthorized codex app-server session.",
+                    "type": "unauthorized"
+                }
+            })),
+        )
+            .into_response();
+    };
+    ws.on_upgrade(move |socket| async move {
+        handle_codex_app_server_socket(socket, state, session).await;
+    })
+    .into_response()
+}
+
+async fn handle_codex_app_server_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    session: CodexAppSessionState,
+) {
+    let mut initialize_seen = false;
+    let mut notifications_ready = false;
+    let mut opt_out_notifications = std::collections::HashSet::<String>::new();
+
+    loop {
+        let Some(message) = socket.recv().await else {
+            break;
+        };
+        let message = match message {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::warn!(%error, "codex app-server websocket receive failed");
+                break;
+            }
+        };
+
+        match message {
+            Message::Text(text) => {
+                if handle_codex_app_server_text(
+                    &mut socket,
+                    &state,
+                    &session,
+                    &mut initialize_seen,
+                    &mut notifications_ready,
+                    &mut opt_out_notifications,
+                    text.as_str(),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+            Message::Binary(_) => {
+                if send_app_server_error(
+                    &mut socket,
+                    Value::Null,
+                    -32600,
+                    "binary websocket frames are not supported",
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+            Message::Ping(payload) => {
+                if socket.send(Message::Pong(payload)).await.is_err() {
+                    break;
+                }
+            }
+            Message::Pong(_) => {}
+            Message::Close(_) => break,
+        }
+    }
+}
+
+async fn handle_codex_app_server_text(
+    socket: &mut WebSocket,
+    state: &AppState,
+    session: &CodexAppSessionState,
+    initialize_seen: &mut bool,
+    notifications_ready: &mut bool,
+    opt_out_notifications: &mut std::collections::HashSet<String>,
+    message: &str,
+) -> Result<(), ()> {
+    let value = match serde_json::from_str::<Value>(message) {
+        Ok(value) => value,
+        Err(error) => {
+            send_app_server_error(socket, Value::Null, -32700, &format!("invalid JSON: {error}"))
+                .await?;
+            return Ok(());
+        }
+    };
+    let Some(object) = value.as_object() else {
+        send_app_server_error(socket, Value::Null, -32600, "invalid request payload").await?;
+        return Ok(());
+    };
+    let id = object.get("id").cloned();
+    let Some(method) = object.get("method").and_then(Value::as_str) else {
+        send_app_server_error(
+            socket,
+            id.clone().unwrap_or(Value::Null),
+            -32600,
+            "invalid request payload: missing method",
+        )
+        .await?;
+        return Ok(());
+    };
+    let method = method.to_string();
+
+    if id.is_none() {
+        match method.as_str() {
+            "initialized" => {
+                if !*initialize_seen {
+                    return Ok(());
+                }
+                *notifications_ready = true;
+                emit_account_notifications(socket, state, session, opt_out_notifications).await?;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    let id = id.unwrap_or(Value::Null);
+    if !*initialize_seen && method != "initialize" {
+        send_app_server_error(socket, id, -32002, "Not initialized").await?;
+        return Ok(());
+    }
+
+    match method.as_str() {
+        "initialize" => {
+            if *initialize_seen {
+                send_app_server_error(socket, id, -32003, "Already initialized").await?;
+                return Ok(());
+            }
+            opt_out_notifications.clear();
+            opt_out_notifications.extend(
+                object
+                    .get("params")
+                    .and_then(|params| params.get("capabilities"))
+                    .and_then(|capabilities| capabilities.get("optOutNotificationMethods"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string),
+            );
+            *initialize_seen = true;
+            send_app_server_result(socket, id, initialize_response_value()).await?;
+        }
+        "account/read" => {
+            let refresh_token = object
+                .get("params")
+                .and_then(|params| params.get("refreshToken"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if refresh_token {
+                if let Err(error) = state.refresh_managed_account(&session.account_id, true).await {
+                    tracing::warn!(
+                        account_id = %session.account_id,
+                        %error,
+                        "codex app-server account/read refresh failed"
+                    );
+                }
+            }
+            let result = account_read_result(state, session).await;
+            send_app_server_result(socket, id, result).await?;
+            if *notifications_ready {
+                emit_account_notifications(socket, state, session, opt_out_notifications).await?;
+            }
+        }
+        "account/rateLimits/read" => {
+            if let Err(error) = state.refresh_managed_account(&session.account_id, false).await {
+                tracing::warn!(
+                    account_id = %session.account_id,
+                    %error,
+                    "codex app-server rateLimits refresh failed"
+                );
+            }
+            let result = rate_limits_result(state, session).await;
+            send_app_server_result(socket, id, result).await?;
+            if *notifications_ready {
+                emit_rate_limit_notification(socket, state, session, opt_out_notifications).await?;
+            }
+        }
+        _ => {
+            send_app_server_error(socket, id, -32601, "Method not found").await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn emit_account_notifications(
+    socket: &mut WebSocket,
+    state: &AppState,
+    session: &CodexAppSessionState,
+    opt_out_notifications: &std::collections::HashSet<String>,
+) -> Result<(), ()> {
+    if !opt_out_notifications.contains("account/updated") {
+        let payload = account_updated_notification(state, session).await;
+        send_app_server_notification(socket, "account/updated", payload).await?;
+    }
+    emit_rate_limit_notification(socket, state, session, opt_out_notifications).await
+}
+
+async fn emit_rate_limit_notification(
+    socket: &mut WebSocket,
+    state: &AppState,
+    session: &CodexAppSessionState,
+    opt_out_notifications: &std::collections::HashSet<String>,
+) -> Result<(), ()> {
+    if opt_out_notifications.contains("account/rateLimits/updated") {
+        return Ok(());
+    }
+    let payload = json!({
+        "rateLimits": current_rate_limits_snapshot(state, session).await,
+    });
+    send_app_server_notification(socket, "account/rateLimits/updated", payload).await
+}
+
+async fn account_read_result(state: &AppState, session: &CodexAppSessionState) -> Value {
+    let summary = managed_account_summary(state, session).await;
+    json!({
+        "account": summary.as_ref().and_then(account_value_from_summary),
+        "workspaceRole": summary
+            .as_ref()
+            .and_then(|summary| sanitize_workspace_role(summary.workspace_role.as_deref())),
+        "isWorkspaceOwner": summary.as_ref().and_then(|summary| summary.is_workspace_owner),
+        "requiresOpenaiAuth": true
+    })
+}
+
+async fn account_updated_notification(state: &AppState, session: &CodexAppSessionState) -> Value {
+    let summary = managed_account_summary(state, session).await;
+    json!({
+        "authMode": summary
+            .as_ref()
+            .and_then(|summary| summary.auth_mode.clone()),
+        "planType": summary
+            .as_ref()
+            .and_then(|summary| sanitize_plan_type(summary.plan_type.as_deref())),
+        "workspaceRole": summary
+            .as_ref()
+            .and_then(|summary| sanitize_workspace_role(summary.workspace_role.as_deref())),
+        "isWorkspaceOwner": summary.as_ref().and_then(|summary| summary.is_workspace_owner),
+    })
+}
+
+async fn rate_limits_result(state: &AppState, session: &CodexAppSessionState) -> Value {
+    let summary = managed_account_summary(state, session).await;
+    let rate_limits = summary
+        .as_ref()
+        .and_then(|summary| summary.rate_limits.clone())
+        .unwrap_or_default();
+    let rate_limits_by_limit_id = summary.as_ref().map(|summary| {
+        if summary.rate_limits_by_limit_id.is_empty() {
+            Value::Null
+        } else {
+            json!(summary.rate_limits_by_limit_id)
+        }
+    }).unwrap_or(Value::Null);
+
+    json!({
+        "rateLimits": rate_limits,
+        "rateLimitsByLimitId": rate_limits_by_limit_id,
+    })
+}
+
+async fn current_rate_limits_snapshot(
+    state: &AppState,
+    session: &CodexAppSessionState,
+) -> ManagedRateLimitSnapshot {
+    managed_account_summary(state, session)
+        .await
+        .and_then(|summary| summary.rate_limits.clone())
+        .unwrap_or_default()
+}
+
+async fn managed_account_summary(
+    state: &AppState,
+    session: &CodexAppSessionState,
+) -> Option<crate::models::AccountSummary> {
+    state
+        .list_accounts()
+        .await
+        .into_iter()
+        .find(|account| account.id == session.account_id && account.tenant_id == session.tenant_id)
+}
+
+fn account_value_from_summary(summary: &crate::models::AccountSummary) -> Option<Value> {
+    let email = summary.chatgpt_email.as_deref()?;
+    Some(json!({
+        "type": "chatgpt",
+        "email": email,
+        "planType": sanitize_plan_type(summary.plan_type.as_deref())
+            .unwrap_or_else(|| "unknown".to_string()),
+    }))
+}
+
+fn sanitize_plan_type(value: Option<&str>) -> Option<String> {
+    let normalized = value?.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "free"
+        | "go"
+        | "plus"
+        | "pro"
+        | "team"
+        | "self_serve_business_usage_based"
+        | "business"
+        | "enterprise_cbp_usage_based"
+        | "enterprise"
+        | "edu"
+        | "unknown" => Some(normalized),
+        _ => Some("unknown".to_string()),
+    }
+}
+
+fn sanitize_workspace_role(value: Option<&str>) -> Option<String> {
+    let normalized = value?.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "account-owner" | "account-admin" | "standard-user" => Some(normalized),
+        _ => None,
+    }
+}
+
+fn initialize_response_value() -> Value {
+    let codex_home = std::env::var("CODEX_HOME")
+        .ok()
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|path| path.join(".codex").to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| "/tmp/.codex".to_string());
+    json!({
+        "userAgent": format!("codex-manager-app-server/{}", env!("CARGO_PKG_VERSION")),
+        "codexHome": codex_home,
+        "platformFamily": std::env::consts::FAMILY,
+        "platformOs": std::env::consts::OS,
+    })
+}
+
+async fn send_app_server_result(
+    socket: &mut WebSocket,
+    id: Value,
+    result: Value,
+) -> Result<(), ()> {
+    send_app_server_json(
+        socket,
+        &json!({
+            "id": id,
+            "result": result,
+        }),
+    )
+    .await
+}
+
+async fn send_app_server_error(
+    socket: &mut WebSocket,
+    id: Value,
+    code: i64,
+    message: &str,
+) -> Result<(), ()> {
+    send_app_server_json(
+        socket,
+        &json!({
+            "id": id,
+            "error": {
+                "code": code,
+                "message": message,
+            }
+        }),
+    )
+    .await
+}
+
+async fn send_app_server_notification(
+    socket: &mut WebSocket,
+    method: &str,
+    params: Value,
+) -> Result<(), ()> {
+    send_app_server_json(
+        socket,
+        &json!({
+            "method": method,
+            "params": params,
+        }),
+    )
+    .await
+}
+
+async fn send_app_server_json(socket: &mut WebSocket, value: &Value) -> Result<(), ()> {
+    socket
+        .send(Message::Text(value.to_string().into()))
+        .await
+        .map_err(|_| ())
+}
+
+async fn codex_app_session_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<CodexAppSessionState> {
+    let auth = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let token = auth.strip_prefix("Bearer ")?;
+    let session = state.codex_app_session_for_token(token).await?;
+    if session.expires_at <= Utc::now() {
+        return None;
+    }
+    Some(session)
+}
+
+async fn gateway_auth_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<GatewayAuthContext> {
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let token = auth.strip_prefix("Bearer ")?;
+    state.auth_context_for_bearer(token).await
+}
+
+fn websocket_public_url(headers: &HeaderMap) -> Result<String, String> {
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(axum::http::header::HOST))
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "缺少 Host 头，无法生成 websocket 地址。".to_string())?;
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
+        .or_else(|| headers.get("x-forwarded-scheme"))
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("http");
+    let scheme = if forwarded_proto.eq_ignore_ascii_case("https")
+        || forwarded_proto.eq_ignore_ascii_case("wss")
+    {
+        "wss"
+    } else {
+        "ws"
+    };
+    Ok(format!("{scheme}://{host}/api/v1/codex/app-server/ws"))
 }

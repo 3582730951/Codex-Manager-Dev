@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type {
+  DashboardLiveSnapshot,
   DashboardSnapshot,
   GatewayUserRole,
   GatewayUserView
@@ -73,6 +74,7 @@ type AccountFilter = "all" | "active" | "low" | "protected";
 type Language = "zh" | "en";
 type ThemeMode = "dark" | "light";
 type BannerTone = "ok" | "error" | "neutral";
+type LiveRefreshInterval = 5000 | 10000 | 30000 | 0;
 
 type ToggleRowProps = {
   checked: boolean;
@@ -692,7 +694,17 @@ function translationFor(language: Language) {
         refreshFailed: "刷新模型失败",
         saveFailed: "保存用户失败",
         requestModelHelp: "是否覆盖下游传入模型",
-        requestReasoningHelp: "是否覆盖下游传入推理强度"
+        requestReasoningHelp: "是否覆盖下游传入推理强度",
+        liveRefresh: "实时刷新",
+        refreshOff: "关闭",
+        refreshPaused: "后台暂停",
+        refreshOffline: "离线暂停",
+        lastRefreshed: "最后刷新",
+        quotaSource: "额度来源：受管账号快照",
+        usageSource: "缓存/用量来源：网关请求观测",
+        plan: "套餐",
+        workspace: "工作区角色",
+        refreshedAt: "刷新于"
       }
     : {
         brandTitle: "AI Pool",
@@ -854,7 +866,17 @@ function translationFor(language: Language) {
         refreshFailed: "Failed to refresh models",
         saveFailed: "Failed to save user",
         requestModelHelp: "Override the downstream model",
-        requestReasoningHelp: "Override the downstream reasoning effort"
+        requestReasoningHelp: "Override the downstream reasoning effort",
+        liveRefresh: "Live refresh",
+        refreshOff: "Off",
+        refreshPaused: "Paused in background",
+        refreshOffline: "Paused offline",
+        lastRefreshed: "Last refresh",
+        quotaSource: "Quota source: managed account snapshot",
+        usageSource: "Cache/usage source: gateway telemetry",
+        plan: "Plan",
+        workspace: "Workspace role",
+        refreshedAt: "Refreshed"
       };
 }
 
@@ -1680,13 +1702,27 @@ export function DashboardApp({
   const [banner, setBanner] = useState<BannerState>(null);
   const [latestCreatedUser, setLatestCreatedUser] =
     useState<CreatedGatewayUser | null>(null);
+  const [liveRefreshInterval, setLiveRefreshInterval] =
+    useState<LiveRefreshInterval>(5000);
+  const [lastLiveRefreshAt, setLastLiveRefreshAt] = useState(snapshot.refreshedAt);
+  const [isDocumentHidden, setIsDocumentHidden] = useState(false);
+  const [isNavigatorOnline, setIsNavigatorOnline] = useState(true);
 
   const t = translationFor(language);
   const isDark = theme === "dark";
   const effectiveSidebarExpanded = sidebarExpanded || sidebarHovered;
+  const liveRefreshLabel =
+    liveRefreshInterval === 0
+      ? t.refreshOff
+      : isDocumentHidden
+        ? t.refreshPaused
+        : !isNavigatorOnline
+          ? t.refreshOffline
+          : `${liveRefreshInterval / 1000}s`;
 
   useEffect(() => {
     setRuntimeSnapshot(snapshot);
+    setLastLiveRefreshAt(snapshot.refreshedAt);
   }, [snapshot]);
 
   useEffect(() => {
@@ -1728,6 +1764,125 @@ export function DashboardApp({
       // ignore storage failures
     }
   }, [language]);
+
+  useEffect(() => {
+    const syncPageState = () => {
+      setIsDocumentHidden(document.visibilityState === "hidden");
+      setIsNavigatorOnline(navigator.onLine);
+    };
+
+    syncPageState();
+    document.addEventListener("visibilitychange", syncPageState);
+    window.addEventListener("online", syncPageState);
+    window.addEventListener("offline", syncPageState);
+
+    return () => {
+      document.removeEventListener("visibilitychange", syncPageState);
+      window.removeEventListener("online", syncPageState);
+      window.removeEventListener("offline", syncPageState);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (liveRefreshInterval === 0 || isDocumentHidden || !isNavigatorOnline) {
+      return undefined;
+    }
+
+    let disposed = false;
+    let timeoutId: number | null = null;
+    let inFlight = false;
+    let controller: AbortController | null = null;
+
+    const schedule = () => {
+      if (disposed) {
+        return;
+      }
+      timeoutId = window.setTimeout(() => {
+        void fetchLiveSnapshot();
+      }, liveRefreshInterval);
+    };
+
+    const fetchLiveSnapshot = async () => {
+      if (disposed || inFlight) {
+        return;
+      }
+      inFlight = true;
+      controller?.abort();
+      controller = new AbortController();
+
+      try {
+        const response = await fetch("/api/dashboard/live", {
+          cache: "no-store",
+          signal: controller.signal
+        });
+        const payload = (await response.json().catch(() => null)) as
+          | DashboardLiveSnapshot
+          | { error?: { message?: string } }
+          | null;
+
+        if (!response.ok || !payload || Array.isArray(payload) || "error" in payload) {
+          throw new Error(
+            payload &&
+              typeof payload === "object" &&
+              !Array.isArray(payload) &&
+              "error" in payload
+              ? payload.error?.message ?? t.refreshFailed
+              : t.refreshFailed
+          );
+        }
+        const livePayload = payload as DashboardLiveSnapshot;
+
+        setRuntimeSnapshot((current) => ({
+          ...current,
+          refreshedAt: livePayload.refreshedAt,
+          cacheMetrics: livePayload.cacheMetrics,
+          accounts: livePayload.accounts,
+          leases: livePayload.leases,
+          requestLogs: livePayload.requestLogs,
+          billing: livePayload.billing,
+          modelCatalog: Array.from(
+            new Set([
+              ...current.modelCatalog,
+              ...livePayload.accounts.flatMap((account) => account.models)
+            ])
+          ).sort(),
+          counts: {
+            ...current.counts,
+            accounts: livePayload.accounts.length,
+            activeLeases: livePayload.leases.length,
+            warpAccounts: livePayload.accounts.filter(
+              (account) => account.routeMode === "warp"
+            ).length
+          }
+        }));
+        setLastLiveRefreshAt(livePayload.refreshedAt);
+      } catch (error) {
+        if (!(error instanceof DOMException && error.name === "AbortError")) {
+          setBanner((current) =>
+            current?.tone === "error"
+              ? current
+              : {
+                  tone: "error",
+                  message: error instanceof Error ? error.message : t.refreshFailed
+                }
+          );
+        }
+      } finally {
+        inFlight = false;
+        schedule();
+      }
+    };
+
+    void fetchLiveSnapshot();
+
+    return () => {
+      disposed = true;
+      controller?.abort();
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [isDocumentHidden, isNavigatorOnline, liveRefreshInterval, t.refreshFailed]);
 
   useEffect(() => {
     if (!banner) {
@@ -2235,6 +2390,19 @@ export function DashboardApp({
             );
           })}
         </div>
+        <div className="mt-4 flex flex-wrap gap-2">
+          {[t.quotaSource, t.usageSource].map((item) => (
+            <span
+              className={cx(
+                "rounded-full px-3 py-1.5 text-[11px]",
+                isDark ? "bg-white/[0.05] text-zinc-400" : "bg-zinc-100 text-zinc-600"
+              )}
+              key={item}
+            >
+              {item}
+            </span>
+          ))}
+        </div>
       </SectionCard>
 
       <div className="grid gap-6 xl:grid-cols-[1.55fr_0.85fr]">
@@ -2570,6 +2738,27 @@ export function DashboardApp({
                   </span>
                 ))}
               </div>
+
+              {account.authMode === "chatgpt" ? (
+                <div
+                  className={cx(
+                    "mt-4 rounded-[20px] border px-3 py-3 text-xs",
+                    isDark ? "border-white/10 bg-[#0c0f15]" : "border-zinc-200 bg-white"
+                  )}
+                >
+                  <div className="flex flex-wrap items-center gap-3">
+                    <span className={cx(isDark ? "text-zinc-500" : "text-zinc-500")}>
+                      {t.plan}: {account.planType ?? "unknown"}
+                    </span>
+                    <span className={cx(isDark ? "text-zinc-500" : "text-zinc-500")}>
+                      {t.workspace}: {account.workspaceRole ?? "--"}
+                    </span>
+                  </div>
+                  <p className={cx("mt-2", isDark ? "text-zinc-500" : "text-zinc-500")}>
+                    {t.refreshedAt}: {formatDateTime(account.managedStateRefreshedAt, language)}
+                  </p>
+                </div>
+              ) : null}
             </article>
           );
         })}
@@ -3388,6 +3577,46 @@ export function DashboardApp({
                       {value === "zh" ? "CN" : "EN"}
                     </button>
                   ))}
+                </div>
+
+                <div
+                  className={cx(
+                    "rounded-2xl px-3 py-2 shadow-soft",
+                    isDark ? "bg-white/[0.06]" : "bg-white"
+                  )}
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={cx("text-[11px] font-medium uppercase tracking-[0.18em]", isDark ? "text-zinc-500" : "text-zinc-400")}>
+                      {t.liveRefresh}
+                    </span>
+                    {([
+                      [5000, "5s"],
+                      [10000, "10s"],
+                      [30000, "30s"],
+                      [0, t.refreshOff]
+                    ] as const).map(([value, label]) => (
+                      <button
+                        className={cx(
+                          "rounded-xl px-3 py-1.5 text-xs font-medium transition-all duration-200",
+                          liveRefreshInterval === value
+                            ? isDark
+                              ? "bg-zinc-100 text-zinc-950"
+                              : "bg-zinc-900 text-white"
+                            : isDark
+                              ? "text-zinc-400 hover:bg-white/[0.06]"
+                              : "text-zinc-500 hover:bg-zinc-100"
+                        )}
+                        key={value}
+                        onClick={() => setLiveRefreshInterval(value)}
+                        type="button"
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  <p className={cx("mt-2 text-[11px]", isDark ? "text-zinc-500" : "text-zinc-500")}>
+                    {t.lastRefreshed}: {formatDateTime(lastLiveRefreshAt, language)} · {liveRefreshLabel}
+                  </p>
                 </div>
 
                 <button

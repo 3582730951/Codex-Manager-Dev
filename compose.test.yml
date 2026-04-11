@@ -35,6 +35,7 @@ services:
       CMGR_BROWSER_ASSIST_URL: http://browser-assist:8090
       CMGR_GATEWAY_HEARTBEAT_SECONDS: 5
       CMGR_ENABLE_DEMO_SEED: "false"
+      CMGR_ACCOUNT_ENCRYPTION_KEY: ${CMGR_ACCOUNT_ENCRYPTION_KEY:-}
       RUST_LOG: warn
     depends_on:
       postgres:

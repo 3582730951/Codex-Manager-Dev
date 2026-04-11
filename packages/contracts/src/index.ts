@@ -9,6 +9,32 @@ export interface CacheMetrics {
   staticPrefixTokens: number;
 }
 
+export interface ManagedRateLimitWindow {
+  usedPercent: number;
+  windowDurationMins: number | null;
+  resetsAt: number | null;
+}
+
+export interface ManagedCreditsSnapshot {
+  hasCredits: boolean;
+  unlimited: boolean;
+  balance: string | null;
+}
+
+export interface ManagedSpendControlSnapshot {
+  reached: boolean;
+}
+
+export interface ManagedRateLimitSnapshot {
+  limitId: string | null;
+  limitName: string | null;
+  primary: ManagedRateLimitWindow | null;
+  secondary: ManagedRateLimitWindow | null;
+  credits: ManagedCreditsSnapshot | null;
+  spendControl: ManagedSpendControlSnapshot | null;
+  planType: string | null;
+}
+
 export interface AccountSummary {
   id: string;
   tenantId: string;
@@ -32,6 +58,14 @@ export interface AccountSummary {
   hasCredential: boolean;
   baseUrl: string | null;
   chatgptAccountId: string | null;
+  authMode: string | null;
+  chatgptEmail: string | null;
+  planType: string | null;
+  workspaceRole: string | null;
+  isWorkspaceOwner: boolean | null;
+  rateLimits: ManagedRateLimitSnapshot | null;
+  rateLimitsByLimitId: Record<string, ManagedRateLimitSnapshot>;
+  managedStateRefreshedAt: string | null;
   egressGroup: string;
   proxyEnabled: boolean;
 }
@@ -143,6 +177,7 @@ export interface BillingSummary {
 export interface DashboardSnapshot {
   title: string;
   subtitle: string;
+  refreshedAt: string;
   topology: ServiceTopologyNode[];
   cacheMetrics: CacheMetrics;
   accounts: AccountSummary[];
@@ -163,9 +198,19 @@ export interface DashboardSnapshot {
   };
 }
 
+export interface DashboardLiveSnapshot {
+  refreshedAt: string;
+  cacheMetrics: CacheMetrics;
+  accounts: AccountSummary[];
+  leases: LeaseView[];
+  requestLogs: RequestLogEntry[];
+  billing: BillingSummary;
+}
+
 export const dashboardFallback: DashboardSnapshot = {
   title: "Codex 管理台",
   subtitle: "路由、缓存、恢复，一屏看完。",
+  refreshedAt: new Date().toISOString(),
   topology: [
     {
       name: "web",
@@ -223,6 +268,14 @@ export const dashboardFallback: DashboardSnapshot = {
       hasCredential: false,
       baseUrl: null,
       chatgptAccountId: null,
+      authMode: null,
+      chatgptEmail: null,
+      planType: null,
+      workspaceRole: null,
+      isWorkspaceOwner: null,
+      rateLimits: null,
+      rateLimitsByLimitId: {},
+      managedStateRefreshedAt: null,
       egressGroup: "direct-native",
       proxyEnabled: false
     }

@@ -3,6 +3,7 @@ import {
   type GatewayUserRole,
   type GatewayUserView,
   type BrowserTask,
+  type DashboardLiveSnapshot,
   type DashboardSnapshot
 } from "@codex-manager/contracts";
 
@@ -122,6 +123,23 @@ export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
     return await fetchAdmin<DashboardSnapshot>("/api/v1/dashboard");
   } catch {
     return dashboardFallback;
+  }
+}
+
+export async function getDashboardLiveSnapshot(): Promise<DashboardLiveSnapshot> {
+  const fallback = {
+    refreshedAt: dashboardFallback.refreshedAt,
+    cacheMetrics: dashboardFallback.cacheMetrics,
+    accounts: dashboardFallback.accounts,
+    leases: dashboardFallback.leases,
+    requestLogs: dashboardFallback.requestLogs,
+    billing: dashboardFallback.billing
+  } satisfies DashboardLiveSnapshot;
+
+  try {
+    return await fetchAdmin<DashboardLiveSnapshot>("/api/v1/dashboard/live");
+  } catch {
+    return fallback;
   }
 }
 

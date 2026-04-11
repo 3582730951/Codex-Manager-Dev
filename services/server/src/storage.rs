@@ -187,7 +187,10 @@ impl Persistence {
         .collect::<Result<Vec<_>, _>>()?;
 
         let credentials = sqlx::query(
-            "select account_id, base_url, bearer_token, chatgpt_account_id, extra_headers, created_at, updated_at from upstream_credentials order by updated_at asc",
+            "select account_id, base_url, bearer_token, chatgpt_account_id, extra_headers,
+                    managed_auth_state, created_at, updated_at
+             from upstream_credentials
+             order by updated_at asc",
         )
         .fetch_all(self.pool.as_ref())
         .await?
@@ -200,6 +203,11 @@ impl Persistence {
                 bearer_token: row.try_get("bearer_token")?,
                 chatgpt_account_id: row.try_get("chatgpt_account_id")?,
                 extra_headers: extra_headers.0,
+                managed_auth: row
+                    .try_get::<Option<Json<crate::models::ManagedAuthState>>, _>(
+                        "managed_auth_state",
+                    )?
+                    .map(|value| value.0),
                 created_at: row.try_get("created_at")?,
                 updated_at: row.try_get("updated_at")?,
             })
@@ -207,7 +215,10 @@ impl Persistence {
         .collect::<Result<Vec<_>, _>>()?;
 
         let route_states = sqlx::query(
-            "select account_id, route_mode, direct_cf_streak, warp_cf_streak, cooldown_level, cooldown_until, warp_entered_at, last_cf_at, success_streak, last_success_at from account_route_states",
+            "select account_id, route_mode, direct_cf_streak, warp_cf_streak, cooldown_level,
+                    cooldown_until, cooldown_reason, warp_entered_at, last_cf_at, success_streak,
+                    last_success_at
+             from account_route_states",
         )
         .fetch_all(self.pool.as_ref())
         .await?
@@ -224,6 +235,7 @@ impl Persistence {
                 warp_cf_streak: warp_cf_streak.max(0) as u32,
                 cooldown_level: cooldown_level.max(0) as usize,
                 cooldown_until: row.try_get("cooldown_until")?,
+                cooldown_reason: row.try_get("cooldown_reason")?,
                 warp_entered_at: row.try_get("warp_entered_at")?,
                 last_cf_at: row.try_get("last_cf_at")?,
                 success_streak: success_streak.max(0) as u32,
@@ -489,16 +501,21 @@ impl Persistence {
                 }
                 PersistenceMessage::CredentialUpsert(credential) => {
                     sqlx::query(
-                        "insert into upstream_credentials (account_id, base_url, bearer_token, chatgpt_account_id, extra_headers, created_at, updated_at)
-                         values ($1, $2, $3, $4, $5, $6, $7)
+                        "insert into upstream_credentials (
+                            account_id, base_url, bearer_token, chatgpt_account_id, extra_headers,
+                            managed_auth_state, created_at, updated_at
+                         )
+                         values ($1, $2, $3, $4, $5, $6, $7, $8)
                          on conflict (account_id) do update set base_url = excluded.base_url, bearer_token = excluded.bearer_token,
-                         chatgpt_account_id = excluded.chatgpt_account_id, extra_headers = excluded.extra_headers, created_at = excluded.created_at, updated_at = excluded.updated_at",
+                         chatgpt_account_id = excluded.chatgpt_account_id, extra_headers = excluded.extra_headers,
+                         managed_auth_state = excluded.managed_auth_state, created_at = excluded.created_at, updated_at = excluded.updated_at",
                     )
                     .bind(&credential.account_id)
                     .bind(&credential.base_url)
                     .bind(&credential.bearer_token)
                     .bind(&credential.chatgpt_account_id)
                     .bind(Json(credential.extra_headers.clone()))
+                    .bind(credential.managed_auth.clone().map(Json))
                     .bind(credential.created_at)
                     .bind(credential.updated_at)
                     .execute(&mut *tx)
@@ -506,10 +523,15 @@ impl Persistence {
                 }
                 PersistenceMessage::RouteStateUpsert(route_state) => {
                     sqlx::query(
-                        "insert into account_route_states (account_id, route_mode, direct_cf_streak, warp_cf_streak, cooldown_level, cooldown_until, warp_entered_at, last_cf_at, success_streak, last_success_at)
-                         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                        "insert into account_route_states (
+                            account_id, route_mode, direct_cf_streak, warp_cf_streak,
+                            cooldown_level, cooldown_until, cooldown_reason, warp_entered_at,
+                            last_cf_at, success_streak, last_success_at
+                         )
+                         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                          on conflict (account_id) do update set route_mode = excluded.route_mode, direct_cf_streak = excluded.direct_cf_streak, warp_cf_streak = excluded.warp_cf_streak,
-                         cooldown_level = excluded.cooldown_level, cooldown_until = excluded.cooldown_until, warp_entered_at = excluded.warp_entered_at, last_cf_at = excluded.last_cf_at,
+                         cooldown_level = excluded.cooldown_level, cooldown_until = excluded.cooldown_until, cooldown_reason = excluded.cooldown_reason,
+                         warp_entered_at = excluded.warp_entered_at, last_cf_at = excluded.last_cf_at,
                          success_streak = excluded.success_streak, last_success_at = excluded.last_success_at",
                     )
                     .bind(&route_state.account_id)
@@ -518,6 +540,7 @@ impl Persistence {
                     .bind(route_state.warp_cf_streak as i32)
                     .bind(route_state.cooldown_level as i32)
                     .bind(route_state.cooldown_until)
+                    .bind(&route_state.cooldown_reason)
                     .bind(route_state.warp_entered_at)
                     .bind(route_state.last_cf_at)
                     .bind(route_state.success_streak as i32)
@@ -698,6 +721,7 @@ impl Persistence {
             include_str!("../migrations/0004_gateway_users_and_request_logs.sql"),
             include_str!("../migrations/0005_behavior_profiles.sql"),
             include_str!("../migrations/0006_conversation_threads.sql"),
+            include_str!("../migrations/0007_managed_auth_state.sql"),
         ] {
             for statement in migration
                 .split("\n-- statement-break\n")

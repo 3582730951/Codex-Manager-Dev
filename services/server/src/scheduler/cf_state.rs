@@ -92,6 +92,7 @@ mod tests {
             warp_cf_streak: 0,
             cooldown_level: 0,
             cooldown_until: None,
+            cooldown_reason: None,
             warp_entered_at: None,
             last_cf_at: None,
             success_streak: 0,

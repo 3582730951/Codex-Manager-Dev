@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -124,6 +126,8 @@ pub struct UpstreamCredential {
     pub bearer_token: String,
     pub chatgpt_account_id: Option<String>,
     pub extra_headers: Vec<(String, String)>,
+    #[serde(default)]
+    pub managed_auth: Option<ManagedAuthState>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -137,6 +141,8 @@ pub struct AccountRouteState {
     pub warp_cf_streak: u32,
     pub cooldown_level: usize,
     pub cooldown_until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub cooldown_reason: Option<String>,
     pub warp_entered_at: Option<DateTime<Utc>>,
     pub last_cf_at: Option<DateTime<Utc>>,
     pub success_streak: u32,
@@ -375,6 +381,54 @@ pub struct CacheMetrics {
     pub static_prefix_tokens: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedRateLimitWindow {
+    pub used_percent: i32,
+    pub window_duration_mins: Option<i64>,
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedCreditsSnapshot {
+    pub has_credits: bool,
+    pub unlimited: bool,
+    pub balance: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedSpendControlSnapshot {
+    pub reached: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedRateLimitSnapshot {
+    pub limit_id: Option<String>,
+    pub limit_name: Option<String>,
+    pub primary: Option<ManagedRateLimitWindow>,
+    pub secondary: Option<ManagedRateLimitWindow>,
+    pub credits: Option<ManagedCreditsSnapshot>,
+    pub spend_control: Option<ManagedSpendControlSnapshot>,
+    pub plan_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedAuthState {
+    pub email: Option<String>,
+    pub plan_type: Option<String>,
+    pub workspace_role: Option<String>,
+    pub is_workspace_owner: Option<bool>,
+    pub rate_limits: Option<ManagedRateLimitSnapshot>,
+    #[serde(default)]
+    pub rate_limits_by_limit_id: BTreeMap<String, ManagedRateLimitSnapshot>,
+    pub refresh_token_encrypted: Option<String>,
+    pub last_refreshed_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CfIncident {
@@ -432,6 +486,22 @@ pub struct AccountSummary {
     pub has_credential: bool,
     pub base_url: Option<String>,
     pub chatgpt_account_id: Option<String>,
+    #[serde(default)]
+    pub auth_mode: Option<String>,
+    #[serde(default)]
+    pub chatgpt_email: Option<String>,
+    #[serde(default)]
+    pub plan_type: Option<String>,
+    #[serde(default)]
+    pub workspace_role: Option<String>,
+    #[serde(default)]
+    pub is_workspace_owner: Option<bool>,
+    #[serde(default)]
+    pub rate_limits: Option<ManagedRateLimitSnapshot>,
+    #[serde(default)]
+    pub rate_limits_by_limit_id: BTreeMap<String, ManagedRateLimitSnapshot>,
+    #[serde(default)]
+    pub managed_state_refreshed_at: Option<DateTime<Utc>>,
     pub egress_group: String,
     pub proxy_enabled: bool,
 }
@@ -595,6 +665,7 @@ pub struct CreatedGatewayUser {
 pub struct DashboardSnapshot {
     pub title: String,
     pub subtitle: String,
+    pub refreshed_at: DateTime<Utc>,
     pub topology: Vec<TopologyNode>,
     pub cache_metrics: CacheMetrics,
     pub accounts: Vec<AccountSummary>,
@@ -606,6 +677,17 @@ pub struct DashboardSnapshot {
     pub billing: BillingSummary,
     pub model_catalog: Vec<String>,
     pub counts: DashboardCounts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DashboardLiveSnapshot {
+    pub refreshed_at: DateTime<Utc>,
+    pub cache_metrics: CacheMetrics,
+    pub accounts: Vec<AccountSummary>,
+    pub leases: Vec<CliLease>,
+    pub request_logs: Vec<RequestLogEntry>,
+    pub billing: BillingSummary,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -695,6 +777,22 @@ pub struct OpenAiLoginStartResponse {
     pub login_id: String,
     pub auth_url: String,
     pub redirect_uri: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAppSessionRequest {
+    pub tenant_id: Option<Uuid>,
+    pub account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAppSessionResponse {
+    pub account_id: String,
+    pub remote_app_server_url: String,
+    pub remote_app_server_auth_token: String,
+    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
