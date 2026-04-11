@@ -1389,7 +1389,6 @@ create_container_action() {
     create
     --name "${container_name}"
     --hostname "${container_name}"
-    --init
     --restart unless-stopped
     --network "${network_name}"
     --workdir /workspace
