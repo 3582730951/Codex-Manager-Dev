@@ -74,6 +74,7 @@ struct RequestLogSeed {
 #[derive(Clone, Debug)]
 struct RequestRoutingScope {
     principal_id: String,
+    lease_principal_id: String,
     placement_affinity_key: String,
     session_key: String,
     window_id: Option<String>,
@@ -210,7 +211,7 @@ async fn responses(
     };
     let selection_request = LeaseSelectionRequest {
         tenant_id: auth.tenant.id,
-        principal_id: principal_id.clone(),
+        principal_id: routing.lease_principal_id.clone(),
         model: model.clone(),
         reasoning_effort: effective_reasoning_effort.clone(),
         subagent_count,
@@ -722,7 +723,7 @@ async fn responses_compact(
     };
     let selection_request = LeaseSelectionRequest {
         tenant_id: auth.tenant.id,
-        principal_id: principal_id.clone(),
+        principal_id: routing.lease_principal_id.clone(),
         model: model.clone(),
         reasoning_effort: effective_reasoning_effort,
         subagent_count,
@@ -1167,7 +1168,7 @@ async fn forward_responses_ws(
     };
     let selection_request = LeaseSelectionRequest {
         tenant_id: auth.tenant.id,
-        principal_id: principal_id.clone(),
+        principal_id: routing.lease_principal_id.clone(),
         model: model.clone(),
         reasoning_effort: effective_reasoning_effort.clone(),
         subagent_count,
@@ -1518,7 +1519,7 @@ async fn chat_completions(
     };
     let selection_request = LeaseSelectionRequest {
         tenant_id: auth.tenant.id,
-        principal_id: principal_id.clone(),
+        principal_id: routing.lease_principal_id.clone(),
         model: model.clone(),
         reasoning_effort: payload.reasoning_effort.clone(),
         subagent_count,
@@ -2410,6 +2411,27 @@ fn gateway_error_value(reason: GatewayFailureReason) -> Value {
     })
 }
 
+fn response_failure_value(response_id: Option<&str>, reason: GatewayFailureReason) -> Value {
+    let response_id = response_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("resp_failed_{}", uuid::Uuid::new_v4().simple()));
+    json!({
+        "type": "response.failed",
+        "response": {
+            "id": response_id,
+            "status": "failed",
+            "error": gateway_error_value(reason),
+        }
+    })
+}
+
+fn response_failed_sse_bytes(response_id: Option<&str>, reason: GatewayFailureReason) -> Bytes {
+    Bytes::from(format!(
+        "event: response.failed\ndata: {}\n\n",
+        response_failure_value(response_id, reason)
+    ))
+}
+
 fn gateway_failure_response(
     stream_requested: bool,
     heartbeat_seconds: u64,
@@ -2609,6 +2631,7 @@ async fn upstream_stream_to_ws_response(
     let mut streamed_response_id = None;
     let mut streamed_output_items = BTreeMap::new();
     let mut completed_response = None;
+    let mut had_hidden_failure = false;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(heartbeat_seconds.max(1)));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let _ = heartbeat.tick().await;
@@ -2636,43 +2659,64 @@ async fn upstream_stream_to_ws_response(
 
     loop {
         tokio::select! {
-            maybe_chunk = upstream.next() => {
-                let Some(chunk) = maybe_chunk else {
-                    break;
-                };
-                let chunk = chunk.map_err(|_| UpstreamFailureKind::Generic)?;
-                buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()).replace("\r\n", "\n"));
-                while let Some(record) = take_sse_record(&mut buffer) {
-                    if let Some(kind) = hidden_failure_kind_from_sse_record(&record, expected_model) {
-                        return Err(kind);
-                    }
-                    if let Some(value) = response_value_from_sse_record(&record) {
-                        merge_request_usage(&mut usage, request_usage_from_value(&value));
-                        if observed_model.is_none() {
-                            observed_model = observed_model_from_value(&value);
-                        }
+                maybe_chunk = upstream.next() => {
+                    let Some(chunk) = maybe_chunk else {
+                        break;
+                    };
+                    let Ok(chunk) = chunk else {
+                        had_hidden_failure = true;
+                        handle_hidden_failure(state, &lease, UpstreamFailureKind::Generic).await;
+                        send_ws_gateway_failure_response(
+                            socket,
+                            GatewayFailureReason::UpstreamFailure,
+                        )
+                        .await
+                        .map_err(|_| UpstreamFailureKind::Generic)?;
+                        break;
+                    };
+                    buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()).replace("\r\n", "\n"));
+                    while let Some(record) = take_sse_record(&mut buffer) {
+                        let hidden_kind = hidden_failure_kind_from_sse_record(&record, expected_model);
+                        if let Some(value) = response_value_from_sse_record(&record) {
+                            merge_request_usage(&mut usage, request_usage_from_value(&value));
+                            if observed_model.is_none() {
+                                observed_model = observed_model_from_value(&value);
+                            }
                         capture_stream_response_metadata(
                             &value,
                             &mut streamed_response_id,
                             &mut streamed_output_items,
                             &mut completed_response,
                         );
+                        }
+                        if let Some(delta) = response_delta_text(&record) {
+                            output_summary.push_str(delta.as_str());
+                        }
+                        send_ws_record(socket, &record)
+                            .await
+                            .map_err(|_| UpstreamFailureKind::Generic)?;
+                        if let Some(kind) = hidden_kind {
+                            had_hidden_failure = true;
+                            handle_hidden_failure(state, &lease, kind).await;
+                            break;
+                        }
                     }
-                    if let Some(delta) = response_delta_text(&record) {
-                        output_summary.push_str(delta.as_str());
+                    if had_hidden_failure {
+                        break;
                     }
-                    send_ws_record(socket, &record)
-                        .await
-                        .map_err(|_| UpstreamFailureKind::Generic)?;
                 }
-            }
-            _ = heartbeat.tick() => {
-                socket
-                    .send(Message::Ping(Bytes::new()))
+                _ = heartbeat.tick() => {
+                    socket
+                        .send(Message::Ping(Bytes::new()))
                     .await
                     .map_err(|_| UpstreamFailureKind::Generic)?;
             }
         }
+    }
+
+    if had_hidden_failure {
+        state.discard_pending_context_turn(&principal_id).await;
+        return Ok(());
     }
 
     let _ = state
@@ -2735,19 +2779,7 @@ async fn send_ws_gateway_failure_response(
     socket: &mut WebSocket,
     reason: GatewayFailureReason,
 ) -> Result<(), ()> {
-    let response_id = format!("resp_ws_failed_{}", uuid::Uuid::new_v4().simple());
-    send_ws_json(
-        socket,
-        &json!({
-            "type": "response.failed",
-            "response": {
-                "id": response_id,
-                "status": "failed",
-                "error": gateway_error_value(reason),
-            }
-        }),
-    )
-    .await
+    send_ws_json(socket, &response_failure_value(None, reason)).await
 }
 
 async fn send_ws_empty_response(socket: &mut WebSocket, model: &str) -> Result<(), ()> {
@@ -2820,15 +2852,7 @@ async fn send_ws_json(socket: &mut WebSocket, value: &Value) -> Result<(), ()> {
 
 #[cfg(test)]
 fn websocket_failure_response_event(reason: GatewayFailureReason) -> Value {
-    let response_id = format!("resp_ws_failed_{}", uuid::Uuid::new_v4().simple());
-    json!({
-        "type": "response.failed",
-        "response": {
-            "id": response_id,
-            "status": "failed",
-            "error": gateway_error_value(reason),
-        }
-    })
+    response_failure_value(None, reason)
 }
 
 async fn upstream_json_response(
@@ -3063,15 +3087,16 @@ async fn upstream_stream_response(
                     let Ok(chunk) = chunk else {
                         had_hidden_failure = true;
                         handle_hidden_failure(&state, &lease, UpstreamFailureKind::Generic).await;
+                        yield Ok::<Bytes, Infallible>(response_failed_sse_bytes(
+                            streamed_response_id.as_deref(),
+                            GatewayFailureReason::UpstreamFailure,
+                        ));
                         break;
                     };
                     buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()).replace("\r\n", "\n"));
                     while let Some(record) = take_sse_record(&mut buffer) {
-                        if let Some(kind) = hidden_failure_kind_from_sse_record(&record, &expected_model) {
-                            had_hidden_failure = true;
-                            handle_hidden_failure(&state, &lease, kind).await;
-                            break;
-                        }
+                        let hidden_kind =
+                            hidden_failure_kind_from_sse_record(&record, &expected_model);
                         if let Some(value) = response_value_from_sse_record(&record) {
                             merge_request_usage(&mut usage, request_usage_from_value(&value));
                             if observed_model.is_none() {
@@ -3088,6 +3113,11 @@ async fn upstream_stream_response(
                             output_summary.push_str(delta.as_str());
                         }
                         yield Ok::<Bytes, Infallible>(Bytes::from(format!("{record}\n\n")));
+                        if let Some(kind) = hidden_kind {
+                            had_hidden_failure = true;
+                            handle_hidden_failure(&state, &lease, kind).await;
+                            break;
+                        }
                     }
                     if had_hidden_failure {
                         break;
@@ -3239,15 +3269,17 @@ async fn upstream_responses_stream_to_chat_response(
             let Ok(chunk) = chunk else {
                 had_hidden_failure = true;
                 handle_hidden_failure(&gateway_state, &lease, UpstreamFailureKind::Generic).await;
+                for event in chat_gateway_failure_events(
+                    &mut adapter_state,
+                    UpstreamFailureKind::Generic,
+                ) {
+                    yield Ok::<Event, Infallible>(event);
+                }
                 break;
             };
             buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()).replace("\r\n", "\n"));
             while let Some(record) = take_sse_record(&mut buffer) {
-                if let Some(kind) = hidden_failure_kind_from_sse_record(&record, &fallback_model) {
-                    had_hidden_failure = true;
-                    handle_hidden_failure(&gateway_state, &lease, kind).await;
-                    break;
-                }
+                let hidden_kind = hidden_failure_kind_from_sse_record(&record, &fallback_model);
                 if let Some(value) = response_value_from_sse_record(&record) {
                     merge_request_usage(&mut usage, request_usage_from_value(&value));
                     if observed_model.is_none() {
@@ -3262,6 +3294,16 @@ async fn upstream_responses_stream_to_chat_response(
                 }
                 for event in translate_response_record_to_chat_events(&record, &mut adapter_state) {
                     yield Ok::<Event, Infallible>(event);
+                }
+                if let Some(kind) = hidden_kind {
+                    had_hidden_failure = true;
+                    handle_hidden_failure(&gateway_state, &lease, kind).await;
+                    if !adapter_state.finished {
+                        for event in chat_gateway_failure_events(&mut adapter_state, kind) {
+                            yield Ok::<Event, Infallible>(event);
+                        }
+                    }
+                    break;
                 }
             }
             if had_hidden_failure {
@@ -5230,6 +5272,7 @@ fn translate_response_record_to_chat_events(
             out.push(Event::default().data("[DONE]"));
             out
         }
+        "response.failed" => chat_failure_events_from_response_record(&value, state),
         _ => Vec::new(),
     }
 }
@@ -5246,6 +5289,53 @@ fn ensure_assistant_role_event(state: &mut ChatStreamAdapterState) -> Vec<Event>
         json!({"role":"assistant"}),
         None,
     ))]
+}
+
+fn chat_failure_events_from_response_record(
+    value: &Value,
+    state: &mut ChatStreamAdapterState,
+) -> Vec<Event> {
+    let response = value.get("response").unwrap_or(value);
+    if response_has_content_filter_terminal(response) {
+        return chat_terminal_failure_events(state, "content_filter");
+    }
+    if response_has_length_terminal(response) {
+        return chat_terminal_failure_events(state, "length");
+    }
+    let kind =
+        hidden_failure_kind_from_json(value, &state.model, &reqwest::header::HeaderMap::new())
+            .unwrap_or(UpstreamFailureKind::Generic);
+    chat_gateway_failure_events(state, kind)
+}
+
+fn chat_terminal_failure_events(
+    state: &mut ChatStreamAdapterState,
+    finish_reason: &'static str,
+) -> Vec<Event> {
+    state.finished = true;
+    let mut out = ensure_assistant_role_event(state);
+    out.push(chat_completion_sse_event(chat_completion_chunk(
+        &state.chat_id,
+        &state.model,
+        state.created,
+        json!({}),
+        Some(finish_reason),
+    )));
+    out.push(Event::default().data("[DONE]"));
+    out
+}
+
+fn chat_gateway_failure_events(
+    state: &mut ChatStreamAdapterState,
+    kind: UpstreamFailureKind,
+) -> Vec<Event> {
+    state.finished = true;
+    vec![
+        Event::default()
+            .event("error")
+            .data(gateway_error_value(gateway_failure_reason_from_upstream(kind)).to_string()),
+        Event::default().data("[DONE]"),
+    ]
 }
 
 fn parse_sse_record(record: &str) -> Option<(String, String)> {
@@ -5314,6 +5404,7 @@ async fn resolve_request_scope(
             let principal_id = format!("tenant:{}/principal:{affinity}", auth.tenant.slug);
             return Ok(RequestRoutingScope {
                 placement_affinity_key: principal_id.clone(),
+                lease_principal_id: principal_id.clone(),
                 principal_id,
                 session_key: affinity.to_string(),
                 window_id: None,
@@ -5327,6 +5418,7 @@ async fn resolve_request_scope(
         let principal_id = format!("tenant:{}/request:{request_key}", auth.tenant.slug);
         return Ok(RequestRoutingScope {
             placement_affinity_key: format!("tenant:{}/request:{request_key}", auth.tenant.id),
+            lease_principal_id: principal_id.clone(),
             principal_id,
             session_key: request_key,
             window_id: None,
@@ -5351,6 +5443,10 @@ async fn resolve_request_scope(
         .await;
     Ok(RequestRoutingScope {
         principal_id: thread.principal_id.clone(),
+        lease_principal_id: format!(
+            "tenant:{}/thread-family:{}",
+            auth.tenant.slug, thread.root_thread_id
+        ),
         placement_affinity_key: format!(
             "tenant:{}/thread-family:{}",
             auth.tenant.id, thread.root_thread_id
@@ -5474,6 +5570,7 @@ fn log_request_attempt(
         attempt = attempt + 1,
         continuity_mode = routing.continuity_mode.as_str(),
         principal_id = %routing.principal_id,
+        lease_principal_id = %routing.lease_principal_id,
         window_id = ?routing.window_id,
         thread_family_id = ?routing.thread_family_id,
         parent_thread_id = ?routing.parent_thread_id,
@@ -5505,6 +5602,7 @@ fn log_selection_exhausted(
         reasoning_effort = ?request_log.reasoning_effort,
         continuity_mode = routing.continuity_mode.as_str(),
         principal_id = %routing.principal_id,
+        lease_principal_id = %routing.lease_principal_id,
         window_id = ?routing.window_id,
         thread_family_id = ?routing.thread_family_id,
         parent_thread_id = ?routing.parent_thread_id,
@@ -6626,6 +6724,7 @@ mod tests {
         headers.insert("x-client-request-id", HeaderValue::from_static("req-123"));
         let routing = RequestRoutingScope {
             principal_id: "tenant:test/principal:thread-1".to_string(),
+            lease_principal_id: "tenant:test/thread-family:root-1".to_string(),
             placement_affinity_key: "tenant:test/thread-family:root-1".to_string(),
             session_key: "root-1".to_string(),
             window_id: Some("thread-1".to_string()),
@@ -6666,6 +6765,10 @@ mod tests {
         let context = forward_context(&headers, &routing);
 
         assert_eq!(routing.session_key, "root-thread");
+        assert_eq!(
+            routing.lease_principal_id,
+            "tenant:test/thread-family:root-thread"
+        );
         assert_eq!(routing.thread_family_id.as_deref(), Some("root-thread"));
         assert_eq!(context.conversation_id, "root-thread");
         assert_eq!(context.window_id.as_deref(), Some("child-thread:3"));
@@ -6903,6 +7006,25 @@ mod tests {
             &mut state,
         );
         assert_eq!(completed_events.len(), 2);
+        assert!(state.finished);
+    }
+
+    #[test]
+    fn response_failed_sse_event_terminates_chat_stream() {
+        let created = Utc::now().timestamp();
+        let mut state = ChatStreamAdapterState::new("gpt-5.4", created);
+
+        let created_events = translate_response_record_to_chat_events(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fail_1\",\"model\":\"gpt-5.4\"}}",
+            &mut state,
+        );
+        assert_eq!(created_events.len(), 1);
+
+        let failed_events = translate_response_record_to_chat_events(
+            "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_fail_1\",\"status\":\"failed\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"context window exceeded\"}}}",
+            &mut state,
+        );
+        assert_eq!(failed_events.len(), 2);
         assert!(state.finished);
     }
 
