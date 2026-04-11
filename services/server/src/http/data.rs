@@ -1959,7 +1959,7 @@ fn codex_worker_model_fallback(
         || normalized.starts_with("gpt-5.1-codex-mini-")
         || normalized.contains("-codex-mini-")
     {
-        return codex_default_or("gpt-5.3-codex");
+        return default_model_or("gpt-5.3-codex");
     }
     if matches!(
         normalized.as_str(),
@@ -2632,6 +2632,7 @@ async fn upstream_stream_to_ws_response(
     let mut streamed_output_items = BTreeMap::new();
     let mut completed_response = None;
     let mut had_hidden_failure = false;
+    let mut client_disconnected = false;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(heartbeat_seconds.max(1)));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let _ = heartbeat.tick().await;
@@ -2652,9 +2653,15 @@ async fn upstream_stream_to_ws_response(
         if let Some(delta) = response_delta_text(&record) {
             output_summary.push_str(delta.as_str());
         }
-        send_ws_record(socket, &record)
-            .await
-            .map_err(|_| UpstreamFailureKind::Generic)?;
+        if send_ws_record(socket, &record).await.is_err() {
+            client_disconnected = true;
+            break;
+        }
+    }
+
+    if client_disconnected {
+        state.discard_pending_context_turn(&principal_id).await;
+        return Ok(());
     }
 
     loop {
@@ -2666,12 +2673,14 @@ async fn upstream_stream_to_ws_response(
                     let Ok(chunk) = chunk else {
                         had_hidden_failure = true;
                         handle_hidden_failure(state, &lease, UpstreamFailureKind::Generic).await;
-                        send_ws_gateway_failure_response(
+                        if send_ws_gateway_failure_response(
                             socket,
                             GatewayFailureReason::UpstreamFailure,
                         )
                         .await
-                        .map_err(|_| UpstreamFailureKind::Generic)?;
+                        .is_err() {
+                            client_disconnected = true;
+                        }
                         break;
                     };
                     buffer.push_str(&String::from_utf8_lossy(chunk.as_ref()).replace("\r\n", "\n"));
@@ -2692,26 +2701,32 @@ async fn upstream_stream_to_ws_response(
                         if let Some(delta) = response_delta_text(&record) {
                             output_summary.push_str(delta.as_str());
                         }
-                        send_ws_record(socket, &record)
-                            .await
-                            .map_err(|_| UpstreamFailureKind::Generic)?;
+                        if send_ws_record(socket, &record).await.is_err() {
+                            client_disconnected = true;
+                            break;
+                        }
                         if let Some(kind) = hidden_kind {
                             had_hidden_failure = true;
                             handle_hidden_failure(state, &lease, kind).await;
                             break;
                         }
                     }
-                    if had_hidden_failure {
+                    if had_hidden_failure || client_disconnected {
                         break;
                     }
                 }
                 _ = heartbeat.tick() => {
-                    socket
-                        .send(Message::Ping(Bytes::new()))
-                    .await
-                    .map_err(|_| UpstreamFailureKind::Generic)?;
+                    if socket.send(Message::Ping(Bytes::new())).await.is_err() {
+                        client_disconnected = true;
+                        break;
+                    }
             }
         }
+    }
+
+    if client_disconnected {
+        state.discard_pending_context_turn(&principal_id).await;
+        return Ok(());
     }
 
     if had_hidden_failure {
