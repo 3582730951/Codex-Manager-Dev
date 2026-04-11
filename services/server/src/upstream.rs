@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use axum::http::header::{ACCEPT, CONTENT_ENCODING, CONTENT_TYPE};
+use chrono::{DateTime, TimeZone, Utc};
 use reqwest::{Client, Proxy, Response, StatusCode};
 use serde_json::Value;
 use tracing::warn;
@@ -28,14 +29,19 @@ pub enum UpstreamFailureKind {
     Cf,
     Auth,
     Quota,
+    RateLimited,
     Capability,
+    Length,
     Continuation,
     Generic,
 }
 
 impl UpstreamFailureKind {
     pub fn requires_failover(self) -> bool {
-        matches!(self, Self::Cf | Self::Auth | Self::Quota | Self::Capability)
+        matches!(
+            self,
+            Self::Cf | Self::Auth | Self::Quota | Self::RateLimited | Self::Capability
+        )
     }
 
     pub fn cooldown_seconds(self) -> i64 {
@@ -43,7 +49,9 @@ impl UpstreamFailureKind {
             Self::Cf => 300,
             Self::Auth => 300,
             Self::Quota => 1800,
+            Self::RateLimited => 45,
             Self::Capability => 300,
+            Self::Length => 0,
             Self::Continuation => 0,
             Self::Generic => 0,
         }
@@ -54,9 +62,28 @@ impl UpstreamFailureKind {
             Self::Cf => "cf",
             Self::Auth => "auth",
             Self::Quota => "quota",
+            Self::RateLimited => "rate_limited",
             Self::Capability => "capability",
+            Self::Length => "length",
             Self::Continuation => "continuation",
             Self::Generic => "generic",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamFailureSubkind {
+    Quota429,
+    Cf429,
+    Ambiguous429,
+}
+
+impl UpstreamFailureSubkind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Quota429 => "quota_429",
+            Self::Cf429 => "cf_429",
+            Self::Ambiguous429 => "ambiguous_429",
         }
     }
 }
@@ -66,6 +93,17 @@ pub struct UpstreamFailure {
     pub status: Option<StatusCode>,
     pub body: Option<String>,
     pub kind: UpstreamFailureKind,
+    pub subkind: Option<UpstreamFailureSubkind>,
+    pub cf_ray: Option<String>,
+    pub reset_at: Option<DateTime<Utc>>,
+}
+
+impl UpstreamFailure {
+    pub fn subkind_label(&self) -> &'static str {
+        self.subkind
+            .map(UpstreamFailureSubkind::as_str)
+            .unwrap_or("-")
+    }
 }
 
 #[derive(Clone)]
@@ -161,6 +199,9 @@ impl UpstreamClient {
                 status: None,
                 body: None,
                 kind: UpstreamFailureKind::Generic,
+                subkind: None,
+                cf_ray: None,
+                reset_at: None,
             }
         })?;
 
@@ -172,10 +213,25 @@ impl UpstreamClient {
         let headers = response.headers().clone();
         let body = response.text().await.unwrap_or_default();
         let kind = classify_failure(status, &headers, &body);
+        let subkind = classify_failure_subkind(status, &headers, &body, kind);
+        let cf_ray = headers
+            .get("cf-ray")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let reset_at = if matches!(subkind, Some(UpstreamFailureSubkind::Quota429))
+            || (kind == UpstreamFailureKind::Quota && status == StatusCode::TOO_MANY_REQUESTS)
+        {
+            extract_quota_reset_at(&body)
+        } else {
+            None
+        };
         Err(UpstreamFailure {
             status: Some(status),
             body: Some(body),
             kind,
+            subkind,
+            cf_ray,
+            reset_at,
         })
     }
 
@@ -278,8 +334,13 @@ fn build_request_body(payload: &Value, compress: bool) -> (Vec<u8>, bool) {
 }
 
 fn should_use_zstd_request_compression(base_url: &str, path: &str) -> bool {
-    base_url.to_ascii_lowercase().contains("/backend-api/codex")
-        && path.trim_matches('/').eq_ignore_ascii_case("responses")
+    if !base_url.to_ascii_lowercase().contains("/backend-api/codex") {
+        return false;
+    }
+    matches!(
+        path.trim_matches('/').to_ascii_lowercase().as_str(),
+        "responses" | "responses/compact"
+    )
 }
 
 pub fn endpoint_url(base_url: &str, path: &str) -> String {
@@ -334,12 +395,44 @@ pub fn classify_failure(
         return UpstreamFailureKind::Cf;
     }
     if status == StatusCode::TOO_MANY_REQUESTS {
-        return UpstreamFailureKind::Quota;
+        return UpstreamFailureKind::RateLimited;
     }
     if let Some(kind) = body_kind {
         return kind;
     }
     UpstreamFailureKind::Generic
+}
+
+pub fn classify_failure_subkind(
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+    kind: UpstreamFailureKind,
+) -> Option<UpstreamFailureSubkind> {
+    if status != StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    match kind {
+        UpstreamFailureKind::Quota => Some(UpstreamFailureSubkind::Quota429),
+        UpstreamFailureKind::Cf => Some(UpstreamFailureSubkind::Cf429),
+        UpstreamFailureKind::RateLimited => {
+            if looks_like_cf(status, headers, body) {
+                Some(UpstreamFailureSubkind::Cf429)
+            } else {
+                Some(UpstreamFailureSubkind::Ambiguous429)
+            }
+        }
+        _ => None,
+    }
+}
+
+pub fn extract_quota_reset_at(body: &str) -> Option<DateTime<Utc>> {
+    let value = serde_json::from_str::<Value>(body).ok()?;
+    let resets_at = value
+        .pointer("/error/resets_at")
+        .and_then(Value::as_i64)
+        .or_else(|| value.pointer("/resets_at").and_then(Value::as_i64))?;
+    Utc.timestamp_opt(resets_at, 0).single()
 }
 
 pub fn classify_failure_body(body: &str) -> Option<UpstreamFailureKind> {
@@ -383,6 +476,19 @@ pub fn classify_failure_body(body: &str) -> Option<UpstreamFailureKind> {
     .any(|needle| lowered.contains(needle))
     {
         return Some(UpstreamFailureKind::Quota);
+    }
+    if [
+        "context_length_exceeded",
+        "context window",
+        "maximum context length",
+        "input too large",
+        "payload too large",
+        "request body too large",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+    {
+        return Some(UpstreamFailureKind::Length);
     }
     if [
         "previous_response_id",
@@ -649,6 +755,89 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn post_json_compresses_codex_compact_requests() {
+        let recorder = Recorder::default();
+        let app = Router::new()
+            .route(
+                "/backend-api/codex/responses/compact",
+                post(record_raw_request),
+            )
+            .with_state(recorder.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let client = UpstreamClient::new(&Config {
+            bind_addr: "127.0.0.1".parse().expect("ip"),
+            data_port: 8080,
+            admin_port: 8081,
+            max_data_plane_body_bytes: 64 * 1024 * 1024,
+            postgres_url: "postgres://localhost/test".to_string(),
+            redis_url: "redis://127.0.0.1:6379".to_string(),
+            redis_channel: "cmgr:test".to_string(),
+            instance_id: "cmgr-test".to_string(),
+            browser_assist_url: "http://127.0.0.1:8090".to_string(),
+            heartbeat_seconds: 5,
+            enable_demo_seed: false,
+            account_encryption_key: None,
+            direct_proxy_url: None,
+            warp_proxy_url: None,
+            browser_assist_direct_proxy_url: None,
+            browser_assist_warp_proxy_url: None,
+        });
+        let credential = UpstreamCredential {
+            account_id: "acc_1".to_string(),
+            base_url: format!("http://{addr}/backend-api/codex"),
+            bearer_token: "secret".to_string(),
+            chatgpt_account_id: None,
+            extra_headers: Vec::new(),
+            managed_auth: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let response = client
+            .post_json(
+                &credential,
+                "responses/compact",
+                &json!({"model":"gpt-5.4","input":[],"tools":[],"parallel_tool_calls":false}),
+                &ForwardContext {
+                    conversation_id: "sess-789".to_string(),
+                    request_id: "req-789".to_string(),
+                    subagent: None,
+                    originator: Some("cmgr".to_string()),
+                    window_id: None,
+                    parent_thread_id: None,
+                },
+                false,
+                RouteMode::Direct,
+            )
+            .await
+            .expect("success");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let headers = recorder.headers.lock().await;
+        let request_headers = headers.first().expect("recorded headers");
+        assert_eq!(
+            request_headers
+                .get(CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("zstd")
+        );
+
+        let bodies = recorder.bodies.lock().await;
+        let request_body = bodies.first().expect("recorded body");
+        assert_eq!(
+            request_body
+                .get("parallel_tool_calls")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
     #[test]
     fn endpoint_url_does_not_duplicate_path() {
         assert_eq!(
@@ -675,6 +864,10 @@ mod tests {
         assert!(should_use_zstd_request_compression(
             "https://chatgpt.com/backend-api/codex",
             "responses"
+        ));
+        assert!(should_use_zstd_request_compression(
+            "https://chatgpt.com/backend-api/codex",
+            "responses/compact"
         ));
         assert!(!should_use_zstd_request_compression(
             "https://api.openai.com/v1",
@@ -754,6 +947,22 @@ mod tests {
     }
 
     #[test]
+    fn classify_failure_detects_context_window_overflow() {
+        let headers = reqwest::header::HeaderMap::new();
+
+        assert_eq!(
+            classify_failure(
+                StatusCode::BAD_REQUEST,
+                &headers,
+                "{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"This request exceeds the context window.\"}}"
+            ),
+            UpstreamFailureKind::Length
+        );
+        assert!(!UpstreamFailureKind::Length.requires_failover());
+        assert_eq!(UpstreamFailureKind::Length.cooldown_seconds(), 0);
+    }
+
+    #[test]
     fn classify_failure_prefers_quota_over_cf_headers() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("cf-ray", reqwest::header::HeaderValue::from_static("123"));
@@ -766,5 +975,33 @@ mod tests {
             ),
             UpstreamFailureKind::Quota
         );
+    }
+
+    #[test]
+    fn classify_failure_uses_rate_limited_for_ambiguous_429() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert_eq!(
+            classify_failure(
+                StatusCode::TOO_MANY_REQUESTS,
+                &headers,
+                "{\"error\":\"slow down\"}"
+            ),
+            UpstreamFailureKind::RateLimited
+        );
+        assert_eq!(
+            classify_failure_subkind(
+                StatusCode::TOO_MANY_REQUESTS,
+                &headers,
+                "{\"error\":\"slow down\"}",
+                UpstreamFailureKind::RateLimited,
+            ),
+            Some(UpstreamFailureSubkind::Ambiguous429)
+        );
+    }
+
+    #[test]
+    fn extract_quota_reset_at_reads_epoch_seconds() {
+        let body = "{\"error\":{\"type\":\"usage_limit_reached\",\"resets_at\":1775904024}}";
+        assert!(extract_quota_reset_at(body).is_some());
     }
 }

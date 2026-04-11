@@ -7,22 +7,22 @@ use tokio::{
     sync::{OwnedSemaphorePermit, RwLock, Semaphore, mpsc, mpsc::error::TryRecvError},
     time::Duration,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::models::{
-    AccountRouteState, AccountSummary, BehaviorProfile, BillingSummary, CacheMetrics,
-    CodexAppSessionRequest, CodexAppSessionResponse, CfIncident, CliLease,
-    CompactConversationThreadRequest, ContextTurn, ConversationContext, ConversationThread,
-    ConversationThreadView, CreateGatewayApiKeyRequest, CreateGatewayUserRequest,
-    CreateTenantRequest, CreatedGatewayApiKey, CreatedGatewayUser, DashboardCounts,
-    DashboardLiveSnapshot, DashboardSnapshot, EgressSlot, ForkConversationThreadRequest,
-    GatewayApiKey, GatewayApiKeyView, GatewayUserRole, GatewayUserView, ImportAccountRequest,
-    LeaseSelectionRequest, ManagedAuthState, OpenAiLoginCompleteRequest, OpenAiLoginSessionView,
-    OpenAiLoginStartRequest, OpenAiLoginStartResponse, PendingContextTurn, RequestLogEntry,
-    RouteEventRequest, RouteMode, SchedulingSignals, StartConversationThreadRequest, Tenant,
-    ThreadEdge, TopologyNode, TurnOutcome, UpdateGatewayUserRequest, UpstreamAccount,
-    UpstreamCredential,
+    AccountAlert, AccountAvailabilityState, AccountCleanupResult, AccountRouteState,
+    AccountSummary, BehaviorProfile, BillingSummary, CacheMetrics, CfIncident, CliLease,
+    CodexAppSessionRequest, CodexAppSessionResponse, CompactConversationThreadRequest, ContextTurn,
+    ConversationContext, ConversationThread, ConversationThreadView, CreateGatewayApiKeyRequest,
+    CreateGatewayUserRequest, CreateTenantRequest, CreatedGatewayApiKey, CreatedGatewayUser,
+    DashboardCounts, DashboardLiveSnapshot, DashboardSnapshot, EgressSlot,
+    ForkConversationThreadRequest, GatewayApiKey, GatewayApiKeyView, GatewayUserRole,
+    GatewayUserView, ImportAccountRequest, LeaseSelectionRequest, ManagedAccountStatus,
+    ManagedAuthState, OpenAiLoginCompleteRequest, OpenAiLoginSessionView, OpenAiLoginStartRequest,
+    OpenAiLoginStartResponse, PendingContextTurn, RequestLogEntry, RouteEventRequest, RouteMode,
+    SchedulingSignals, StartConversationThreadRequest, Tenant, ThreadEdge, TopologyNode,
+    TurnOutcome, UpdateGatewayUserRequest, UpstreamAccount, UpstreamCredential,
 };
 use crate::openai_auth;
 use crate::reasoning::normalize_reasoning_effort;
@@ -34,6 +34,47 @@ use crate::scheduler::token_optimizer::WarmupDecision;
 use crate::storage::{Persistence, PersistenceMessage, PersistenceSnapshot};
 use crate::upstream::UpstreamClient;
 use crate::{browser_assist, bus, config::Config};
+
+pub const MANAGED_ACCOUNT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+pub const MODEL_CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(900);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseSelectionExhaustedKind {
+    QuotaExhausted,
+    Cooldown,
+    Capability,
+    Unavailable,
+}
+
+impl LeaseSelectionExhaustedKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::Cooldown => "cooldown",
+            Self::Capability => "capability",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LeaseSelectionExhausted {
+    pub kind: LeaseSelectionExhaustedKind,
+    pub attempted_account_ids: Vec<String>,
+    pub skipped_quota_count: usize,
+    pub skipped_cooldown_count: usize,
+    pub skipped_inflight_count: usize,
+    pub skipped_capability_count: usize,
+    pub skipped_unavailable_count: usize,
+    pub earliest_reset_at: Option<chrono::DateTime<Utc>>,
+    pub earliest_retry_at: Option<chrono::DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum LeaseSelectionOutcome {
+    Selected(CliLease, String, WarmupDecision),
+    Exhausted(LeaseSelectionExhausted),
+}
 
 #[derive(Debug, Clone)]
 pub struct GatewayAuthContext {
@@ -595,6 +636,7 @@ impl AppState {
 
         let cf_incidents = self.runtime.cf_incidents.read().await.clone();
         let account_summaries = self.account_summaries().await;
+        let account_alerts = derive_account_alerts(&account_summaries);
         let request_logs = self.list_request_logs().await;
         let cache_metrics = self.derived_cache_metrics(&request_logs).await;
         let billing = self.billing_summary(&request_logs);
@@ -635,6 +677,7 @@ impl AppState {
             cache_metrics,
             accounts: account_summaries,
             leases: leases.clone(),
+            account_alerts,
             cf_incidents,
             browser_tasks: Vec::new(),
             users: users.clone(),
@@ -1743,8 +1786,8 @@ impl AppState {
             let credential = credentials
                 .get_mut(account_id)
                 .ok_or_else(|| "账号凭证不存在。".to_string())?;
-            if let Some(chatgpt_account_id) = chatgpt_account_id
-                .filter(|value| !value.trim().is_empty())
+            if let Some(chatgpt_account_id) =
+                chatgpt_account_id.filter(|value| !value.trim().is_empty())
             {
                 credential.chatgpt_account_id = Some(chatgpt_account_id);
             }
@@ -1810,15 +1853,21 @@ impl AppState {
 
         if force_token_refresh {
             if let Some(refresh_token) = maybe_refresh_token.as_deref() {
-                let refreshed = openai_auth::refresh_access_token(refresh_token).await?;
+                let refreshed = match openai_auth::refresh_access_token(refresh_token).await {
+                    Ok(refreshed) => refreshed,
+                    Err(message) => {
+                        self.record_managed_account_failure(account_id, message.clone(), true)
+                            .await;
+                        return Err(message);
+                    }
+                };
                 if let Some(rotated_refresh_token) = refreshed.refresh_token.as_deref() {
                     self.attach_rotated_refresh_token(account_id, rotated_refresh_token)
                         .await?;
                 }
                 if credential.chatgpt_account_id.is_none() {
-                    credential.chatgpt_account_id = openai_auth::extract_chatgpt_account_id(
-                        &refreshed.access_token,
-                    );
+                    credential.chatgpt_account_id =
+                        openai_auth::extract_chatgpt_account_id(&refreshed.access_token);
                 }
                 if let Some(plan_type) =
                     openai_auth::extract_plan_type_from_token(&refreshed.access_token)
@@ -1841,24 +1890,56 @@ impl AppState {
 
         let snapshot = match fetched {
             Ok(snapshot) => snapshot,
-            Err(error) if error.unauthorized && maybe_refresh_token.is_some() && !refreshed_access_token => {
-                let refreshed =
-                    openai_auth::refresh_access_token(maybe_refresh_token.as_deref().unwrap_or_default())
-                        .await?;
+            Err(error)
+                if error.unauthorized
+                    && maybe_refresh_token.is_some()
+                    && !refreshed_access_token =>
+            {
+                let refreshed = match openai_auth::refresh_access_token(
+                    maybe_refresh_token.as_deref().unwrap_or_default(),
+                )
+                .await
+                {
+                    Ok(refreshed) => refreshed,
+                    Err(message) => {
+                        self.record_managed_account_failure(account_id, message.clone(), true)
+                            .await;
+                        return Err(message);
+                    }
+                };
                 access_token = refreshed.access_token;
                 if let Some(rotated_refresh_token) = refreshed.refresh_token.as_deref() {
                     self.attach_rotated_refresh_token(account_id, rotated_refresh_token)
                         .await?;
                 }
-                openai_auth::fetch_managed_chatgpt_snapshot(
+                match openai_auth::fetch_managed_chatgpt_snapshot(
                     &credential.base_url,
                     &access_token,
                     credential.chatgpt_account_id.as_deref(),
                 )
                 .await
-                .map_err(|error| error.message)?
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        self.record_managed_account_failure(
+                            account_id,
+                            error.message.clone(),
+                            error.unauthorized,
+                        )
+                        .await;
+                        return Err(error.message);
+                    }
+                }
             }
-            Err(error) => return Err(error.message),
+            Err(error) => {
+                self.record_managed_account_failure(
+                    account_id,
+                    error.message.clone(),
+                    error.unauthorized,
+                )
+                .await;
+                return Err(error.message);
+            }
         };
 
         let managed_snapshot = {
@@ -1870,13 +1951,18 @@ impl AppState {
             if let Some(chatgpt_account_id) = snapshot.chatgpt_account_id.clone() {
                 credential.chatgpt_account_id = Some(chatgpt_account_id);
             }
-            let managed = credential.managed_auth.get_or_insert_with(ManagedAuthState::default);
+            let managed = credential
+                .managed_auth
+                .get_or_insert_with(ManagedAuthState::default);
             managed.email = snapshot.email.or_else(|| managed.email.clone());
             managed.plan_type = snapshot.plan_type.or_else(|| managed.plan_type.clone());
-            managed.workspace_role = snapshot.workspace_role.or_else(|| managed.workspace_role.clone());
-            managed.is_workspace_owner = snapshot
-                .is_workspace_owner
-                .or(managed.is_workspace_owner);
+            managed.workspace_role = snapshot
+                .workspace_role
+                .or_else(|| managed.workspace_role.clone());
+            managed.is_workspace_owner = snapshot.is_workspace_owner.or(managed.is_workspace_owner);
+            managed.status = ManagedAccountStatus::Active;
+            managed.status_reason = None;
+            managed.last_error = None;
             managed.rate_limits = snapshot.rate_limits.clone();
             managed.rate_limits_by_limit_id = snapshot.rate_limits_by_limit_id.clone();
             managed.last_refreshed_at = Some(Utc::now());
@@ -1884,11 +1970,40 @@ impl AppState {
             credential.clone()
         };
 
-        self.apply_managed_rate_limits_to_account(account_id, managed_snapshot.managed_auth.as_ref())
-            .await;
+        self.apply_managed_rate_limits_to_account(
+            account_id,
+            managed_snapshot.managed_auth.as_ref(),
+        )
+        .await;
         self.enqueue(PersistenceMessage::CredentialUpsert(managed_snapshot))
             .await;
         Ok(())
+    }
+
+    async fn record_managed_account_failure(
+        &self,
+        account_id: &str,
+        message: String,
+        unauthorized: bool,
+    ) {
+        let snapshot = {
+            let mut credentials = self.runtime.credentials.write().await;
+            let Some(credential) = credentials.get_mut(account_id) else {
+                return;
+            };
+            let managed = credential
+                .managed_auth
+                .get_or_insert_with(ManagedAuthState::default);
+            let (status, reason) = classify_managed_account_status(&message, unauthorized);
+            managed.status = status;
+            managed.status_reason = Some(reason);
+            managed.last_error = Some(message);
+            credential.updated_at = Utc::now();
+            credential.clone()
+        };
+
+        self.enqueue(PersistenceMessage::CredentialUpsert(snapshot))
+            .await;
     }
 
     async fn attach_rotated_refresh_token(
@@ -1957,7 +2072,8 @@ impl AppState {
         account_id: &str,
         managed_auth: Option<&ManagedAuthState>,
     ) {
-        let Some(rate_limits) = managed_auth.and_then(|managed| managed.rate_limits.as_ref()) else {
+        let Some(rate_limits) = managed_auth.and_then(|managed| managed.rate_limits.as_ref())
+        else {
             return;
         };
         let primary = rate_limits.primary.as_ref();
@@ -1988,12 +2104,13 @@ impl AppState {
             account.clone()
         };
 
-        self.enqueue(PersistenceMessage::AccountUpsert(updated)).await;
+        self.enqueue(PersistenceMessage::AccountUpsert(updated))
+            .await;
     }
 
     pub async fn dashboard_live_snapshot(&self) -> DashboardLiveSnapshot {
         let _ = self
-            .refresh_stale_managed_accounts(Duration::from_secs(30))
+            .refresh_stale_managed_accounts(MANAGED_ACCOUNT_REFRESH_INTERVAL)
             .await;
         let snapshot = self.dashboard_snapshot().await;
         DashboardLiveSnapshot {
@@ -2001,6 +2118,7 @@ impl AppState {
             cache_metrics: snapshot.cache_metrics,
             accounts: snapshot.accounts,
             leases: snapshot.leases,
+            account_alerts: snapshot.account_alerts,
             request_logs: snapshot.request_logs,
             billing: snapshot.billing,
         }
@@ -2044,9 +2162,7 @@ impl AppState {
                 .await
                 .values()
                 .find(|credential| {
-                    credential
-                        .managed_auth
-                        .is_some()
+                    credential.managed_auth.is_some()
                         && accounts
                             .get(&credential.account_id)
                             .is_some_and(|account| account.tenant_id == tenant_id)
@@ -2100,7 +2216,8 @@ impl AppState {
 
         let semaphore = {
             let mut gates = self.runtime.execution_gates.lock().ok()?;
-            gates.entry(account_id.to_string())
+            gates
+                .entry(account_id.to_string())
                 .or_insert_with(|| Arc::new(Semaphore::new(1)))
                 .clone()
         };
@@ -2134,11 +2251,7 @@ impl AppState {
         matching == 1 && accounts.contains_key(account_id)
     }
 
-    async fn should_protect_sole_account(
-        &self,
-        account_id: &str,
-        model: Option<&str>,
-    ) -> bool {
+    async fn should_protect_sole_account(&self, account_id: &str, model: Option<&str>) -> bool {
         let Some(account) = self.runtime.accounts.read().await.get(account_id).cloned() else {
             return false;
         };
@@ -2228,7 +2341,15 @@ impl AppState {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    warn!(account_id = %account.id, %error, "failed to refresh upstream model catalog");
+                    if is_best_effort_model_catalog_error(&error) {
+                        debug!(
+                            account_id = %account.id,
+                            %error,
+                            "upstream model catalog refresh unavailable; retaining cached models"
+                        );
+                    } else {
+                        warn!(account_id = %account.id, %error, "failed to refresh upstream model catalog");
+                    }
                 }
             }
         }
@@ -2255,6 +2376,92 @@ impl AppState {
         }
 
         Ok(self.account_summaries().await)
+    }
+
+    pub async fn refresh_account_quota(&self, account_id: &str) -> Result<AccountSummary, String> {
+        if !self.runtime.accounts.read().await.contains_key(account_id) {
+            return Err("账号不存在。".to_string());
+        }
+        let credential = self
+            .credential_for_account(account_id)
+            .await
+            .ok_or_else(|| "账号凭证不存在。".to_string())?;
+        if credential.managed_auth.is_none() {
+            return Err("当前账号不是 ChatGPT 受管账号，无法刷新额度。".to_string());
+        }
+        self.refresh_managed_account(account_id, false).await?;
+        self.account_summary(account_id)
+            .await
+            .ok_or_else(|| "账号不存在。".to_string())
+    }
+
+    pub async fn delete_account(&self, account_id: &str) -> Result<(), String> {
+        let removed = self
+            .runtime
+            .accounts
+            .write()
+            .await
+            .remove(account_id)
+            .is_some();
+        if !removed {
+            return Err("账号不存在。".to_string());
+        }
+
+        self.runtime.credentials.write().await.remove(account_id);
+        self.runtime.route_states.write().await.remove(account_id);
+        self.runtime
+            .ephemeral_refresh_tokens
+            .write()
+            .await
+            .remove(account_id);
+        self.runtime
+            .codex_app_sessions
+            .write()
+            .await
+            .retain(|_, session| session.account_id != account_id);
+
+        if let Ok(mut gates) = self.runtime.execution_gates.lock() {
+            gates.remove(account_id);
+        }
+        if let Ok(mut inflight) = self.runtime.execution_inflight.lock() {
+            inflight.remove(account_id);
+        }
+
+        let evicted_leases = self.evict_leases_for_account(account_id).await;
+        if !evicted_leases.is_empty() {
+            self.enqueue_many(
+                evicted_leases
+                    .into_iter()
+                    .map(|lease| PersistenceMessage::LeaseDelete(lease.principal_id))
+                    .collect(),
+            )
+            .await;
+        }
+        self.enqueue(PersistenceMessage::AccountDelete(account_id.to_string()))
+            .await;
+        Ok(())
+    }
+
+    pub async fn cleanup_banned_accounts(&self) -> Result<AccountCleanupResult, String> {
+        let accounts = self.account_summaries().await;
+        let deleted_account_ids = accounts
+            .iter()
+            .filter(|account| account.status == ManagedAccountStatus::Banned)
+            .map(|account| account.id.clone())
+            .collect::<Vec<_>>();
+        let scanned = accounts.len();
+        let deleted = deleted_account_ids.len();
+
+        for account_id in &deleted_account_ids {
+            self.delete_account(account_id).await?;
+        }
+
+        Ok(AccountCleanupResult {
+            scanned,
+            deleted,
+            skipped_not_banned: scanned.saturating_sub(deleted),
+            deleted_account_ids,
+        })
     }
 
     pub async fn record_request_log(&self, entry: RequestLogEntry) {
@@ -2544,10 +2751,116 @@ impl AppState {
         Some(state_snapshot)
     }
 
+    pub async fn mark_account_quota_exhausted(
+        &self,
+        account_id: &str,
+        reset_at: Option<chrono::DateTime<Utc>>,
+        message: Option<&str>,
+    ) -> Option<AccountRouteState> {
+        let now = Utc::now();
+        let until = reset_at.unwrap_or_else(|| now + ChronoDuration::minutes(30));
+        let state_snapshot = {
+            let mut route_states = self.runtime.route_states.write().await;
+            let state = route_states.get_mut(account_id)?;
+            state.success_streak = 0;
+            state.cooldown_level = state.cooldown_level.max(1);
+            state.cooldown_until = Some(until);
+            state.cooldown_reason = Some(match message {
+                Some(message) if !message.trim().is_empty() => {
+                    format!("quota_exhausted:{message}")
+                }
+                _ => "quota_exhausted".to_string(),
+            });
+            state.clone()
+        };
+
+        let account_snapshot = {
+            let mut accounts = self.runtime.accounts.write().await;
+            let account = accounts.get_mut(account_id)?;
+            account.current_mode = state_snapshot.route_mode;
+            account.clone()
+        };
+
+        let incident = CfIncident {
+            id: Uuid::new_v4().to_string(),
+            account_id: account_id.to_string(),
+            account_label: account_snapshot.label.clone(),
+            route_mode: state_snapshot.route_mode,
+            severity: "quota_exhausted".to_string(),
+            happened_at: now,
+            cooldown_level: state_snapshot.cooldown_level,
+        };
+
+        {
+            let mut incidents = self.runtime.cf_incidents.write().await;
+            incidents.insert(0, incident.clone());
+            incidents.truncate(128);
+        }
+
+        let evicted_leases = self.evict_leases_for_account(account_id).await;
+        let mut messages = vec![
+            PersistenceMessage::AccountUpsert(account_snapshot),
+            PersistenceMessage::RouteStateUpsert(state_snapshot.clone()),
+            PersistenceMessage::IncidentInsert(incident),
+        ];
+        messages.extend(
+            evicted_leases
+                .iter()
+                .map(|lease| PersistenceMessage::LeaseDelete(lease.principal_id.clone())),
+        );
+        self.enqueue_many(messages).await;
+
+        Some(state_snapshot)
+    }
+
+    #[allow(dead_code)]
     pub async fn resolve_lease(
         &self,
         request: LeaseSelectionRequest,
     ) -> Option<(CliLease, String, WarmupDecision)> {
+        match self.resolve_lease_outcome(request).await {
+            LeaseSelectionOutcome::Selected(lease, prompt_cache_key, warmup) => {
+                Some((lease, prompt_cache_key, warmup))
+            }
+            LeaseSelectionOutcome::Exhausted(_) => None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub async fn wait_for_quota_slot(
+        &self,
+        request: LeaseSelectionRequest,
+        mut earliest_reset_at: Option<chrono::DateTime<Utc>>,
+    ) -> LeaseSelectionOutcome {
+        loop {
+            let now = Utc::now();
+            let fallback = Duration::from_secs(5);
+            let wait_for = earliest_reset_at
+                .and_then(|reset_at| {
+                    if reset_at <= now {
+                        Some(Duration::from_secs(1))
+                    } else {
+                        (reset_at - now).to_std().ok()
+                    }
+                })
+                .map(|duration| duration.min(fallback))
+                .unwrap_or(fallback);
+            tokio::time::sleep(wait_for).await;
+            match self.resolve_lease_outcome(request.clone()).await {
+                LeaseSelectionOutcome::Exhausted(exhausted)
+                    if exhausted.kind == LeaseSelectionExhaustedKind::QuotaExhausted =>
+                {
+                    earliest_reset_at = exhausted.earliest_retry_at.or(exhausted.earliest_reset_at);
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
+    pub async fn resolve_lease_outcome(
+        &self,
+        request: LeaseSelectionRequest,
+    ) -> LeaseSelectionOutcome {
         let now = Utc::now();
         let principal_id = request.principal_id.clone();
 
@@ -2605,36 +2918,81 @@ impl AppState {
             .cloned()
             .collect::<Vec<_>>();
         let route_states = self.runtime.route_states.read().await.clone();
-        let credentialed_accounts = self
-            .runtime
-            .credentials
-            .read()
-            .await
-            .keys()
+        let credentials = self.runtime.credentials.read().await.clone();
+        let credentialed_accounts = credentials.keys().cloned().collect::<HashSet<_>>();
+        let tenant_accounts = accounts
+            .iter()
+            .filter(|account| account.tenant_id == request.tenant_id)
             .cloned()
-            .collect::<HashSet<_>>();
-        let tenant_model_accounts = accounts
+            .collect::<Vec<_>>();
+        let tenant_credentialed_accounts = tenant_accounts
+            .iter()
+            .filter(|account| credentialed_accounts.contains(account.id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let tenant_routable_accounts = tenant_credentialed_accounts
             .iter()
             .filter(|account| {
-                account.tenant_id == request.tenant_id
-                    && credentialed_accounts.contains(account.id.as_str())
-                    && account.models.iter().any(|model| model == &request.model)
+                credential_is_routable_for_selection(credentials.get(account.id.as_str()))
             })
             .cloned()
             .collect::<Vec<_>>();
-        let sole_protected_account_id = (tenant_model_accounts.len() == 1)
-            .then(|| tenant_model_accounts[0].id.clone());
-        let mut candidate_accounts = tenant_model_accounts
+        let tenant_model_accounts = tenant_routable_accounts
             .iter()
-            .filter(|account| {
-                route_states.get(account.id.as_str()).is_some_and(|route_state| {
-                    !is_in_cooldown(route_state, now)
-                        || (sole_protected_account_id.as_deref() == Some(account.id.as_str())
-                            && route_state.cooldown_reason.as_deref() != Some("quota"))
-                })
-            })
+            .filter(|account| account.models.iter().any(|model| model == &request.model))
             .cloned()
             .collect::<Vec<_>>();
+        let attempted_account_ids = tenant_model_accounts
+            .iter()
+            .map(|account| account.id.clone())
+            .collect::<Vec<_>>();
+        let mut skipped_quota_count = 0_usize;
+        let mut skipped_cooldown_count = 0_usize;
+        let skipped_inflight_count = 0_usize;
+        let skipped_capability_count = if tenant_routable_accounts.is_empty() {
+            0
+        } else {
+            tenant_routable_accounts
+                .len()
+                .saturating_sub(tenant_model_accounts.len())
+        };
+        let skipped_unavailable_count = tenant_accounts
+            .len()
+            .saturating_sub(tenant_routable_accounts.len());
+        let mut earliest_reset_at: Option<chrono::DateTime<Utc>> = None;
+        let mut earliest_retry_at: Option<chrono::DateTime<Utc>> = None;
+        let mut candidate_accounts = Vec::new();
+
+        for account in &tenant_model_accounts {
+            let Some(route_state) = route_states.get(account.id.as_str()) else {
+                candidate_accounts.push(account.clone());
+                continue;
+            };
+            if route_state_is_quota_exhausted(route_state, now) {
+                skipped_quota_count += 1;
+                earliest_reset_at = match (earliest_reset_at, route_state.cooldown_until) {
+                    (Some(current), Some(candidate)) => Some(current.min(candidate)),
+                    (Some(current), None) => Some(current),
+                    (None, candidate) => candidate,
+                };
+                earliest_retry_at = match (earliest_retry_at, route_state.cooldown_until) {
+                    (Some(current), Some(candidate)) => Some(current.min(candidate)),
+                    (Some(current), None) => Some(current),
+                    (None, candidate) => candidate,
+                };
+                continue;
+            }
+            if is_in_cooldown(route_state, now) {
+                skipped_cooldown_count += 1;
+                earliest_retry_at = match (earliest_retry_at, route_state.cooldown_until) {
+                    (Some(current), Some(candidate)) => Some(current.min(candidate)),
+                    (Some(current), None) => Some(current),
+                    (None, candidate) => candidate,
+                };
+                continue;
+            }
+            candidate_accounts.push(account.clone());
+        }
 
         candidate_accounts.sort_by(|left, right| left.label.cmp(&right.label));
 
@@ -2647,33 +3005,73 @@ impl AppState {
                 route_states.get(existing.account_id.as_str()),
             ) {
                 if credentialed_accounts.contains(account.id.as_str())
-                    && (should_reuse_lease(existing, account, route_state)
-                        || (sole_protected_account_id.as_deref() == Some(account.id.as_str())
-                            && route_state.cooldown_reason.as_deref() != Some("quota")))
+                    && credential_is_routable_for_selection(credentials.get(account.id.as_str()))
+                    && should_reuse_lease(existing, account, route_state)
                     && account.models.contains(&request.model)
                 {
                     let lease_snapshot = {
                         let mut leases = self.runtime.leases.write().await;
-                        let lease = leases.get_mut(&principal_id)?;
-                        lease.last_used_at = now;
-                        lease.active_subagents = request.subagent_count;
-                        lease.route_mode = route_state.route_mode;
-                        lease.clone()
+                        refresh_reusable_lease_snapshot(
+                            &mut leases,
+                            &principal_id,
+                            request.subagent_count,
+                            route_state.route_mode,
+                            now,
+                        )
                     };
-                    let metrics_snapshot = current_cache_metrics_snapshot(
-                        &self.runtime.cache_metrics.read().await.clone(),
-                        &self.list_request_logs().await,
-                    );
-                    let warmup = observed_warmup_decision(&metrics_snapshot);
-                    self.enqueue(PersistenceMessage::LeaseUpsert(lease_snapshot.clone()))
-                        .await;
-                    return Some((lease_snapshot, request.cache_affinity_key.clone(), warmup));
+                    if let Some(lease_snapshot) = lease_snapshot {
+                        let metrics_snapshot = current_cache_metrics_snapshot(
+                            &self.runtime.cache_metrics.read().await.clone(),
+                            &self.list_request_logs().await,
+                        );
+                        let warmup = observed_warmup_decision(&metrics_snapshot);
+                        self.enqueue(PersistenceMessage::LeaseUpsert(lease_snapshot.clone()))
+                            .await;
+                        return LeaseSelectionOutcome::Selected(
+                            lease_snapshot,
+                            request.cache_affinity_key.clone(),
+                            warmup,
+                        );
+                    } else {
+                        // Another task evicted the lease between the read snapshot and the reuse
+                        // write-lock. Treat this as a stale binding and continue into fresh
+                        // candidate selection instead of surfacing a false empty-pool result.
+                        info!(
+                            principal_id = %principal_id,
+                            account_id = %existing.account_id,
+                            "lease disappeared during reuse path; falling back to fresh account selection"
+                        );
+                    }
                 }
             }
         }
 
         if candidate_accounts.is_empty() {
-            return None;
+            let kind = if tenant_model_accounts.is_empty() {
+                if tenant_routable_accounts.is_empty() {
+                    LeaseSelectionExhaustedKind::Unavailable
+                } else {
+                    LeaseSelectionExhaustedKind::Capability
+                }
+            } else if skipped_quota_count == tenant_model_accounts.len() && skipped_quota_count > 0
+            {
+                LeaseSelectionExhaustedKind::QuotaExhausted
+            } else if skipped_cooldown_count > 0 {
+                LeaseSelectionExhaustedKind::Cooldown
+            } else {
+                LeaseSelectionExhaustedKind::Unavailable
+            };
+            return LeaseSelectionOutcome::Exhausted(LeaseSelectionExhausted {
+                kind,
+                attempted_account_ids,
+                skipped_quota_count,
+                skipped_cooldown_count,
+                skipped_inflight_count,
+                skipped_capability_count,
+                skipped_unavailable_count,
+                earliest_reset_at,
+                earliest_retry_at,
+            });
         }
 
         let dual_candidates = select_dual_candidates(
@@ -2696,7 +3094,21 @@ impl AppState {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(account, _)| account)
-            .or_else(|| candidate_accounts.first().cloned())?;
+            .or_else(|| candidate_accounts.first().cloned());
+
+        let Some(selected) = selected else {
+            return LeaseSelectionOutcome::Exhausted(LeaseSelectionExhausted {
+                kind: LeaseSelectionExhaustedKind::Unavailable,
+                attempted_account_ids,
+                skipped_quota_count,
+                skipped_cooldown_count,
+                skipped_inflight_count,
+                skipped_capability_count,
+                skipped_unavailable_count,
+                earliest_reset_at,
+                earliest_retry_at,
+            });
+        };
 
         let generation = existing_lease
             .as_ref()
@@ -2740,7 +3152,7 @@ impl AppState {
         ])
         .await;
 
-        Some((lease, request.cache_affinity_key.clone(), warmup))
+        LeaseSelectionOutcome::Selected(lease, request.cache_affinity_key.clone(), warmup)
     }
 
     pub async fn begin_context_turn(
@@ -3112,7 +3524,15 @@ impl AppState {
             .collect()
     }
 
+    async fn account_summary(&self, account_id: &str) -> Option<AccountSummary> {
+        self.account_summaries()
+            .await
+            .into_iter()
+            .find(|account| account.id == account_id)
+    }
+
     async fn account_summaries(&self) -> Vec<AccountSummary> {
+        let now = Utc::now();
         let mut accounts = self
             .runtime
             .accounts
@@ -3136,11 +3556,40 @@ impl AppState {
             .map(|account| {
                 let route_state = route_states.get(account.id.as_str()).cloned();
                 let credential = credentials.get(account.id.as_str()).cloned();
-                let managed = credential.as_ref().and_then(|credential| credential.managed_auth.as_ref());
+                let managed = credential
+                    .as_ref()
+                    .and_then(|credential| credential.managed_auth.as_ref());
                 let resolved_route_mode = route_state
                     .as_ref()
                     .map(|route_state| route_state.route_mode)
                     .unwrap_or(account.current_mode);
+                let status = managed
+                    .map(|managed| managed.status)
+                    .unwrap_or(ManagedAccountStatus::Active);
+                let availability_state = account_availability_state(
+                    credential.is_some(),
+                    route_state.as_ref(),
+                    status,
+                    now,
+                );
+                let availability_reason = account_availability_reason(
+                    credential.is_some(),
+                    route_state.as_ref(),
+                    managed.and_then(|managed| managed.status_reason.as_deref()),
+                    now,
+                );
+                let availability_reset_at = route_state
+                    .as_ref()
+                    .and_then(|route_state| route_state_quota_reset_at(route_state, now));
+                let cooldown_until = route_state.as_ref().and_then(|route_state| {
+                    if is_in_cooldown(route_state, now)
+                        && !route_state_is_quota_exhausted(route_state, now)
+                    {
+                        route_state.cooldown_until
+                    } else {
+                        None
+                    }
+                });
                 AccountSummary {
                     id: account.id.clone(),
                     tenant_id: account.tenant_id,
@@ -3152,9 +3601,7 @@ impl AppState {
                         .as_ref()
                         .map(|route_state| route_state.cooldown_level)
                         .unwrap_or_default(),
-                    cooldown_until: route_state
-                        .as_ref()
-                        .and_then(|route_state| route_state.cooldown_until),
+                    cooldown_until,
                     direct_cf_streak: route_state
                         .as_ref()
                         .map(|route_state| route_state.direct_cf_streak)
@@ -3173,7 +3620,10 @@ impl AppState {
                     near_quota_guard_enabled: account.signals.near_quota_guard_enabled(),
                     health_score: account.signals.health_score,
                     egress_stability: account.signals.egress_stability,
-                    inflight: execution_inflight.get(&account.id).copied().unwrap_or(account.signals.inflight),
+                    inflight: execution_inflight
+                        .get(&account.id)
+                        .copied()
+                        .unwrap_or(account.signals.inflight),
                     capacity: account.signals.capacity,
                     has_credential: credential.is_some(),
                     base_url: credential
@@ -3187,11 +3637,18 @@ impl AppState {
                     plan_type: managed.and_then(|managed| managed.plan_type.clone()),
                     workspace_role: managed.and_then(|managed| managed.workspace_role.clone()),
                     is_workspace_owner: managed.and_then(|managed| managed.is_workspace_owner),
+                    status,
+                    status_reason: managed.and_then(|managed| managed.status_reason.clone()),
+                    last_error: managed.and_then(|managed| managed.last_error.clone()),
                     rate_limits: managed.and_then(|managed| managed.rate_limits.clone()),
                     rate_limits_by_limit_id: managed
                         .map(|managed| managed.rate_limits_by_limit_id.clone())
                         .unwrap_or_default(),
-                    managed_state_refreshed_at: managed.and_then(|managed| managed.last_refreshed_at),
+                    managed_state_refreshed_at: managed
+                        .and_then(|managed| managed.last_refreshed_at),
+                    availability_state,
+                    availability_reason,
+                    availability_reset_at,
                     egress_group: self.egress_group_label(resolved_route_mode),
                     proxy_enabled: self.route_mode_uses_proxy(resolved_route_mode),
                 }
@@ -3224,6 +3681,119 @@ impl AppState {
             RouteMode::Warp => self.config.warp_proxy_url.is_some(),
         }
     }
+}
+
+fn route_state_is_quota_marked(route_state: &AccountRouteState) -> bool {
+    route_state
+        .cooldown_reason
+        .as_deref()
+        .map(|reason| {
+            let normalized = reason.trim().to_ascii_lowercase();
+            normalized == "quota"
+                || normalized.starts_with("quota_exhausted")
+                || normalized.starts_with("usage_limit")
+        })
+        .unwrap_or(false)
+}
+
+fn is_best_effort_model_catalog_error(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("404 not found")
+        || normalized.contains("invalid upstream model catalog payload")
+        || normalized.contains("error decoding response body")
+}
+
+fn route_state_quota_reset_at(
+    route_state: &AccountRouteState,
+    now: chrono::DateTime<Utc>,
+) -> Option<chrono::DateTime<Utc>> {
+    if route_state_is_quota_marked(route_state) && is_in_cooldown(route_state, now) {
+        route_state.cooldown_until
+    } else {
+        None
+    }
+}
+
+fn route_state_is_quota_exhausted(
+    route_state: &AccountRouteState,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    route_state_quota_reset_at(route_state, now).is_some()
+}
+
+fn refresh_reusable_lease_snapshot(
+    leases: &mut HashMap<String, CliLease>,
+    principal_id: &str,
+    subagent_count: u32,
+    route_mode: RouteMode,
+    now: chrono::DateTime<Utc>,
+) -> Option<CliLease> {
+    let lease = leases.get_mut(principal_id)?;
+    lease.last_used_at = now;
+    lease.active_subagents = subagent_count;
+    lease.route_mode = route_mode;
+    Some(lease.clone())
+}
+
+fn managed_status_for_selection(credential: Option<&UpstreamCredential>) -> ManagedAccountStatus {
+    credential
+        .and_then(|credential| credential.managed_auth.as_ref())
+        .map(|managed| managed.status)
+        .unwrap_or(ManagedAccountStatus::Active)
+}
+
+fn credential_is_routable_for_selection(credential: Option<&UpstreamCredential>) -> bool {
+    credential.is_some()
+        && !matches!(
+            managed_status_for_selection(credential),
+            ManagedAccountStatus::Banned | ManagedAccountStatus::Unavailable
+        )
+}
+
+fn account_availability_state(
+    has_credential: bool,
+    route_state: Option<&AccountRouteState>,
+    status: ManagedAccountStatus,
+    now: chrono::DateTime<Utc>,
+) -> AccountAvailabilityState {
+    if !has_credential
+        || matches!(
+            status,
+            ManagedAccountStatus::Banned | ManagedAccountStatus::Unavailable
+        )
+    {
+        return AccountAvailabilityState::Unavailable;
+    }
+    if route_state.is_some_and(|route_state| route_state_is_quota_exhausted(route_state, now)) {
+        return AccountAvailabilityState::QuotaExhausted;
+    }
+    if route_state.is_some_and(|route_state| is_in_cooldown(route_state, now)) {
+        return AccountAvailabilityState::Cooldown;
+    }
+    AccountAvailabilityState::Routable
+}
+
+fn account_availability_reason(
+    has_credential: bool,
+    route_state: Option<&AccountRouteState>,
+    managed_reason: Option<&str>,
+    now: chrono::DateTime<Utc>,
+) -> Option<String> {
+    if !has_credential {
+        return Some("missing_credential".to_string());
+    }
+    if let Some(route_state) = route_state {
+        if route_state_is_quota_exhausted(route_state, now) {
+            return Some("quota_exhausted".to_string());
+        }
+        if is_in_cooldown(route_state, now) {
+            return route_state
+                .cooldown_reason
+                .clone()
+                .or_else(|| Some("cooldown".to_string()));
+        }
+    }
+    managed_reason.map(str::to_string)
 }
 
 fn gateway_user_view(
@@ -3319,9 +3889,115 @@ fn default_cache_metrics() -> CacheMetrics {
         cached_tokens: 0,
         replay_tokens: 0,
         prefix_hit_ratio: 0.0,
+        request_hit_ratio: 0.0,
+        token_hit_ratio: 0.0,
         warmup_roi: 0.0,
         static_prefix_tokens: 0,
     }
+}
+
+fn derive_account_alerts(accounts: &[AccountSummary]) -> Vec<AccountAlert> {
+    let now = Utc::now();
+    let mut alerts = accounts
+        .iter()
+        .filter_map(|account| {
+            let quota_floor = account
+                .quota_headroom
+                .min(account.quota_headroom_5h)
+                .min(account.quota_headroom_7d);
+
+            let (kind, severity, reason, happened_at) =
+                if account.availability_state == AccountAvailabilityState::QuotaExhausted {
+                    (
+                        "quota_exhausted",
+                        "critical",
+                        account
+                            .availability_reason
+                            .clone()
+                            .or_else(|| Some("quota_exhausted".to_string())),
+                        account.availability_reset_at.unwrap_or(now),
+                    )
+                } else if account.availability_state == AccountAvailabilityState::Unavailable
+                    && account.status == ManagedAccountStatus::Banned
+                {
+                    (
+                        "disabled",
+                        "critical",
+                        account
+                            .status_reason
+                            .clone()
+                            .or_else(|| Some("account_disabled".to_string())),
+                        account.managed_state_refreshed_at.unwrap_or(now),
+                    )
+                } else if account.availability_state == AccountAvailabilityState::Unavailable {
+                    (
+                        "unavailable",
+                        "warning",
+                        account
+                            .availability_reason
+                            .clone()
+                            .or_else(|| Some("refresh_failed".to_string())),
+                        account.managed_state_refreshed_at.unwrap_or(now),
+                    )
+                } else if account.availability_state == AccountAvailabilityState::Cooldown
+                    || account.near_quota_guard_enabled
+                {
+                    (
+                        "protected",
+                        "warning",
+                        account
+                            .availability_reason
+                            .clone()
+                            .or_else(|| Some("cooldown_guard".to_string())),
+                        account.cooldown_until.unwrap_or(now),
+                    )
+                } else if quota_floor <= 0.25 {
+                    (
+                        "low_quota",
+                        if quota_floor <= 0.10 {
+                            "critical"
+                        } else {
+                            "warning"
+                        },
+                        Some("quota_floor".to_string()),
+                        account.managed_state_refreshed_at.unwrap_or(now),
+                    )
+                } else {
+                    return None;
+                };
+
+            Some(AccountAlert {
+                id: format!("{}:{kind}", account.id),
+                account_id: account.id.clone(),
+                account_label: account.label.clone(),
+                kind: kind.to_string(),
+                severity: severity.to_string(),
+                happened_at,
+                quota_headroom: Some(quota_floor),
+                cooldown_level: account.cooldown_level,
+                status: account.status,
+                reason,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    alerts.sort_by(|left, right| {
+        let left_rank = match left.severity.as_str() {
+            "critical" => 0_u8,
+            "warning" => 1_u8,
+            _ => 2_u8,
+        };
+        let right_rank = match right.severity.as_str() {
+            "critical" => 0_u8,
+            "warning" => 1_u8,
+            _ => 2_u8,
+        };
+        left_rank
+            .cmp(&right_rank)
+            .then_with(|| right.happened_at.cmp(&left.happened_at))
+            .then_with(|| left.account_label.cmp(&right.account_label))
+    });
+    alerts
 }
 
 fn derive_cache_metrics_from_logs(logs: &[RequestLogEntry], base: &CacheMetrics) -> CacheMetrics {
@@ -3350,11 +4026,17 @@ fn derive_cache_metrics_from_logs(logs: &[RequestLogEntry], base: &CacheMetrics)
     metrics.cached_tokens = total_cached_input_tokens;
     metrics.replay_tokens = total_input_tokens;
     metrics.static_prefix_tokens = max_cached_input_tokens;
-    metrics.prefix_hit_ratio = if eligible_requests > 0 {
+    metrics.request_hit_ratio = if eligible_requests > 0 {
         hit_requests as f64 / eligible_requests as f64
     } else {
         0.0
     };
+    metrics.token_hit_ratio = if total_input_tokens > 0 {
+        total_cached_input_tokens as f64 / total_input_tokens as f64
+    } else {
+        0.0
+    };
+    metrics.prefix_hit_ratio = metrics.request_hit_ratio;
     metrics
 }
 
@@ -3372,8 +4054,7 @@ fn observed_warmup_decision(metrics: &CacheMetrics) -> WarmupDecision {
         };
     }
 
-    let cached_ratio = metrics.cached_tokens as f64 / metrics.replay_tokens as f64;
-    let expected_saving = metrics.static_prefix_tokens as f64 * cached_ratio;
+    let expected_saving = metrics.static_prefix_tokens as f64 * metrics.token_hit_ratio;
     WarmupDecision {
         should_warm: metrics.prefix_hit_ratio < 0.60 && expected_saving >= 1024.0,
         expected_saving,
@@ -3499,6 +4180,37 @@ fn mask_endpoint(url: &str) -> String {
     } else {
         prefix
     }
+}
+
+fn classify_managed_account_status(
+    message: &str,
+    unauthorized: bool,
+) -> (ManagedAccountStatus, String) {
+    if let Some(reason) = openai_auth::deactivation_reason_from_message(message) {
+        return (ManagedAccountStatus::Banned, reason.to_string());
+    }
+
+    let lowered = message.trim().to_ascii_lowercase();
+    if unauthorized {
+        return (
+            ManagedAccountStatus::Unavailable,
+            "unauthorized".to_string(),
+        );
+    }
+    if lowered.contains("429")
+        || lowered.contains("usage limit")
+        || lowered.contains("insufficient_quota")
+        || lowered.contains("quota exceeded")
+    {
+        return (ManagedAccountStatus::Unavailable, "usage_limit".to_string());
+    }
+    if lowered.contains("timeout") {
+        return (ManagedAccountStatus::Unavailable, "timeout".to_string());
+    }
+    (
+        ManagedAccountStatus::Unavailable,
+        "refresh_failed".to_string(),
+    )
 }
 
 fn normalize_thread_id(value: &str) -> String {
@@ -3662,6 +4374,59 @@ mod tests {
         tenant
     }
 
+    async fn insert_test_account(
+        state: &AppState,
+        account: UpstreamAccount,
+        status: ManagedAccountStatus,
+    ) {
+        let account_id = account.id.clone();
+        let credential = UpstreamCredential {
+            account_id: account_id.clone(),
+            base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            bearer_token: "secret".to_string(),
+            chatgpt_account_id: Some(format!("{account_id}-chatgpt")),
+            extra_headers: Vec::new(),
+            managed_auth: Some(ManagedAuthState {
+                status,
+                ..ManagedAuthState::default()
+            }),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let route_state = AccountRouteState {
+            account_id: account_id.clone(),
+            route_mode: account.current_mode,
+            direct_cf_streak: 0,
+            warp_cf_streak: 0,
+            cooldown_level: 0,
+            cooldown_until: None,
+            cooldown_reason: None,
+            warp_entered_at: None,
+            last_cf_at: None,
+            success_streak: 0,
+            last_success_at: None,
+        };
+
+        state
+            .runtime
+            .accounts
+            .write()
+            .await
+            .insert(account_id.clone(), account);
+        state
+            .runtime
+            .credentials
+            .write()
+            .await
+            .insert(account_id.clone(), credential);
+        state
+            .runtime
+            .route_states
+            .write()
+            .await
+            .insert(account_id, route_state);
+    }
+
     fn item_text(item: &Value) -> String {
         item.get("content")
             .map(|content| match content {
@@ -3681,11 +4446,61 @@ mod tests {
     }
 
     #[test]
+    fn refresh_reusable_lease_snapshot_returns_none_when_binding_missing() {
+        let now = Utc::now();
+        let mut leases = std::collections::HashMap::new();
+
+        let snapshot = refresh_reusable_lease_snapshot(
+            &mut leases,
+            "tenant:test/thread:missing",
+            2,
+            RouteMode::Warp,
+            now,
+        );
+
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
+    fn refresh_reusable_lease_snapshot_updates_route_mode_and_subagents() {
+        let now = Utc::now();
+        let principal_id = "tenant:test/thread:existing".to_string();
+        let lease = CliLease {
+            principal_id: principal_id.clone(),
+            tenant_id: Uuid::nil(),
+            account_id: "acc_1".to_string(),
+            account_label: "Account 1".to_string(),
+            model: "gpt-5.4".to_string(),
+            reasoning_effort: None,
+            route_mode: RouteMode::Direct,
+            generation: 1,
+            active_subagents: 0,
+            created_at: now - ChronoDuration::seconds(30),
+            last_used_at: now - ChronoDuration::seconds(30),
+        };
+        let mut leases = std::collections::HashMap::from([(principal_id.clone(), lease)]);
+
+        let snapshot =
+            refresh_reusable_lease_snapshot(&mut leases, &principal_id, 3, RouteMode::Warp, now)
+                .expect("lease snapshot");
+
+        assert_eq!(snapshot.route_mode, RouteMode::Warp);
+        assert_eq!(snapshot.active_subagents, 3);
+        assert_eq!(snapshot.last_used_at, now);
+        assert_eq!(
+            leases.get(&principal_id).expect("stored lease").route_mode,
+            RouteMode::Warp
+        );
+    }
+
+    #[test]
     fn cache_metrics_use_real_request_hit_rate() {
         let base = CacheMetrics {
             cached_tokens: 999,
             replay_tokens: 999,
             prefix_hit_ratio: 0.99,
+            request_hit_ratio: 0.99,
+            token_hit_ratio: 0.99,
             warmup_roi: 1.5,
             static_prefix_tokens: 2048,
         };
@@ -3700,8 +4515,106 @@ mod tests {
         assert_eq!(derived.cached_tokens, 38);
         assert_eq!(derived.replay_tokens, 264);
         assert!((derived.prefix_hit_ratio - (2.0 / 3.0)).abs() < 1e-9);
+        assert!((derived.request_hit_ratio - (2.0 / 3.0)).abs() < 1e-9);
+        assert!((derived.token_hit_ratio - (38.0 / 264.0)).abs() < 1e-9);
         assert_eq!(derived.warmup_roi, base.warmup_roi);
         assert_eq!(derived.static_prefix_tokens, 30);
+    }
+
+    #[test]
+    fn managed_account_status_marks_deactivation_as_banned() {
+        let (status, reason) = classify_managed_account_status("403 workspace_deactivated", true);
+        assert_eq!(status, ManagedAccountStatus::Banned);
+        assert_eq!(reason, "workspace_deactivated");
+
+        let (status, reason) = classify_managed_account_status("OpenAI refresh 接口返回 401", true);
+        assert_eq!(status, ManagedAccountStatus::Unavailable);
+        assert_eq!(reason, "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn cleanup_banned_accounts_only_removes_banned_entries() {
+        let state = test_state();
+        let tenant = insert_test_tenant(&state).await;
+        let banned_account = demo_account(
+            &tenant.id,
+            "acc_banned",
+            "Banned",
+            RouteMode::Direct,
+            0.3,
+            0.7,
+            0.7,
+        );
+        let active_account = demo_account(
+            &tenant.id,
+            "acc_active",
+            "Active",
+            RouteMode::Direct,
+            0.8,
+            0.9,
+            0.9,
+        );
+
+        insert_test_account(&state, banned_account, ManagedAccountStatus::Banned).await;
+        insert_test_account(&state, active_account, ManagedAccountStatus::Active).await;
+        state.runtime.leases.write().await.insert(
+            "tenant:test/principal:banned".to_string(),
+            CliLease {
+                principal_id: "tenant:test/principal:banned".to_string(),
+                tenant_id: tenant.id,
+                account_id: "acc_banned".to_string(),
+                account_label: "Banned".to_string(),
+                model: "gpt-5.4".to_string(),
+                reasoning_effort: None,
+                route_mode: RouteMode::Direct,
+                generation: 1,
+                active_subagents: 0,
+                created_at: Utc::now(),
+                last_used_at: Utc::now(),
+            },
+        );
+
+        let result = state
+            .cleanup_banned_accounts()
+            .await
+            .expect("cleanup result");
+
+        assert_eq!(result.scanned, 2);
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.deleted_account_ids, vec!["acc_banned".to_string()]);
+        assert!(
+            !state
+                .runtime
+                .accounts
+                .read()
+                .await
+                .contains_key("acc_banned")
+        );
+        assert!(
+            state
+                .runtime
+                .accounts
+                .read()
+                .await
+                .contains_key("acc_active")
+        );
+        assert!(
+            !state
+                .runtime
+                .credentials
+                .read()
+                .await
+                .contains_key("acc_banned")
+        );
+        assert!(
+            !state
+                .runtime
+                .route_states
+                .read()
+                .await
+                .contains_key("acc_banned")
+        );
+        assert!(state.runtime.leases.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -4042,13 +4955,15 @@ mod tests {
             .await;
 
         assert_eq!(
-            selection.as_ref().map(|(lease, _, _)| lease.account_id.as_str()),
+            selection
+                .as_ref()
+                .map(|(lease, _, _)| lease.account_id.as_str()),
             Some(account.id.as_str())
         );
     }
 
     #[tokio::test]
-    async fn sole_account_quota_failover_blocks_selection() {
+    async fn sole_account_quota_exhausted_enters_exhausted_selection_state() {
         let state = test_state();
         let tenant = insert_test_tenant(&state).await;
         let account = state
@@ -4069,14 +4984,19 @@ mod tests {
             .await;
 
         let route_state = state
-            .failover_account(&account.id, "quota", 300, false)
+            .mark_account_quota_exhausted(&account.id, None, Some("usage_limit_reached"))
             .await
             .expect("route state");
         assert!(route_state.cooldown_until.is_some());
-        assert_eq!(route_state.cooldown_reason.as_deref(), Some("quota"));
+        assert!(
+            route_state
+                .cooldown_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("quota_exhausted"))
+        );
 
         let selection = state
-            .resolve_lease(LeaseSelectionRequest {
+            .resolve_lease_outcome(LeaseSelectionRequest {
                 tenant_id: tenant.id,
                 principal_id: "tenant:test/thread:solo".to_string(),
                 model: "gpt-5.4".to_string(),
@@ -4087,7 +5007,215 @@ mod tests {
             })
             .await;
 
-        assert!(selection.is_none());
+        match selection {
+            LeaseSelectionOutcome::Selected(..) => {
+                panic!("quota exhausted account must not be selected")
+            }
+            LeaseSelectionOutcome::Exhausted(exhausted) => {
+                assert_eq!(exhausted.kind, LeaseSelectionExhaustedKind::QuotaExhausted);
+                assert_eq!(exhausted.skipped_quota_count, 1);
+                assert!(exhausted.earliest_reset_at.is_some());
+                assert!(exhausted.earliest_retry_at.is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sole_account_cooldown_surfaces_retry_time() {
+        let state = test_state();
+        let tenant = insert_test_tenant(&state).await;
+        let account = state
+            .import_account(ImportAccountRequest {
+                tenant_id: tenant.id,
+                label: "Cooldown Account".to_string(),
+                models: vec!["gpt-5.4".to_string()],
+                quota_headroom: Some(0.8),
+                quota_headroom_5h: Some(0.8),
+                quota_headroom_7d: Some(0.8),
+                health_score: Some(0.9),
+                egress_stability: Some(0.9),
+                base_url: Some("https://chatgpt.com/backend-api/codex".to_string()),
+                bearer_token: Some("token".to_string()),
+                chatgpt_account_id: Some("acct_test".to_string()),
+                extra_headers: None,
+            })
+            .await;
+
+        let cooldown_until = Utc::now() + ChronoDuration::seconds(30);
+        {
+            let mut route_states = state.runtime.route_states.write().await;
+            let route_state = route_states
+                .get_mut(account.id.as_str())
+                .expect("route state exists");
+            route_state.cooldown_until = Some(cooldown_until);
+            route_state.cooldown_reason = Some("cf_edge".to_string());
+        }
+
+        let selection = state
+            .resolve_lease_outcome(LeaseSelectionRequest {
+                tenant_id: tenant.id,
+                principal_id: "tenant:test/thread:cooldown".to_string(),
+                model: "gpt-5.4".to_string(),
+                reasoning_effort: None,
+                subagent_count: 0,
+                cache_affinity_key: "affinity".to_string(),
+                placement_affinity_key: "placement".to_string(),
+            })
+            .await;
+
+        match selection {
+            LeaseSelectionOutcome::Selected(..) => {
+                panic!("cooldown account must not be selected")
+            }
+            LeaseSelectionOutcome::Exhausted(exhausted) => {
+                assert_eq!(exhausted.kind, LeaseSelectionExhaustedKind::Cooldown);
+                assert_eq!(exhausted.skipped_cooldown_count, 1);
+                assert_eq!(exhausted.earliest_retry_at, Some(cooldown_until));
+                assert!(exhausted.earliest_reset_at.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_unavailable_account_is_skipped_during_selection() {
+        let state = test_state();
+        let tenant = insert_test_tenant(&state).await;
+        let unavailable_account = demo_account(
+            &tenant.id,
+            "acc_unavailable",
+            "Unavailable",
+            RouteMode::Direct,
+            0.9,
+            0.9,
+            0.9,
+        );
+        let active_account = demo_account(
+            &tenant.id,
+            "acc_active",
+            "Active",
+            RouteMode::Direct,
+            0.9,
+            0.9,
+            0.9,
+        );
+
+        insert_test_account(
+            &state,
+            unavailable_account,
+            ManagedAccountStatus::Unavailable,
+        )
+        .await;
+        insert_test_account(&state, active_account.clone(), ManagedAccountStatus::Active).await;
+
+        let selection = state
+            .resolve_lease_outcome(LeaseSelectionRequest {
+                tenant_id: tenant.id,
+                principal_id: "tenant:test/thread:managed".to_string(),
+                model: "gpt-5.4".to_string(),
+                reasoning_effort: None,
+                subagent_count: 0,
+                cache_affinity_key: "affinity".to_string(),
+                placement_affinity_key: "placement".to_string(),
+            })
+            .await;
+
+        match selection {
+            LeaseSelectionOutcome::Selected(lease, _, _) => {
+                assert_eq!(lease.account_id, active_account.id);
+            }
+            LeaseSelectionOutcome::Exhausted(exhausted) => {
+                panic!("expected active account to be selected, got {exhausted:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sole_managed_unavailable_account_enters_unavailable_exhaustion() {
+        let state = test_state();
+        let tenant = insert_test_tenant(&state).await;
+        let unavailable_account = demo_account(
+            &tenant.id,
+            "acc_unavailable",
+            "Unavailable",
+            RouteMode::Direct,
+            0.9,
+            0.9,
+            0.9,
+        );
+
+        insert_test_account(
+            &state,
+            unavailable_account,
+            ManagedAccountStatus::Unavailable,
+        )
+        .await;
+
+        let selection = state
+            .resolve_lease_outcome(LeaseSelectionRequest {
+                tenant_id: tenant.id,
+                principal_id: "tenant:test/thread:managed".to_string(),
+                model: "gpt-5.4".to_string(),
+                reasoning_effort: None,
+                subagent_count: 0,
+                cache_affinity_key: "affinity".to_string(),
+                placement_affinity_key: "placement".to_string(),
+            })
+            .await;
+
+        match selection {
+            LeaseSelectionOutcome::Selected(..) => {
+                panic!("managed unavailable account must not be selected")
+            }
+            LeaseSelectionOutcome::Exhausted(exhausted) => {
+                assert_eq!(exhausted.kind, LeaseSelectionExhaustedKind::Unavailable);
+                assert_eq!(exhausted.skipped_unavailable_count, 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn account_summary_surfaces_quota_exhausted_availability() {
+        let state = test_state();
+        let tenant = insert_test_tenant(&state).await;
+        let account = state
+            .import_account(ImportAccountRequest {
+                tenant_id: tenant.id,
+                label: "Managed ChatGPT".to_string(),
+                models: vec!["gpt-5.4".to_string()],
+                quota_headroom: Some(0.05),
+                quota_headroom_5h: Some(0.05),
+                quota_headroom_7d: Some(0.05),
+                health_score: Some(0.9),
+                egress_stability: Some(0.9),
+                base_url: Some("https://chatgpt.com/backend-api/codex".to_string()),
+                bearer_token: Some("token".to_string()),
+                chatgpt_account_id: Some("acct_test".to_string()),
+                extra_headers: None,
+            })
+            .await;
+
+        state
+            .mark_account_quota_exhausted(&account.id, None, Some("usage_limit_reached"))
+            .await
+            .expect("route state");
+
+        let summary = state
+            .list_accounts()
+            .await
+            .into_iter()
+            .find(|summary| summary.id == account.id)
+            .expect("account summary");
+
+        assert_eq!(
+            summary.availability_state,
+            AccountAvailabilityState::QuotaExhausted
+        );
+        assert_eq!(
+            summary.availability_reason.as_deref(),
+            Some("quota_exhausted")
+        );
+        assert!(summary.availability_reset_at.is_some());
+        assert!(summary.cooldown_until.is_none());
     }
 
     #[tokio::test]
@@ -4128,13 +5256,16 @@ mod tests {
             drop(second_guard);
         });
 
-        let blocked = tokio::time::timeout(tokio::time::Duration::from_millis(100), rx.recv()).await;
-        assert!(blocked.is_err(), "second guard should wait while first guard is held");
+        let blocked =
+            tokio::time::timeout(tokio::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            blocked.is_err(),
+            "second guard should wait while first guard is held"
+        );
 
         drop(first_guard);
 
-        let released =
-            tokio::time::timeout(tokio::time::Duration::from_secs(1), rx.recv()).await;
+        let released = tokio::time::timeout(tokio::time::Duration::from_secs(1), rx.recv()).await;
         assert!(
             matches!(released, Ok(Some(()))),
             "second guard should proceed after the first guard is released"
