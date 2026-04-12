@@ -7,17 +7,18 @@ use axum::{
     },
     http::{HeaderMap, Response, StatusCode},
     response::IntoResponse,
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
 };
 use chrono::Utc;
+use serde::Serialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
     browser_assist,
     models::{
-        BrowserTaskRequest, CompactConversationThreadRequest, CreateGatewayApiKeyRequest,
-        CodexAppSessionRequest, CreateGatewayUserRequest, CreateTenantRequest,
+        BrowserTaskRequest, CodexAppSessionRequest, CompactConversationThreadRequest,
+        CreateGatewayApiKeyRequest, CreateGatewayUserRequest, CreateTenantRequest,
         ForkConversationThreadRequest, ImportAccountRequest, ManagedRateLimitSnapshot,
         OpenAiLoginCompleteRequest, OpenAiLoginStartRequest, RouteEventRequest,
         StartConversationThreadRequest, UpdateGatewayUserRequest,
@@ -36,6 +37,15 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/accounts/models/refresh",
             post(refresh_account_models),
         )
+        .route(
+            "/api/v1/accounts/cleanup/banned",
+            post(cleanup_banned_accounts),
+        )
+        .route(
+            "/api/v1/accounts/{account_id}/quota/refresh",
+            post(refresh_account_quota),
+        )
+        .route("/api/v1/accounts/{account_id}", delete(delete_account))
         .route("/api/v1/egress-slots", get(egress_slots))
         .route("/api/v1/leases", get(leases))
         .route("/api/v1/cache-metrics", get(cache_metrics))
@@ -119,6 +129,59 @@ async fn refresh_account_models(
                 "error": {
                     "message": message,
                     "type": "model_refresh_failed"
+                }
+            })),
+        )),
+    }
+}
+
+async fn refresh_account_quota(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+) -> Result<Json<crate::models::AccountSummary>, (StatusCode, Json<serde_json::Value>)> {
+    match state.refresh_account_quota(&account_id).await {
+        Ok(account) => Ok(Json(account)),
+        Err(message) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "quota_refresh_failed"
+                }
+            })),
+        )),
+    }
+}
+
+async fn delete_account(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    match state.delete_account(&account_id).await {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(message) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "account_delete_failed"
+                }
+            })),
+        )),
+    }
+}
+
+async fn cleanup_banned_accounts(
+    State(state): State<AppState>,
+) -> Result<Json<crate::models::AccountCleanupResult>, (StatusCode, Json<serde_json::Value>)> {
+    match state.cleanup_banned_accounts().await {
+        Ok(result) => Ok(Json(result)),
+        Err(message) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "account_cleanup_failed"
                 }
             })),
         )),
@@ -572,8 +635,13 @@ async fn handle_codex_app_server_text(
     let value = match serde_json::from_str::<Value>(message) {
         Ok(value) => value,
         Err(error) => {
-            send_app_server_error(socket, Value::Null, -32700, &format!("invalid JSON: {error}"))
-                .await?;
+            send_app_server_error(
+                socket,
+                Value::Null,
+                -32700,
+                &format!("invalid JSON: {error}"),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -642,7 +710,10 @@ async fn handle_codex_app_server_text(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             if refresh_token {
-                if let Err(error) = state.refresh_managed_account(&session.account_id, true).await {
+                if let Err(error) = state
+                    .refresh_managed_account(&session.account_id, true)
+                    .await
+                {
                     tracing::warn!(
                         account_id = %session.account_id,
                         %error,
@@ -657,7 +728,10 @@ async fn handle_codex_app_server_text(
             }
         }
         "account/rateLimits/read" => {
-            if let Err(error) = state.refresh_managed_account(&session.account_id, false).await {
+            if let Err(error) = state
+                .refresh_managed_account(&session.account_id, false)
+                .await
+            {
                 tracing::warn!(
                     account_id = %session.account_id,
                     %error,
@@ -669,6 +743,18 @@ async fn handle_codex_app_server_text(
             if *notifications_ready {
                 emit_rate_limit_notification(socket, state, session, opt_out_notifications).await?;
             }
+        }
+        "model/list" => {
+            let result = model_list_result(state, session, object.get("params")).await;
+            send_app_server_result(socket, id, result).await?;
+        }
+        "getAuthStatus" => {
+            let result = auth_status_result(state, session).await;
+            send_app_server_result(socket, id, result).await?;
+        }
+        "mcpServerStatus/list" | "mcpServers/list" => {
+            let result = mcp_server_status_list_result(object.get("params"));
+            send_app_server_result(socket, id, result).await?;
         }
         _ => {
             send_app_server_error(socket, id, -32601, "Method not found").await?;
@@ -714,7 +800,7 @@ async fn account_read_result(state: &AppState, session: &CodexAppSessionState) -
             .as_ref()
             .and_then(|summary| sanitize_workspace_role(summary.workspace_role.as_deref())),
         "isWorkspaceOwner": summary.as_ref().and_then(|summary| summary.is_workspace_owner),
-        "requiresOpenaiAuth": true
+        "requiresOpenaiAuth": requires_openai_auth(summary.as_ref())
     })
 }
 
@@ -734,19 +820,38 @@ async fn account_updated_notification(state: &AppState, session: &CodexAppSessio
     })
 }
 
+async fn auth_status_result(state: &AppState, session: &CodexAppSessionState) -> Value {
+    let summary = managed_account_summary(state, session).await;
+    let auth_method = if let Some(summary) = summary.as_ref() {
+        summary.auth_mode.clone()
+    } else {
+        state
+            .app_server_auth_mode_for_account(&session.account_id)
+            .await
+    };
+    json!({
+        "authMethod": auth_method,
+        "authToken": Value::Null,
+        "requiresOpenaiAuth": requires_openai_auth(summary.as_ref()),
+    })
+}
+
 async fn rate_limits_result(state: &AppState, session: &CodexAppSessionState) -> Value {
     let summary = managed_account_summary(state, session).await;
     let rate_limits = summary
         .as_ref()
         .and_then(|summary| summary.rate_limits.clone())
         .unwrap_or_default();
-    let rate_limits_by_limit_id = summary.as_ref().map(|summary| {
-        if summary.rate_limits_by_limit_id.is_empty() {
-            Value::Null
-        } else {
-            json!(summary.rate_limits_by_limit_id)
-        }
-    }).unwrap_or(Value::Null);
+    let rate_limits_by_limit_id = summary
+        .as_ref()
+        .map(|summary| {
+            if summary.rate_limits_by_limit_id.is_empty() {
+                Value::Null
+            } else {
+                json!(summary.rate_limits_by_limit_id)
+            }
+        })
+        .unwrap_or(Value::Null);
 
     json!({
         "rateLimits": rate_limits,
@@ -775,14 +880,330 @@ async fn managed_account_summary(
         .find(|account| account.id == session.account_id && account.tenant_id == session.tenant_id)
 }
 
+async fn model_list_result(
+    state: &AppState,
+    session: &CodexAppSessionState,
+    params: Option<&Value>,
+) -> Value {
+    let models = managed_account_summary(state, session)
+        .await
+        .map(|summary| normalize_account_models(&summary.models))
+        .filter(|models| !models.is_empty())
+        .unwrap_or_else(default_app_server_models);
+    let include_hidden = params
+        .and_then(|params| params.get("includeHidden"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let limit = params
+        .and_then(|params| params.get("limit"))
+        .and_then(Value::as_u64)
+        .and_then(|limit| usize::try_from(limit).ok());
+    let cursor = params
+        .and_then(|params| params.get("cursor"))
+        .and_then(Value::as_str);
+
+    build_model_list_response(&models, include_hidden, limit, cursor)
+}
+
+fn build_model_list_response(
+    models: &[String],
+    include_hidden: bool,
+    limit: Option<usize>,
+    cursor: Option<&str>,
+) -> Value {
+    let default_model = preferred_default_model(models).map(str::to_string);
+    let filtered = models
+        .iter()
+        .map(|model| app_server_model_metadata(model, default_model.as_deref() == Some(model)))
+        .filter(|model| include_hidden || !model.hidden)
+        .collect::<Vec<_>>();
+    let start = cursor
+        .and_then(parse_model_list_cursor)
+        .unwrap_or_default()
+        .min(filtered.len());
+    let end = limit
+        .map(|limit| start.saturating_add(limit).min(filtered.len()))
+        .unwrap_or(filtered.len());
+    let next_cursor = (end < filtered.len()).then(|| end.to_string());
+
+    json!({
+        "data": filtered[start..end].to_vec(),
+        "nextCursor": next_cursor,
+    })
+}
+
+fn parse_model_list_cursor(value: &str) -> Option<usize> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<usize>().ok()
+}
+
+fn mcp_server_status_list_result(params: Option<&Value>) -> Value {
+    let limit = params
+        .and_then(|params| params.get("limit"))
+        .and_then(Value::as_u64)
+        .and_then(|limit| usize::try_from(limit).ok());
+    let cursor = params
+        .and_then(|params| params.get("cursor"))
+        .and_then(Value::as_str);
+    let all_servers = Vec::<Value>::new();
+    let start = cursor
+        .and_then(parse_model_list_cursor)
+        .unwrap_or_default()
+        .min(all_servers.len());
+    let end = limit
+        .map(|limit| start.saturating_add(limit).min(all_servers.len()))
+        .unwrap_or(all_servers.len());
+    let next_cursor = (end < all_servers.len()).then(|| end.to_string());
+
+    json!({
+        "data": all_servers[start..end].to_vec(),
+        "nextCursor": next_cursor,
+    })
+}
+
+fn preferred_default_model(models: &[String]) -> Option<&str> {
+    for preferred in ["gpt-5.4", "gpt-5.3-codex", "gpt-5.2"] {
+        if models.iter().any(|model| model == preferred) {
+            return Some(preferred);
+        }
+    }
+    models.first().map(String::as_str)
+}
+
+fn normalize_account_models(models: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for model in models {
+        let model = model.trim();
+        if model.is_empty() || normalized.iter().any(|existing| existing == model) {
+            continue;
+        }
+        normalized.push(model.to_string());
+    }
+    normalized
+}
+
+fn default_app_server_models() -> Vec<String> {
+    vec![
+        "gpt-5.4".to_string(),
+        "gpt-5.3-codex".to_string(),
+        "gpt-5.2".to_string(),
+    ]
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct AppServerModelMetadata {
+    id: String,
+    model: String,
+    upgrade: Option<String>,
+    upgrade_info: Option<AppServerModelUpgradeInfo>,
+    availability_nux: Option<AppServerModelAvailabilityNux>,
+    display_name: String,
+    description: String,
+    hidden: bool,
+    supported_reasoning_efforts: Vec<AppServerReasoningEffortOption>,
+    default_reasoning_effort: String,
+    input_modalities: Vec<String>,
+    supports_personality: bool,
+    additional_speed_tiers: Vec<String>,
+    is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct AppServerModelUpgradeInfo {
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upgrade_copy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_link: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    migration_markdown: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct AppServerModelAvailabilityNux {
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct AppServerReasoningEffortOption {
+    reasoning_effort: String,
+    description: String,
+}
+
+fn app_server_model_metadata(model: &str, is_default: bool) -> AppServerModelMetadata {
+    let known = known_model_metadata(model);
+    AppServerModelMetadata {
+        id: model.to_string(),
+        model: model.to_string(),
+        upgrade: known.upgrade.as_ref().map(|upgrade| upgrade.model.clone()),
+        upgrade_info: known.upgrade,
+        availability_nux: known.availability_nux,
+        display_name: known.display_name,
+        description: known.description,
+        hidden: known.hidden,
+        supported_reasoning_efforts: known.supported_reasoning_efforts,
+        default_reasoning_effort: known.default_reasoning_effort,
+        input_modalities: known.input_modalities,
+        supports_personality: known.supports_personality,
+        additional_speed_tiers: known.additional_speed_tiers,
+        is_default,
+    }
+}
+
+struct KnownModelMetadata {
+    display_name: String,
+    description: String,
+    hidden: bool,
+    supported_reasoning_efforts: Vec<AppServerReasoningEffortOption>,
+    default_reasoning_effort: String,
+    input_modalities: Vec<String>,
+    supports_personality: bool,
+    additional_speed_tiers: Vec<String>,
+    availability_nux: Option<AppServerModelAvailabilityNux>,
+    upgrade: Option<AppServerModelUpgradeInfo>,
+}
+
+fn known_model_metadata(model: &str) -> KnownModelMetadata {
+    match model {
+        "gpt-5.4" => KnownModelMetadata {
+            display_name: "gpt-5.4".to_string(),
+            description: "Latest frontier agentic coding model.".to_string(),
+            hidden: false,
+            supported_reasoning_efforts: standard_reasoning_efforts(
+                "Fast responses with lighter reasoning",
+                "Balances speed and reasoning depth for everyday tasks",
+                "Greater reasoning depth for complex problems",
+                "Extra high reasoning depth for complex problems",
+            ),
+            default_reasoning_effort: "medium".to_string(),
+            input_modalities: vec!["text".to_string(), "image".to_string()],
+            supports_personality: false,
+            additional_speed_tiers: vec!["fast".to_string()],
+            availability_nux: None,
+            upgrade: None,
+        },
+        "gpt-5.3-codex" => KnownModelMetadata {
+            display_name: "gpt-5.3-codex".to_string(),
+            description: "Latest frontier agentic coding model.".to_string(),
+            hidden: false,
+            supported_reasoning_efforts: standard_reasoning_efforts(
+                "Fast responses with lighter reasoning",
+                "Balances speed and reasoning depth for everyday tasks",
+                "Greater reasoning depth for complex problems",
+                "Extra high reasoning depth for complex problems",
+            ),
+            default_reasoning_effort: "medium".to_string(),
+            input_modalities: vec!["text".to_string(), "image".to_string()],
+            supports_personality: false,
+            additional_speed_tiers: Vec::new(),
+            availability_nux: None,
+            upgrade: Some(AppServerModelUpgradeInfo {
+                model: "gpt-5.4".to_string(),
+                upgrade_copy: None,
+                model_link: None,
+                migration_markdown: None,
+            }),
+        },
+        "gpt-5.2" => KnownModelMetadata {
+            display_name: "gpt-5.2".to_string(),
+            description:
+                "Latest frontier model with improvements across knowledge, reasoning and coding"
+                    .to_string(),
+            hidden: false,
+            supported_reasoning_efforts: standard_reasoning_efforts(
+                "Balances speed with some reasoning; useful for straightforward queries and short explanations",
+                "Provides a solid balance of reasoning depth and latency for general-purpose tasks",
+                "Maximizes reasoning depth for complex or ambiguous problems",
+                "Extra high reasoning for complex problems",
+            ),
+            default_reasoning_effort: "medium".to_string(),
+            input_modalities: vec!["text".to_string(), "image".to_string()],
+            supports_personality: false,
+            additional_speed_tiers: Vec::new(),
+            availability_nux: None,
+            upgrade: Some(AppServerModelUpgradeInfo {
+                model: "gpt-5.4".to_string(),
+                upgrade_copy: None,
+                model_link: None,
+                migration_markdown: None,
+            }),
+        },
+        _ => KnownModelMetadata {
+            display_name: model.to_string(),
+            description: "Available model from the managed account.".to_string(),
+            hidden: false,
+            supported_reasoning_efforts: standard_reasoning_efforts(
+                "Fast responses with lighter reasoning",
+                "Balanced reasoning for everyday tasks",
+                "Greater reasoning depth for complex problems",
+                "Extra high reasoning depth for complex problems",
+            ),
+            default_reasoning_effort: "medium".to_string(),
+            input_modalities: vec!["text".to_string(), "image".to_string()],
+            supports_personality: false,
+            additional_speed_tiers: Vec::new(),
+            availability_nux: None,
+            upgrade: None,
+        },
+    }
+}
+
+fn standard_reasoning_efforts(
+    low: &str,
+    medium: &str,
+    high: &str,
+    xhigh: &str,
+) -> Vec<AppServerReasoningEffortOption> {
+    vec![
+        AppServerReasoningEffortOption {
+            reasoning_effort: "low".to_string(),
+            description: low.to_string(),
+        },
+        AppServerReasoningEffortOption {
+            reasoning_effort: "medium".to_string(),
+            description: medium.to_string(),
+        },
+        AppServerReasoningEffortOption {
+            reasoning_effort: "high".to_string(),
+            description: high.to_string(),
+        },
+        AppServerReasoningEffortOption {
+            reasoning_effort: "xhigh".to_string(),
+            description: xhigh.to_string(),
+        },
+    ]
+}
+
 fn account_value_from_summary(summary: &crate::models::AccountSummary) -> Option<Value> {
-    let email = summary.chatgpt_email.as_deref()?;
-    Some(json!({
-        "type": "chatgpt",
-        "email": email,
-        "planType": sanitize_plan_type(summary.plan_type.as_deref())
-            .unwrap_or_else(|| "unknown".to_string()),
-    }))
+    match summary.auth_mode.as_deref() {
+        Some("apikey") => Some(json!({
+            "type": "apiKey",
+        })),
+        Some("chatgpt") => {
+            let email = summary.chatgpt_email.as_deref()?;
+            Some(json!({
+                "type": "chatgpt",
+                "email": email,
+                "planType": sanitize_plan_type(summary.plan_type.as_deref())
+                    .unwrap_or_else(|| "unknown".to_string()),
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn requires_openai_auth(summary: Option<&crate::models::AccountSummary>) -> bool {
+    summary
+        .and_then(|summary| summary.base_url.as_deref())
+        .map(|base_url| !base_url.trim().is_empty())
+        .unwrap_or(true)
 }
 
 fn sanitize_plan_type(value: Option<&str>) -> Option<String> {
@@ -888,7 +1309,10 @@ async fn codex_app_session_from_headers(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Option<CodexAppSessionState> {
-    let auth = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
     let token = auth.strip_prefix("Bearer ")?;
     let session = state.codex_app_session_for_token(token).await?;
     if session.expires_at <= Utc::now() {
@@ -929,4 +1353,140 @@ fn websocket_public_url(headers: &HeaderMap) -> Result<String, String> {
         "ws"
     };
     Ok(format!("{scheme}://{host}/api/v1/codex/app-server/ws"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{
+        AccountAvailabilityState, AccountSummary, ManagedAccountStatus, RouteMode,
+    };
+    use uuid::Uuid;
+
+    fn sample_account_summary() -> AccountSummary {
+        AccountSummary {
+            id: "acc_test".to_string(),
+            tenant_id: Uuid::nil(),
+            label: "Test".to_string(),
+            models: vec!["gpt-5.4".to_string()],
+            current_mode: RouteMode::Direct,
+            route_mode: RouteMode::Direct,
+            cooldown_level: 0,
+            cooldown_until: None,
+            direct_cf_streak: 0,
+            warp_cf_streak: 0,
+            success_streak: 0,
+            quota_headroom: 1.0,
+            quota_headroom_5h: 1.0,
+            quota_headroom_7d: 1.0,
+            near_quota_guard_enabled: false,
+            health_score: 0.9,
+            egress_stability: 0.9,
+            inflight: 0,
+            capacity: 4,
+            has_credential: true,
+            base_url: Some("https://api.openai.com/v1".to_string()),
+            chatgpt_account_id: None,
+            auth_mode: Some("apikey".to_string()),
+            chatgpt_email: None,
+            plan_type: None,
+            workspace_role: None,
+            is_workspace_owner: None,
+            status: ManagedAccountStatus::Active,
+            status_reason: None,
+            last_error: None,
+            rate_limits: None,
+            rate_limits_by_limit_id: Default::default(),
+            managed_state_refreshed_at: None,
+            availability_state: AccountAvailabilityState::Routable,
+            availability_reason: None,
+            availability_reset_at: None,
+            egress_group: "direct-native".to_string(),
+            proxy_enabled: false,
+        }
+    }
+
+    #[test]
+    fn preferred_default_model_uses_codex_priority() {
+        let models = vec![
+            "gpt-5.2".to_string(),
+            "gpt-5.4".to_string(),
+            "custom-model".to_string(),
+        ];
+
+        assert_eq!(preferred_default_model(&models), Some("gpt-5.4"));
+    }
+
+    #[test]
+    fn build_model_list_response_paginates_with_numeric_cursor() {
+        let models = vec![
+            "gpt-5.4".to_string(),
+            "gpt-5.3-codex".to_string(),
+            "gpt-5.2".to_string(),
+        ];
+
+        let payload = build_model_list_response(&models, false, Some(1), Some("1"));
+        let data = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .expect("data array");
+
+        assert_eq!(data.len(), 1);
+        assert_eq!(
+            data[0].get("model").and_then(Value::as_str),
+            Some("gpt-5.3-codex")
+        );
+        assert_eq!(payload.get("nextCursor").and_then(Value::as_str), Some("2"));
+    }
+
+    #[test]
+    fn known_model_metadata_matches_official_default_fields() {
+        let payload = build_model_list_response(&["gpt-5.4".to_string()], true, None, None);
+        let model = payload
+            .get("data")
+            .and_then(Value::as_array)
+            .and_then(|data| data.first())
+            .expect("single model entry");
+
+        assert_eq!(model.get("model").and_then(Value::as_str), Some("gpt-5.4"));
+        assert_eq!(
+            model.get("defaultReasoningEffort").and_then(Value::as_str),
+            Some("medium")
+        );
+        assert_eq!(
+            model
+                .get("additionalSpeedTiers")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn mcp_server_status_list_result_returns_empty_remote_inventory() {
+        let payload = mcp_server_status_list_result(Some(&json!({"limit": 10, "cursor": "0"})));
+
+        assert_eq!(
+            payload.get("data").and_then(Value::as_array).map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(payload.get("nextCursor"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn account_value_from_summary_returns_api_key_variant_for_api_key_accounts() {
+        let summary = sample_account_summary();
+        let account = account_value_from_summary(&summary).expect("account payload");
+
+        assert_eq!(account.get("type").and_then(Value::as_str), Some("apiKey"));
+    }
+
+    #[test]
+    fn account_value_from_summary_requires_email_for_chatgpt_variant() {
+        let mut summary = sample_account_summary();
+        summary.auth_mode = Some("chatgptAuthTokens".to_string());
+
+        assert_eq!(account_value_from_summary(&summary), None);
+        assert!(requires_openai_auth(Some(&summary)));
+    }
 }

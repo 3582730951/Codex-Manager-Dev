@@ -2147,30 +2147,40 @@ impl AppState {
             if account.tenant_id != tenant_id {
                 return Err("指定账号不属于当前租户。".to_string());
             }
-            let credential = credentials
+            credentials
                 .get(&account_id)
                 .ok_or_else(|| "指定账号缺少凭证。".to_string())?;
-            if credential.managed_auth.is_none() {
-                return Err("指定账号不是 ChatGPT 受管账号。".to_string());
-            }
             account_id
         } else {
             let accounts = self.runtime.accounts.read().await.clone();
-            self.runtime
-                .credentials
-                .read()
-                .await
-                .values()
-                .find(|credential| {
-                    credential.managed_auth.is_some()
-                        && accounts
-                            .get(&credential.account_id)
-                            .is_some_and(|account| account.tenant_id == tenant_id)
-                })
-                .map(|credential| credential.account_id.clone())
-                .ok_or_else(|| "没有可用的 ChatGPT 受管账号。".to_string())?
+            let mut fallback_account_id = None;
+            let mut managed_account_id = None;
+            for credential in self.runtime.credentials.read().await.values() {
+                if !accounts
+                    .get(&credential.account_id)
+                    .is_some_and(|account| account.tenant_id == tenant_id)
+                {
+                    continue;
+                }
+                if fallback_account_id.is_none() {
+                    fallback_account_id = Some(credential.account_id.clone());
+                }
+                if credential.managed_auth.is_some() {
+                    managed_account_id = Some(credential.account_id.clone());
+                    break;
+                }
+            }
+            managed_account_id
+                .or(fallback_account_id)
+                .ok_or_else(|| "没有可用的上游账号凭证。".to_string())?
         };
-        self.refresh_managed_account(&account_id, false).await?;
+        let credential = self
+            .credential_for_account(&account_id)
+            .await
+            .ok_or_else(|| "指定账号缺少凭证。".to_string())?;
+        if credential.managed_auth.is_some() {
+            self.refresh_managed_account(&account_id, false).await?;
+        }
         let token = openai_auth::generate_state();
         let expires_at = Utc::now() + ChronoDuration::minutes(10);
         let session = CodexAppSessionState {
@@ -3559,6 +3569,7 @@ impl AppState {
                 let managed = credential
                     .as_ref()
                     .and_then(|credential| credential.managed_auth.as_ref());
+                let auth_mode = app_server_auth_mode_from_credential(credential.as_ref());
                 let resolved_route_mode = route_state
                     .as_ref()
                     .map(|route_state| route_state.route_mode)
@@ -3632,7 +3643,7 @@ impl AppState {
                     chatgpt_account_id: credential
                         .as_ref()
                         .and_then(|credential| credential.chatgpt_account_id.clone()),
-                    auth_mode: managed.map(|_| "chatgpt".to_string()),
+                    auth_mode,
                     chatgpt_email: managed.and_then(|managed| managed.email.clone()),
                     plan_type: managed.and_then(|managed| managed.plan_type.clone()),
                     workspace_role: managed.and_then(|managed| managed.workspace_role.clone()),
@@ -3654,6 +3665,14 @@ impl AppState {
                 }
             })
             .collect()
+    }
+
+    pub(crate) async fn app_server_auth_mode_for_account(
+        &self,
+        account_id: &str,
+    ) -> Option<String> {
+        let credential = self.credential_for_account(account_id).await;
+        app_server_auth_mode_from_credential(credential.as_ref())
     }
 
     fn egress_group_label(&self, route_mode: RouteMode) -> String {
@@ -4152,6 +4171,25 @@ fn browser_task_login_url_for_credential(
     credential.map(|credential| credential.base_url.clone())
 }
 
+fn app_server_auth_mode_from_credential(credential: Option<&UpstreamCredential>) -> Option<String> {
+    let credential = credential?;
+    if credential.managed_auth.is_some() {
+        return Some("chatgpt".to_string());
+    }
+    if credential
+        .chatgpt_account_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || credential
+            .base_url
+            .to_ascii_lowercase()
+            .contains("chatgpt.com")
+    {
+        return Some("chatgptAuthTokens".to_string());
+    }
+    Some("apikey".to_string())
+}
+
 fn mask_token(token: &str) -> String {
     if token.len() <= 10 {
         return "********".to_string();
@@ -4427,6 +4465,56 @@ mod tests {
             .insert(account_id, route_state);
     }
 
+    async fn insert_test_unmanaged_account(
+        state: &AppState,
+        account: UpstreamAccount,
+        base_url: &str,
+    ) {
+        let account_id = account.id.clone();
+        let credential = UpstreamCredential {
+            account_id: account_id.clone(),
+            base_url: base_url.to_string(),
+            bearer_token: "secret".to_string(),
+            chatgpt_account_id: Some(format!("{account_id}-chatgpt")),
+            extra_headers: Vec::new(),
+            managed_auth: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let route_state = AccountRouteState {
+            account_id: account_id.clone(),
+            route_mode: account.current_mode,
+            direct_cf_streak: 0,
+            warp_cf_streak: 0,
+            cooldown_level: 0,
+            cooldown_until: None,
+            cooldown_reason: None,
+            warp_entered_at: None,
+            last_cf_at: None,
+            success_streak: 0,
+            last_success_at: None,
+        };
+
+        state
+            .runtime
+            .accounts
+            .write()
+            .await
+            .insert(account_id.clone(), account);
+        state
+            .runtime
+            .credentials
+            .write()
+            .await
+            .insert(account_id.clone(), credential);
+        state
+            .runtime
+            .route_states
+            .write()
+            .await
+            .insert(account_id, route_state);
+    }
+
     fn item_text(item: &Value) -> String {
         item.get("content")
             .map(|content| match content {
@@ -4530,6 +4618,69 @@ mod tests {
         let (status, reason) = classify_managed_account_status("OpenAI refresh 接口返回 401", true);
         assert_eq!(status, ManagedAccountStatus::Unavailable);
         assert_eq!(reason, "unauthorized");
+    }
+
+    #[test]
+    fn app_server_auth_mode_distinguishes_api_key_and_chatgpt_token_accounts() {
+        let api_key_credential = UpstreamCredential {
+            account_id: "acc_api".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            bearer_token: "sk-live".to_string(),
+            chatgpt_account_id: None,
+            extra_headers: Vec::new(),
+            managed_auth: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let chatgpt_token_credential = UpstreamCredential {
+            account_id: "acc_chatgpt".to_string(),
+            base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            bearer_token: "sess-live".to_string(),
+            chatgpt_account_id: Some("acct_123".to_string()),
+            extra_headers: Vec::new(),
+            managed_auth: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        assert_eq!(
+            app_server_auth_mode_from_credential(Some(&api_key_credential)).as_deref(),
+            Some("apikey")
+        );
+        assert_eq!(
+            app_server_auth_mode_from_credential(Some(&chatgpt_token_credential)).as_deref(),
+            Some("chatgptAuthTokens")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_codex_app_session_falls_back_to_unmanaged_credentials() {
+        let state = test_state();
+        let tenant = insert_test_tenant(&state).await;
+        let account = demo_account(
+            &tenant.id,
+            "acc_unmanaged",
+            "Unmanaged",
+            RouteMode::Direct,
+            0.9,
+            0.8,
+            0.9,
+        );
+        insert_test_unmanaged_account(&state, account, "https://api.openai.com/v1").await;
+
+        let session = state
+            .create_codex_app_session(
+                CodexAppSessionRequest {
+                    tenant_id: Some(tenant.id),
+                    account_id: None,
+                },
+                tenant.id,
+                "ws://example.test/app-server".to_string(),
+            )
+            .await
+            .expect("session");
+
+        assert_eq!(session.account_id, "acc_unmanaged");
     }
 
     #[tokio::test]
