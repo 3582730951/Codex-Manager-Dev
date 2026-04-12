@@ -116,6 +116,7 @@ async fn apply_message(runtime: &Arc<RuntimeState>, message: PersistenceMessage)
         PersistenceMessage::TenantUpsert(tenant) => upsert_tenant(runtime, tenant).await,
         PersistenceMessage::ApiKeyUpsert(api_key) => upsert_api_key(runtime, api_key).await,
         PersistenceMessage::AccountUpsert(account) => upsert_account(runtime, account).await,
+        PersistenceMessage::AccountDelete(account_id) => delete_account(runtime, &account_id).await,
         PersistenceMessage::CredentialUpsert(credential) => {
             upsert_credential(runtime, credential).await
         }
@@ -157,6 +158,33 @@ async fn upsert_account(runtime: &Arc<RuntimeState>, account: UpstreamAccount) {
         .write()
         .await
         .insert(account.id.clone(), account);
+}
+
+async fn delete_account(runtime: &Arc<RuntimeState>, account_id: &str) {
+    runtime.accounts.write().await.remove(account_id);
+    runtime.credentials.write().await.remove(account_id);
+    runtime.route_states.write().await.remove(account_id);
+    runtime
+        .ephemeral_refresh_tokens
+        .write()
+        .await
+        .remove(account_id);
+    runtime
+        .codex_app_sessions
+        .write()
+        .await
+        .retain(|_, session| session.account_id != account_id);
+    runtime
+        .leases
+        .write()
+        .await
+        .retain(|_, lease| lease.account_id != account_id);
+    if let Ok(mut gates) = runtime.execution_gates.lock() {
+        gates.remove(account_id);
+    }
+    if let Ok(mut inflight) = runtime.execution_inflight.lock() {
+        inflight.remove(account_id);
+    }
 }
 
 async fn upsert_credential(runtime: &Arc<RuntimeState>, credential: UpstreamCredential) {

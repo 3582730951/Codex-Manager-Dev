@@ -37,12 +37,15 @@ services:
       PORT: 8090
       CMGR_BROWSER_ASSIST_IDLE_TTL_MS: 180000
       CMGR_BROWSER_ASSIST_CHROMIUM_PATH: /usr/bin/chromium-browser
+      CMGR_BROWSER_ASSIST_PROFILE_ROOT: /var/lib/cmgr-browser-assist
       CMGR_DIRECT_PROXY_URL: ${CMGR_DIRECT_PROXY_URL:-}
       CMGR_WARP_PROXY_URL: ${CMGR_WARP_PROXY_URL:-}
       CMGR_BROWSER_ASSIST_DIRECT_PROXY_URL: ${CMGR_BROWSER_ASSIST_DIRECT_PROXY_URL:-}
       CMGR_BROWSER_ASSIST_WARP_PROXY_URL: ${CMGR_BROWSER_ASSIST_WARP_PROXY_URL:-}
     ports:
       - "8090:8090"
+    volumes:
+      - browser-assist-data:/var/lib/cmgr-browser-assist
     depends_on:
       redis:
         condition: service_started
@@ -88,9 +91,11 @@ services:
       SERVER_ADMIN_ORIGIN: http://server:8081
     ports:
       - "3000:3000"
+      - "13100:3000"
     depends_on:
       server:
         condition: service_started
 
 volumes:
   postgres-data:
+  browser-assist-data:

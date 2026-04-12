@@ -377,6 +377,8 @@ pub struct CacheMetrics {
     pub cached_tokens: u64,
     pub replay_tokens: u64,
     pub prefix_hit_ratio: f64,
+    pub request_hit_ratio: f64,
+    pub token_hit_ratio: f64,
     pub warmup_roi: f64,
     pub static_prefix_tokens: u64,
 }
@@ -415,6 +417,25 @@ pub struct ManagedRateLimitSnapshot {
     pub plan_type: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedAccountStatus {
+    #[default]
+    Active,
+    Unavailable,
+    Banned,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountAvailabilityState {
+    #[default]
+    Routable,
+    Cooldown,
+    QuotaExhausted,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedAuthState {
@@ -422,6 +443,12 @@ pub struct ManagedAuthState {
     pub plan_type: Option<String>,
     pub workspace_role: Option<String>,
     pub is_workspace_owner: Option<bool>,
+    #[serde(default)]
+    pub status: ManagedAccountStatus,
+    #[serde(default)]
+    pub status_reason: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
     pub rate_limits: Option<ManagedRateLimitSnapshot>,
     #[serde(default)]
     pub rate_limits_by_limit_id: BTreeMap<String, ManagedRateLimitSnapshot>,
@@ -439,6 +466,21 @@ pub struct CfIncident {
     pub severity: String,
     pub happened_at: DateTime<Utc>,
     pub cooldown_level: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountAlert {
+    pub id: String,
+    pub account_id: String,
+    pub account_label: String,
+    pub kind: String,
+    pub severity: String,
+    pub happened_at: DateTime<Utc>,
+    pub quota_headroom: Option<f64>,
+    pub cooldown_level: usize,
+    pub status: ManagedAccountStatus,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -497,11 +539,23 @@ pub struct AccountSummary {
     #[serde(default)]
     pub is_workspace_owner: Option<bool>,
     #[serde(default)]
+    pub status: ManagedAccountStatus,
+    #[serde(default)]
+    pub status_reason: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
     pub rate_limits: Option<ManagedRateLimitSnapshot>,
     #[serde(default)]
     pub rate_limits_by_limit_id: BTreeMap<String, ManagedRateLimitSnapshot>,
     #[serde(default)]
     pub managed_state_refreshed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub availability_state: AccountAvailabilityState,
+    #[serde(default)]
+    pub availability_reason: Option<String>,
+    #[serde(default)]
+    pub availability_reset_at: Option<DateTime<Utc>>,
     pub egress_group: String,
     pub proxy_enabled: bool,
 }
@@ -670,6 +724,7 @@ pub struct DashboardSnapshot {
     pub cache_metrics: CacheMetrics,
     pub accounts: Vec<AccountSummary>,
     pub leases: Vec<CliLease>,
+    pub account_alerts: Vec<AccountAlert>,
     pub cf_incidents: Vec<CfIncident>,
     pub browser_tasks: Vec<BrowserTask>,
     pub users: Vec<GatewayUserView>,
@@ -686,8 +741,18 @@ pub struct DashboardLiveSnapshot {
     pub cache_metrics: CacheMetrics,
     pub accounts: Vec<AccountSummary>,
     pub leases: Vec<CliLease>,
+    pub account_alerts: Vec<AccountAlert>,
     pub request_logs: Vec<RequestLogEntry>,
     pub billing: BillingSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountCleanupResult {
+    pub scanned: usize,
+    pub deleted: usize,
+    pub skipped_not_banned: usize,
+    pub deleted_account_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

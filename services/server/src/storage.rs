@@ -20,6 +20,7 @@ pub enum PersistenceMessage {
     TenantUpsert(Tenant),
     ApiKeyUpsert(GatewayApiKey),
     AccountUpsert(UpstreamAccount),
+    AccountDelete(String),
     CredentialUpsert(UpstreamCredential),
     RouteStateUpsert(AccountRouteState),
     LeaseUpsert(CliLease),
@@ -38,6 +39,7 @@ impl PersistenceMessage {
             Self::TenantUpsert(_) => "tenant_upsert",
             Self::ApiKeyUpsert(_) => "api_key_upsert",
             Self::AccountUpsert(_) => "account_upsert",
+            Self::AccountDelete(_) => "account_delete",
             Self::CredentialUpsert(_) => "credential_upsert",
             Self::RouteStateUpsert(_) => "route_state_upsert",
             Self::LeaseUpsert(_) => "lease_upsert",
@@ -369,10 +371,19 @@ impl Persistence {
         .fetch_optional(self.pool.as_ref())
         .await?
         .map(|row| -> Result<CacheMetrics, sqlx::Error> {
+            let cached_tokens = row.try_get::<i64, _>("cached_tokens")?.max(0) as u64;
+            let replay_tokens = row.try_get::<i64, _>("replay_tokens")?.max(0) as u64;
+            let prefix_hit_ratio = row.try_get("prefix_hit_ratio")?;
             Ok(CacheMetrics {
-                cached_tokens: row.try_get::<i64, _>("cached_tokens")?.max(0) as u64,
-                replay_tokens: row.try_get::<i64, _>("replay_tokens")?.max(0) as u64,
-                prefix_hit_ratio: row.try_get("prefix_hit_ratio")?,
+                cached_tokens,
+                replay_tokens,
+                prefix_hit_ratio,
+                request_hit_ratio: prefix_hit_ratio,
+                token_hit_ratio: if replay_tokens > 0 {
+                    cached_tokens as f64 / replay_tokens as f64
+                } else {
+                    0.0
+                },
                 warmup_roi: row.try_get("warmup_roi")?,
                 static_prefix_tokens: row.try_get::<i64, _>("static_prefix_tokens")?.max(0) as u64,
             })
@@ -498,6 +509,12 @@ impl Persistence {
                     .bind(account.created_at)
                     .execute(&mut *tx)
                     .await?;
+                }
+                PersistenceMessage::AccountDelete(account_id) => {
+                    sqlx::query("delete from upstream_accounts where id = $1")
+                        .bind(account_id)
+                        .execute(&mut *tx)
+                        .await?;
                 }
                 PersistenceMessage::CredentialUpsert(credential) => {
                     sqlx::query(

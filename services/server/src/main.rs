@@ -15,7 +15,10 @@ use axum::Router;
 use tokio::net::TcpListener;
 use tracing::info;
 
-use crate::{config::Config, state::AppState};
+use crate::{
+    config::Config,
+    state::{AppState, MANAGED_ACCOUNT_REFRESH_INTERVAL, MODEL_CATALOG_REFRESH_INTERVAL},
+};
 
 #[tokio::main]
 async fn main() {
@@ -28,6 +31,8 @@ async fn main() {
 
     let config = Config::from_env();
     let state = AppState::new(config.clone()).await;
+    spawn_managed_account_refresh_worker(state.clone());
+    spawn_model_catalog_refresh_worker(state.clone());
 
     let data_router = http::data::router(state.clone());
     let admin_router = http::admin::router(state.clone());
@@ -64,4 +69,31 @@ async fn main() {
 
 async fn serve_router(listener: TcpListener, router: Router) -> std::io::Result<()> {
     axum::serve(listener, router).await
+}
+
+fn spawn_managed_account_refresh_worker(state: AppState) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(MANAGED_ACCOUNT_REFRESH_INTERVAL);
+        loop {
+            ticker.tick().await;
+            if let Err(error) = state
+                .refresh_stale_managed_accounts(MANAGED_ACCOUNT_REFRESH_INTERVAL)
+                .await
+            {
+                tracing::warn!(%error, "managed account refresh sweep failed");
+            }
+        }
+    });
+}
+
+fn spawn_model_catalog_refresh_worker(state: AppState) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(MODEL_CATALOG_REFRESH_INTERVAL);
+        loop {
+            ticker.tick().await;
+            if let Err(error) = state.refresh_account_models().await {
+                tracing::warn!(%error, "account model refresh sweep failed");
+            }
+        }
+    });
 }

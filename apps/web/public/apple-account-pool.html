@@ -1,0 +1,615 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>Account Pool</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f5f5f7;
+        --surface: rgba(255, 255, 255, 0.84);
+        --surface-solid: #ffffff;
+        --line: rgba(0, 0, 0, 0.06);
+        --shadow: 0 2px 12px rgba(0, 0, 0, 0.04), 0 0 0 0.5px rgba(0, 0, 0, 0.02);
+        --blue: #007aff;
+        --green: #34c759;
+        --orange: #ff9f0a;
+        --red: #ff3b30;
+        --gray: #8e8e93;
+        --text: #111111;
+        --muted: #6e6e73;
+        --ease: cubic-bezier(0.25, 0.1, 0.25, 1);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        min-height: 100%;
+        background:
+          radial-gradient(circle at top left, rgba(0, 122, 255, 0.08), transparent 24%),
+          linear-gradient(180deg, #fbfbfd 0%, #f5f5f7 58%, #eef1f5 100%);
+        color: var(--text);
+        font-family:
+          -apple-system,
+          BlinkMacSystemFont,
+          "SF Pro Text",
+          "SF Pro Display",
+          "Helvetica Neue",
+          sans-serif;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+
+      body {
+        padding: 24px;
+      }
+
+      .shell {
+        max-width: 1480px;
+        margin: 0 auto;
+      }
+
+      .toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 20px;
+      }
+
+      .glass,
+      .card,
+      .fab {
+        border-radius: 24px;
+        background: var(--surface);
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(20px) saturate(180%);
+        -webkit-backdrop-filter: blur(20px) saturate(180%);
+      }
+
+      .segmented {
+        display: inline-flex;
+        gap: 6px;
+        padding: 6px;
+      }
+
+      .segment,
+      .icon-button,
+      .fab {
+        border: 0;
+        appearance: none;
+        background: transparent;
+        color: var(--muted);
+        cursor: pointer;
+        transition:
+          background 220ms var(--ease),
+          color 220ms var(--ease),
+          transform 220ms var(--ease),
+          opacity 220ms var(--ease),
+          box-shadow 220ms var(--ease);
+      }
+
+      .segment,
+      .icon-button {
+        width: 40px;
+        height: 40px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 18px;
+      }
+
+      .segment:hover,
+      .icon-button:hover,
+      .fab:hover {
+        transform: translateY(-1px);
+      }
+
+      .segment:active,
+      .icon-button:active,
+      .fab:active,
+      .account:active {
+        transform: scale(0.985);
+      }
+
+      .segment.active {
+        background: var(--surface-solid);
+        color: var(--text);
+        box-shadow: 0 1px 0 rgba(255, 255, 255, 0.9), var(--shadow);
+      }
+
+      .toolbar-right {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .refresh-pill {
+        padding: 0 14px;
+        height: 40px;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--muted);
+        letter-spacing: 0.01em;
+      }
+
+      .grid {
+        display: grid;
+        gap: 18px;
+        grid-template-columns: repeat(1, minmax(0, 1fr));
+      }
+
+      .account {
+        position: relative;
+        min-height: 220px;
+        padding: 22px;
+        border-radius: 24px;
+        background: var(--surface-solid);
+        box-shadow: var(--shadow);
+        transition:
+          transform 240ms var(--ease),
+          box-shadow 240ms var(--ease),
+          background 240ms var(--ease);
+      }
+
+      .account:hover {
+        transform: scale(1.01) translateY(-1px);
+        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.06), 0 0 0 0.5px rgba(0, 0, 0, 0.02);
+      }
+
+      .account-top {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+      }
+
+      .account-main {
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+      }
+
+      .platform,
+      .status-badge {
+        width: 42px;
+        height: 42px;
+        border-radius: 999px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex: 0 0 auto;
+      }
+
+      .platform {
+        background: #f7f7f9;
+        color: var(--text);
+      }
+
+      .status-badge.available {
+        color: var(--green);
+        background: rgba(52, 199, 89, 0.12);
+      }
+
+      .status-badge.in-use {
+        color: var(--orange);
+        background: rgba(255, 159, 10, 0.12);
+      }
+
+      .status-badge.disabled {
+        color: var(--red);
+        background: rgba(255, 59, 48, 0.12);
+      }
+
+      .identity {
+        min-width: 0;
+      }
+
+      .identity strong,
+      .identity span {
+        display: block;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .identity strong {
+        font-size: 16px;
+        font-weight: 600;
+        letter-spacing: -0.025em;
+      }
+
+      .identity span {
+        margin-top: 4px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .meta {
+        margin-top: 22px;
+      }
+
+      .meta-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 8px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .track {
+        width: 100%;
+        height: 8px;
+        background: #ececef;
+        border-radius: 999px;
+        overflow: hidden;
+      }
+
+      .fill {
+        height: 100%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, var(--blue), #5ac8fa);
+        transition: width 320ms var(--ease), background 320ms var(--ease);
+      }
+
+      .fill.warn {
+        background: linear-gradient(90deg, var(--orange), #ffd60a);
+      }
+
+      .fill.bad {
+        background: linear-gradient(90deg, var(--red), #ff6961);
+      }
+
+      .chips {
+        margin-top: 18px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+
+      .chip {
+        min-height: 32px;
+        padding: 0 12px;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        border-radius: 999px;
+        background: #f7f7f9;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .footer {
+        margin-top: 18px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .footer .models {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        min-width: 0;
+      }
+
+      .tag {
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: #f7f7f9;
+        color: var(--muted);
+        font-size: 11px;
+        max-width: 132px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .footer-time {
+        color: var(--muted);
+        font-size: 11px;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        flex: 0 0 auto;
+      }
+
+      .menu {
+        position: absolute;
+        top: 70px;
+        right: 20px;
+        display: none;
+        gap: 6px;
+        padding: 8px;
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 12px 32px rgba(0, 0, 0, 0.08);
+      }
+
+      .account.open .menu {
+        display: inline-flex;
+      }
+
+      .fab {
+        width: 52px;
+        height: 52px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        background: var(--blue);
+      }
+
+      @media (min-width: 720px) {
+        .grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+
+      @media (min-width: 1080px) {
+        .grid {
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+        }
+      }
+
+      @media (min-width: 1400px) {
+        .grid {
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+        }
+      }
+
+      @media (max-width: 640px) {
+        body {
+          padding: 16px;
+        }
+
+        .toolbar {
+          align-items: stretch;
+          flex-direction: column;
+        }
+
+        .toolbar-right {
+          justify-content: space-between;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <div class="toolbar">
+        <div class="glass segmented" role="tablist" aria-label="Filters">
+          <button class="segment active" data-filter="all" title="All">
+            <i data-lucide="layout-grid"></i>
+          </button>
+          <button class="segment" data-filter="available" title="Available">
+            <i data-lucide="badge-check"></i>
+          </button>
+          <button class="segment" data-filter="in-use" title="In use">
+            <i data-lucide="circle-user-round"></i>
+          </button>
+          <button class="segment" data-filter="disabled" title="Disabled">
+            <i data-lucide="circle-x"></i>
+          </button>
+        </div>
+
+        <div class="toolbar-right">
+          <div class="glass refresh-pill" title="Quota refresh every 60s">
+            <i data-lucide="clock-3"></i>
+            <span>60s</span>
+          </div>
+          <button class="glass icon-button" title="Search" aria-label="Search">
+            <i data-lucide="search"></i>
+          </button>
+          <button class="fab" title="Add" aria-label="Add">
+            <i data-lucide="plus"></i>
+          </button>
+        </div>
+      </div>
+
+      <main class="grid" id="grid"></main>
+    </div>
+
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script>
+      const accounts = [
+        {
+          id: "acc_01",
+          type: "mail",
+          name: "john.doe@gmail.com",
+          subtitle: "Workspace A",
+          status: "available",
+          quota: 0.82,
+          route: "direct",
+          models: ["gpt-5.4", "gpt-5.3-codex"],
+          refreshedAt: Date.now() - 15_000
+        },
+        {
+          id: "acc_02",
+          type: "key",
+          name: "build-bot@corp.io",
+          subtitle: "Shared key",
+          status: "in-use",
+          quota: 0.48,
+          route: "warp",
+          models: ["gpt-5.4"],
+          refreshedAt: Date.now() - 31_000
+        },
+        {
+          id: "acc_03",
+          type: "mail",
+          name: "sara.ops@outlook.com",
+          subtitle: "Workspace B",
+          status: "available",
+          quota: 0.22,
+          route: "direct",
+          models: ["gpt-5.2"],
+          refreshedAt: Date.now() - 42_000
+        },
+        {
+          id: "acc_04",
+          type: "key",
+          name: "legacy@pool.local",
+          subtitle: "Disabled",
+          status: "disabled",
+          quota: 0.05,
+          route: "direct",
+          models: ["gpt-4.1"],
+          refreshedAt: Date.now() - 58_000
+        }
+      ];
+
+      const grid = document.getElementById("grid");
+      const segments = Array.from(document.querySelectorAll(".segment"));
+      let activeFilter = "all";
+
+      function platformIcon(type) {
+        return type === "mail" ? "mail" : "key-round";
+      }
+
+      function statusIcon(status) {
+        if (status === "available") return "badge-check";
+        if (status === "in-use") return "circle-user-round";
+        return "circle-x";
+      }
+
+      function quotaClass(quota) {
+        if (quota <= 0.25) return "fill bad";
+        if (quota <= 0.6) return "fill warn";
+        return "fill";
+      }
+
+      function timeAgo(timestamp) {
+        const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+        if (seconds < 60) return `${seconds}s`;
+        return `${Math.round(seconds / 60)}m`;
+      }
+
+      function filteredAccounts() {
+        if (activeFilter === "all") return accounts;
+        return accounts.filter((account) => account.status === activeFilter);
+      }
+
+      function render() {
+        grid.innerHTML = filteredAccounts()
+          .map(
+            (account) => `
+              <article class="account" data-id="${account.id}">
+                <div class="account-top">
+                  <div class="account-main">
+                    <span class="platform" title="Platform">
+                      <i data-lucide="${platformIcon(account.type)}"></i>
+                    </span>
+                    <div class="identity">
+                      <strong>${account.name}</strong>
+                      <span>${account.subtitle}</span>
+                    </div>
+                  </div>
+                  <div style="display:flex; gap:8px; align-items:center;">
+                    <span class="status-badge ${account.status}" title="${account.status}">
+                      <i data-lucide="${statusIcon(account.status)}"></i>
+                    </span>
+                    <button class="icon-button menu-toggle" title="More">
+                      <i data-lucide="ellipsis"></i>
+                    </button>
+                  </div>
+                </div>
+
+                <div class="menu" role="menu">
+                  <button class="icon-button" title="Copy">
+                    <i data-lucide="copy"></i>
+                  </button>
+                  <button class="icon-button" title="Assign">
+                    <i data-lucide="user-plus"></i>
+                  </button>
+                  <button class="icon-button" title="Edit">
+                    <i data-lucide="square-pen"></i>
+                  </button>
+                </div>
+
+                <div class="meta">
+                  <div class="meta-head">
+                    <span>Quota</span>
+                    <span>${Math.round(account.quota * 100)}%</span>
+                  </div>
+                  <div class="track">
+                    <div class="${quotaClass(account.quota)}" style="width:${Math.round(account.quota * 100)}%"></div>
+                  </div>
+                </div>
+
+                <div class="chips">
+                  <span class="chip"><i data-lucide="arrow-up-right"></i>${account.route}</span>
+                  <span class="chip"><i data-lucide="sparkles"></i>${account.models.length}</span>
+                </div>
+
+                <div class="footer">
+                  <div class="models">
+                    ${account.models
+                      .slice(0, 2)
+                      .map((model) => `<span class="tag" title="${model}">${model}</span>`)
+                      .join("")}
+                  </div>
+                  <span class="footer-time" title="Last quota refresh">
+                    <i data-lucide="refresh-cw"></i>${timeAgo(account.refreshedAt)}
+                  </span>
+                </div>
+              </article>
+            `
+          )
+          .join("");
+
+        lucide.createIcons();
+
+        grid.querySelectorAll(".menu-toggle").forEach((button) => {
+          button.addEventListener("click", () => {
+            const card = button.closest(".account");
+            document.querySelectorAll(".account.open").forEach((node) => {
+              if (node !== card) node.classList.remove("open");
+            });
+            card.classList.toggle("open");
+          });
+        });
+      }
+
+      segments.forEach((segment) => {
+        segment.addEventListener("click", () => {
+          activeFilter = segment.dataset.filter;
+          segments.forEach((node) => node.classList.toggle("active", node === segment));
+          render();
+        });
+      });
+
+      document.addEventListener("click", (event) => {
+        if (event.target.closest(".menu-toggle") || event.target.closest(".menu")) {
+          return;
+        }
+        document
+          .querySelectorAll(".account.open")
+          .forEach((node) => node.classList.remove("open"));
+      });
+
+      setInterval(() => {
+        accounts.forEach((account) => {
+          const delta = Math.random() * 0.06 - 0.02;
+          account.quota = Math.max(0.03, Math.min(0.98, account.quota + delta));
+          account.refreshedAt = Date.now();
+        });
+        render();
+      }, 60_000);
+
+      render();
+    </script>
+  </body>
+</html>

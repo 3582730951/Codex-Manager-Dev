@@ -1,8 +1,10 @@
 import {
+  type AccountCleanupResult,
+  type AccountSummary,
+  type BrowserTask,
   dashboardFallback,
   type GatewayUserRole,
   type GatewayUserView,
-  type BrowserTask,
   type DashboardLiveSnapshot,
   type DashboardSnapshot
 } from "@codex-manager/contracts";
@@ -132,6 +134,7 @@ export async function getDashboardLiveSnapshot(): Promise<DashboardLiveSnapshot>
     cacheMetrics: dashboardFallback.cacheMetrics,
     accounts: dashboardFallback.accounts,
     leases: dashboardFallback.leases,
+    accountAlerts: dashboardFallback.accountAlerts,
     requestLogs: dashboardFallback.requestLogs,
     billing: dashboardFallback.billing
   } satisfies DashboardLiveSnapshot;
@@ -209,6 +212,24 @@ export async function updateUser(
 
 export async function refreshAccountModels() {
   return fetchAdmin<DashboardSnapshot["accounts"]>("/api/v1/accounts/models/refresh", {
+    method: "POST"
+  });
+}
+
+export async function refreshAccountQuota(accountId: string) {
+  return fetchAdmin<AccountSummary>(`/api/v1/accounts/${accountId}/quota/refresh`, {
+    method: "POST"
+  });
+}
+
+export async function deleteAccount(accountId: string) {
+  await fetchAdmin<void>(`/api/v1/accounts/${accountId}`, {
+    method: "DELETE"
+  });
+}
+
+export async function cleanupBannedAccounts() {
+  return fetchAdmin<AccountCleanupResult>("/api/v1/accounts/cleanup/banned", {
     method: "POST"
   });
 }

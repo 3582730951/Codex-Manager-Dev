@@ -309,7 +309,9 @@ fn decode_secret_key(secret: &str) -> Result<[u8; 32], String> {
     let decoded = URL_SAFE_NO_PAD
         .decode(secret)
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(secret))
-        .map_err(|_| "CMGR_ACCOUNT_ENCRYPTION_KEY 必须是 32 字节明文或 base64 编码的 32 字节密钥".to_string())?;
+        .map_err(|_| {
+            "CMGR_ACCOUNT_ENCRYPTION_KEY 必须是 32 字节明文或 base64 编码的 32 字节密钥".to_string()
+        })?;
     let key = decoded
         .get(..32)
         .ok_or_else(|| "CMGR_ACCOUNT_ENCRYPTION_KEY 长度不足 32 字节".to_string())?;
@@ -374,6 +376,25 @@ fn chatgpt_backend_base(base_url: &str) -> Option<String> {
     None
 }
 
+pub fn deactivation_reason_from_message(message: &str) -> Option<&'static str> {
+    let normalized = message.trim().to_ascii_lowercase();
+    if normalized.contains("workspace_deactivated")
+        || normalized.contains("deactivated_workspace")
+        || normalized.contains("workspace deactivated")
+        || normalized.contains("workspace-deactivated")
+        || normalized.contains("deactivated workspace")
+    {
+        return Some("workspace_deactivated");
+    }
+    if normalized.contains("account_deactivated")
+        || normalized.contains("account deactivated")
+        || normalized.contains("deactivated")
+    {
+        return Some("account_deactivated");
+    }
+    None
+}
+
 fn extract_rate_limits_from_usage(
     value: &serde_json::Value,
 ) -> (
@@ -391,13 +412,18 @@ fn extract_rate_limits_from_usage(
             .pointer("/rate_limit/secondary_window")
             .and_then(parse_rate_limit_window),
         credits: value.get("credits").and_then(parse_credits_snapshot),
-        spend_control: value.get("spend_control").and_then(parse_spend_control_snapshot),
+        spend_control: value
+            .get("spend_control")
+            .and_then(parse_spend_control_snapshot),
         plan_type: plan_type.clone(),
     };
 
     let mut by_limit_id = BTreeMap::new();
     by_limit_id.insert("codex".to_string(), primary.clone());
-    if let Some(items) = value.get("additional_rate_limits").and_then(serde_json::Value::as_array) {
+    if let Some(items) = value
+        .get("additional_rate_limits")
+        .and_then(serde_json::Value::as_array)
+    {
         for item in items {
             let limit_id = item
                 .get("metered_feature")
@@ -476,9 +502,7 @@ fn parse_credits_snapshot(value: &serde_json::Value) -> Option<ManagedCreditsSna
     })
 }
 
-fn parse_spend_control_snapshot(
-    value: &serde_json::Value,
-) -> Option<ManagedSpendControlSnapshot> {
+fn parse_spend_control_snapshot(value: &serde_json::Value) -> Option<ManagedSpendControlSnapshot> {
     Some(ManagedSpendControlSnapshot {
         reached: value
             .get("reached")

@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type {
+  AccountCleanupResult,
   DashboardLiveSnapshot,
   DashboardSnapshot,
   GatewayUserRole,
@@ -13,6 +14,7 @@ import {
   Bell,
   BellOff,
   Bot,
+  CircleX,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
@@ -35,6 +37,7 @@ import {
   Sparkles,
   SunMedium,
   Terminal,
+  Trash2,
   TriangleAlert,
   User,
   Users
@@ -70,7 +73,7 @@ type ActiveView =
   | "logs"
   | "config";
 
-type AccountFilter = "all" | "active" | "low" | "protected";
+type AccountFilter = "all" | "available" | "inUse" | "disabled";
 type Language = "zh" | "en";
 type ThemeMode = "dark" | "light";
 type BannerTone = "ok" | "error" | "neutral";
@@ -112,6 +115,9 @@ type BannerState = {
   tone: BannerTone;
   message: string;
 } | null;
+
+type AccountRecord = DashboardSnapshot["accounts"][number];
+type AccountAlertRecord = DashboardSnapshot["accountAlerts"][number];
 
 type RecentCliInstance = {
   principalId: string;
@@ -163,6 +169,7 @@ type UserPolicyCardProps = {
 const iconStroke = 1.5;
 const themeStorageKey = "cmgr-dashboard-theme";
 const languageStorageKey = "cmgr-dashboard-language";
+const managedQuotaRefreshIntervalMs = 60_000;
 
 function cx(...values: Array<string | false | null | undefined>) {
   return values.filter(Boolean).join(" ");
@@ -181,6 +188,10 @@ function shortId(value: string) {
     return value;
   }
   return `${value.slice(0, 7)}...${value.slice(-4)}`;
+}
+
+function truncateText(value: string, limit = 120) {
+  return value.length > limit ? `${value.slice(0, limit - 3)}...` : value;
 }
 
 function initialsForName(value: string) {
@@ -207,6 +218,15 @@ function formatNumber(value: number, language: Language) {
   return new Intl.NumberFormat(language === "zh" ? "zh-CN" : "en-US").format(
     value
   );
+}
+
+function formatMToken(value: number, language: Language) {
+  const mtokens = value / 1_000_000;
+  const formatter = new Intl.NumberFormat(language === "zh" ? "zh-CN" : "en-US", {
+    minimumFractionDigits: mtokens >= 10 ? 1 : 2,
+    maximumFractionDigits: mtokens >= 10 ? 1 : 2
+  });
+  return `${formatter.format(mtokens)} MToken`;
 }
 
 function relativeTime(value: string | null, language: Language) {
@@ -264,22 +284,46 @@ function affinityIdFromPrincipal(principalId: string) {
   return principalId.slice(markerIndex + marker.length) || principalId;
 }
 
-function donutStyle(value: number) {
-  const circumference = 2 * Math.PI * 38;
+function ringSegmentStyle(
+  value: number,
+  radius: number,
+  startFraction: number,
+  spanFraction: number
+) {
+  const circumference = 2 * Math.PI * radius;
+  const segmentLength = circumference * clamp01(spanFraction) * clamp01(value);
   return {
-    strokeDasharray: circumference,
-    strokeDashoffset: circumference * (1 - clamp01(value))
+    strokeDasharray: `${segmentLength} ${Math.max(circumference - segmentLength, 0)}`,
+    strokeDashoffset: -circumference * clamp01(startFraction)
   };
 }
 
-function accountKind(account: DashboardSnapshot["accounts"][number]) {
+function requestHitRatio(cacheMetrics: DashboardSnapshot["cacheMetrics"]) {
+  return clamp01(cacheMetrics.requestHitRatio ?? cacheMetrics.prefixHitRatio);
+}
+
+function tokenHitRatio(cacheMetrics: DashboardSnapshot["cacheMetrics"]) {
+  if (Number.isFinite(cacheMetrics.tokenHitRatio)) {
+    return clamp01(cacheMetrics.tokenHitRatio);
+  }
+  if (cacheMetrics.replayTokens <= 0) {
+    return 0;
+  }
+  return clamp01(cacheMetrics.cachedTokens / cacheMetrics.replayTokens);
+}
+
+function accountKind(account: AccountRecord) {
   const quotaFloor = Math.min(
     account.quotaHeadroom,
     account.quotaHeadroom5h,
     account.quotaHeadroom7d
   );
 
-  if (account.nearQuotaGuardEnabled || account.cooldownLevel > 0) {
+  if (
+    account.availabilityState === "quota_exhausted" ||
+    account.availabilityState === "cooldown" ||
+    account.nearQuotaGuardEnabled
+  ) {
     return "protected";
   }
   if (quotaFloor <= 0.25) {
@@ -296,6 +340,261 @@ function quotaBarColor(quota: number) {
     return "bg-amber-500";
   }
   return "bg-rose-500";
+}
+
+function accountStatusTone(account: AccountRecord) {
+  if (account.availabilityState === "quota_exhausted") {
+    return {
+      dot: "bg-rose-500",
+      chip: "bg-rose-500/12 text-rose-300",
+      chipLight: "bg-rose-50 text-rose-600"
+    };
+  }
+  if (account.availabilityState === "cooldown") {
+    return {
+      dot: "bg-amber-500",
+      chip: "bg-amber-500/12 text-amber-300",
+      chipLight: "bg-amber-50 text-amber-600"
+    };
+  }
+  if (account.status === "banned") {
+    return {
+      dot: "bg-rose-500",
+      chip: "bg-rose-500/12 text-rose-300",
+      chipLight: "bg-rose-50 text-rose-600"
+    };
+  }
+  if (status === "unavailable") {
+    return {
+      dot: "bg-amber-500",
+      chip: "bg-amber-500/12 text-amber-300",
+      chipLight: "bg-amber-50 text-amber-600"
+    };
+  }
+  return {
+    dot: "bg-emerald-500",
+    chip: "bg-emerald-500/12 text-emerald-300",
+    chipLight: "bg-emerald-50 text-emerald-600"
+  };
+}
+
+function accountRateLimitWindow(
+  account: AccountRecord,
+  target: "5h" | "7d"
+) {
+  const windows = [account.rateLimits?.primary, account.rateLimits?.secondary].reduce<
+    Array<NonNullable<NonNullable<AccountRecord["rateLimits"]>["primary"]>>
+  >((items, window) => {
+    if (window) {
+      items.push(window);
+    }
+    return items;
+  }, []);
+  return windows.find((window) => {
+    const minutes = window.windowDurationMins;
+    if (minutes === null || minutes === undefined) {
+      return false;
+    }
+    return target === "5h" ? minutes <= 300 : minutes >= 10_080;
+  });
+}
+
+function accountQuotaHeadroomLabel(
+  account: AccountRecord,
+  target: "5h" | "7d"
+) {
+  return target === "5h"
+    ? percent(account.quotaHeadroom5h)
+    : percent(account.quotaHeadroom7d);
+}
+
+function accountPrimaryIdentifier(account: AccountRecord) {
+  return account.chatgptEmail || account.label || shortId(account.id);
+}
+
+function accountSecondaryIdentifier(account: AccountRecord) {
+  return account.chatgptEmail ? account.label || shortId(account.id) : shortId(account.id);
+}
+
+function accountOperationalState(
+  account: AccountRecord,
+  leasedAccountIds: Set<string>
+) {
+  if (account.availabilityState !== "routable") {
+    return "disabled" as const;
+  }
+  if (account.inflight > 0 || leasedAccountIds.has(account.id)) {
+    return "inUse" as const;
+  }
+  return "available" as const;
+}
+
+function effectiveQuotaHeadroom(account: AccountRecord) {
+  return Math.min(
+    account.quotaHeadroom,
+    account.quotaHeadroom5h,
+    account.quotaHeadroom7d
+  );
+}
+
+function deriveAccountAlertsFromAccounts(accounts: AccountRecord[]): AccountAlertRecord[] {
+  const now = new Date().toISOString();
+  return accounts
+    .reduce<AccountAlertRecord[]>((alerts, account) => {
+      const quotaFloor = effectiveQuotaHeadroom(account);
+
+      if (account.availabilityState === "quota_exhausted") {
+        alerts.push({
+          id: `${account.id}:quota_exhausted`,
+          accountId: account.id,
+          accountLabel: account.label,
+          kind: "quota_exhausted",
+          severity: "critical",
+          happenedAt: account.availabilityResetAt ?? now,
+          quotaHeadroom: quotaFloor,
+          cooldownLevel: account.cooldownLevel,
+          status: account.status,
+          reason: account.availabilityReason ?? "quota_exhausted"
+        });
+        return alerts;
+      }
+
+      if (account.status === "banned") {
+        alerts.push({
+          id: `${account.id}:disabled`,
+          accountId: account.id,
+          accountLabel: account.label,
+          kind: "disabled",
+          severity: "critical",
+          happenedAt: account.managedStateRefreshedAt ?? now,
+          quotaHeadroom: quotaFloor,
+          cooldownLevel: account.cooldownLevel,
+          status: account.status,
+          reason: account.statusReason ?? "account_disabled"
+        });
+        return alerts;
+      }
+
+      if (account.availabilityState === "unavailable") {
+        alerts.push({
+          id: `${account.id}:unavailable`,
+          accountId: account.id,
+          accountLabel: account.label,
+          kind: "unavailable",
+          severity: "warning",
+          happenedAt: account.managedStateRefreshedAt ?? now,
+          quotaHeadroom: quotaFloor,
+          cooldownLevel: account.cooldownLevel,
+          status: account.status,
+          reason: account.availabilityReason ?? account.statusReason ?? "refresh_failed"
+        });
+        return alerts;
+      }
+
+      if (account.availabilityState === "cooldown" || account.nearQuotaGuardEnabled) {
+        alerts.push({
+          id: `${account.id}:protected`,
+          accountId: account.id,
+          accountLabel: account.label,
+          kind: "protected",
+          severity: "warning",
+          happenedAt:
+            account.cooldownUntil ?? account.managedStateRefreshedAt ?? now,
+          quotaHeadroom: quotaFloor,
+          cooldownLevel: account.cooldownLevel,
+          status: account.status,
+          reason: account.availabilityReason ?? account.statusReason ?? "cooldown_guard"
+        });
+        return alerts;
+      }
+
+      if (quotaFloor <= 0.25) {
+        alerts.push({
+          id: `${account.id}:low_quota`,
+          accountId: account.id,
+          accountLabel: account.label,
+          kind: "low_quota",
+          severity: quotaFloor <= 0.1 ? "critical" : "warning",
+          happenedAt: account.managedStateRefreshedAt ?? now,
+          quotaHeadroom: quotaFloor,
+          cooldownLevel: account.cooldownLevel,
+          status: account.status,
+          reason: "quota_floor"
+        });
+      }
+
+      return alerts;
+    }, [])
+    .sort((left, right) => {
+      const leftPriority = left.severity === "critical" ? 0 : 1;
+      const rightPriority = right.severity === "critical" ? 0 : 1;
+      if (leftPriority !== rightPriority) {
+        return leftPriority - rightPriority;
+      }
+      return (
+        new Date(right.happenedAt).getTime() - new Date(left.happenedAt).getTime()
+      );
+    });
+}
+
+function nextSnapshotWithAccounts(
+  current: DashboardSnapshot,
+  accounts: DashboardSnapshot["accounts"]
+) {
+  const activeAccountIds = new Set(accounts.map((account) => account.id));
+  const leases = current.leases.filter((lease) => activeAccountIds.has(lease.accountId));
+  return {
+    ...current,
+    accounts,
+    leases,
+    accountAlerts: deriveAccountAlertsFromAccounts(accounts),
+    modelCatalog: Array.from(
+      new Set(accounts.flatMap((account) => account.models))
+    ).sort(),
+    counts: {
+      ...current.counts,
+      accounts: accounts.length,
+      activeLeases: leases.length,
+      warpAccounts: accounts.filter((account) => account.routeMode === "warp").length
+    }
+  };
+}
+
+function readApiErrorMessage(payload: unknown, fallback: string) {
+  if (
+    payload &&
+    typeof payload === "object" &&
+    !Array.isArray(payload) &&
+    "error" in payload
+  ) {
+    const error = (payload as { error?: { message?: string } }).error;
+    if (error?.message) {
+      return error.message;
+    }
+  }
+  return fallback;
+}
+
+function isAccountRecordPayload(payload: unknown): payload is AccountRecord {
+  return (
+    payload !== null &&
+    typeof payload === "object" &&
+    !Array.isArray(payload) &&
+    "id" in payload &&
+    "models" in payload
+  );
+}
+
+function isAccountCleanupResultPayload(
+  payload: unknown
+): payload is AccountCleanupResult {
+  return (
+    payload !== null &&
+    typeof payload === "object" &&
+    !Array.isArray(payload) &&
+    "deletedAccountIds" in payload &&
+    Array.isArray((payload as AccountCleanupResult).deletedAccountIds)
+  );
 }
 
 function deriveModelCatalog(snapshot: DashboardSnapshot) {
@@ -363,12 +662,12 @@ function SidebarItem({
   return (
     <button
       className={cx(
-        "group flex h-12 items-center rounded-[20px] text-sm font-medium transition-all duration-200",
-        expanded ? "w-full gap-3 px-3" : "mx-auto w-12 justify-center px-0",
+        "group flex h-10 items-center rounded-[16px] text-[13px] font-medium transition-all duration-200",
+        expanded ? "w-full gap-2.5 px-2.5" : "mx-auto w-10 justify-center px-0",
         active
           ? isDark
-            ? "bg-sky-500/12 text-sky-200 shadow-soft"
-            : "bg-sky-50 text-sky-600 shadow-soft"
+            ? "bg-white/[0.08] text-zinc-50 shadow-soft"
+            : "bg-white text-zinc-950 shadow-soft"
           : isDark
             ? "text-zinc-400 hover:bg-white/[0.04] hover:text-zinc-100"
             : "text-zinc-500 hover:bg-white/80 hover:text-zinc-900"
@@ -379,22 +678,22 @@ function SidebarItem({
     >
       <span
         className={cx(
-          "flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl transition-all duration-200",
+          "flex h-8 w-8 shrink-0 items-center justify-center rounded-[14px] transition-all duration-200",
           active
             ? isDark
-              ? "bg-sky-400/16 text-sky-200"
-              : "bg-sky-100 text-sky-600"
+              ? "bg-white/[0.12] text-zinc-100"
+              : "bg-zinc-900 text-white"
             : isDark
               ? "bg-white/[0.05] text-zinc-400 group-hover:bg-white/[0.08]"
               : "bg-zinc-100 text-zinc-500 group-hover:bg-zinc-200/80"
         )}
       >
-        <Icon size={18} strokeWidth={iconStroke} />
+        <Icon size={16} strokeWidth={iconStroke} />
       </span>
       <span
         className={cx(
           "overflow-hidden whitespace-nowrap text-left transition-all duration-200",
-          expanded ? "max-w-[160px] opacity-100" : "max-w-0 opacity-0"
+          expanded ? "max-w-[144px] opacity-100" : "max-w-0 opacity-0"
         )}
       >
         {label}
@@ -416,26 +715,23 @@ function SectionCard({
   return (
     <section
       className={cx(
-        "rounded-[32px] border p-6 shadow-panel backdrop-blur-xl",
-        isDark
-          ? "border-white/10 bg-[#11141b]/82"
-          : "border-white/70 bg-white/85"
+        "apple-panel rounded-[30px] p-4 shadow-panel md:p-5"
       )}
     >
-      <header className="mb-5 flex items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
+      <header className="mb-5 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div className="flex items-center gap-2.5">
           <span
             className={cx(
-              "flex h-11 w-11 items-center justify-center rounded-2xl",
-              isDark ? "bg-white/[0.05] text-zinc-300" : "bg-zinc-100 text-zinc-600"
+              "apple-subtle-panel flex h-10 w-10 items-center justify-center rounded-[16px]",
+              isDark ? "text-zinc-300" : "text-zinc-600"
             )}
           >
-            <Icon size={18} strokeWidth={iconStroke} />
+            <Icon size={16} strokeWidth={iconStroke} />
           </span>
           <div>
             <h2
               className={cx(
-                "text-xl font-semibold tracking-tight",
+                "text-[18px] font-semibold tracking-[-0.03em]",
                 isDark ? "text-zinc-50" : "text-zinc-900"
               )}
             >
@@ -444,7 +740,7 @@ function SectionCard({
             {subtitle ? (
               <p
                 className={cx(
-                  "mt-1 text-xs",
+                  "mt-0.5 text-[11px] leading-[18px]",
                   isDark ? "text-zinc-500" : "text-zinc-500"
                 )}
               >
@@ -466,16 +762,16 @@ function EmptyState({ icon: Icon, theme, title }: EmptyStateProps) {
   return (
     <div
       className={cx(
-        "flex min-h-[240px] flex-col items-center justify-center gap-3 rounded-[24px] border border-dashed text-center",
+        "apple-subtle-panel flex min-h-[240px] flex-col items-center justify-center gap-3 rounded-[24px] border border-dashed text-center",
         isDark
-          ? "border-white/10 bg-white/[0.02]"
-          : "border-zinc-200 bg-zinc-50/80"
+          ? "border-white/10"
+          : "border-zinc-200"
       )}
     >
       <span
         className={cx(
-          "flex h-16 w-16 items-center justify-center rounded-full shadow-soft",
-          isDark ? "bg-white/[0.05] text-zinc-600" : "bg-white text-zinc-300"
+          "apple-subtle-panel flex h-16 w-16 items-center justify-center rounded-full shadow-soft",
+          isDark ? "text-zinc-600" : "text-zinc-300"
         )}
       >
         <Icon size={28} strokeWidth={iconStroke} />
@@ -541,54 +837,95 @@ function ToggleRow({
 function translationFor(language: Language) {
   return language === "zh"
     ? {
-        brandTitle: "AI 账号池",
-        brandSubtitle: "Pool Control",
+        brandTitle: "Origin管理端",
+        brandSubtitle: "",
         navOverview: "概览",
         navAccounts: "账号",
         navUsers: "用户",
         navAlerts: "告警",
         navLogs: "日志",
         navConfig: "配置",
-        headerKicker: "AI Account Pool",
-        headerTitle: "暗色账号池控制台",
-        headerDescription:
-          "统一账号接入、用户策略、消费追踪和网关连接配置，面向日常运维直接可用。",
-        summaryCache: "缓存",
+        headerKicker: "",
+        headerTitle: "Origin管理端",
+        headerDescription: "",
+        summaryCache: "Token 命中",
         summaryUsers: "用户",
         summarySpend: "消费",
         summaryHealth: "状态",
         nominal: "正常",
         attention: "关注",
         overview: "概览",
-        overviewSub: "缓存、账号状态和消费概况",
-        cacheHit: "缓存命中率",
-        prefixCache: "累计缓存 Token",
-        cacheHitHint: "按最近 512 条请求日志中出现缓存命中的请求占比计算。",
+        overviewSub: "缓存、额度与账号状态",
+        cacheHit: "缓存命中",
+        tokenHitRate: "Token 级命中率",
+        prefixCache: "累计缓存 Input Tokens",
+        totalInputTokens: "累计 Input Tokens",
+        requestHitLabel: "请求级",
+        tokenHitLabel: "Token 级",
+        cacheProfileTitle: "缓存命中画像",
+        cacheProfileDesc: "以 Token 命中为主，请求级仅作参考。",
+        observedWindow: "统计窗口",
+        observedWindowValue: "最近 512 条请求",
+        recoveredInput: "已回收输入",
+        ringCenterLabel: "Token 命中",
+        cacheHitHint: "Token=缓存/输入 · 请求=命中请求占比",
         hit: "命中",
-        tokens: "tokens",
+        tokens: "MToken",
         lowQuota: "低额度",
-        lowQuotaDesc: "额度接近下限，建议优先排查或切换出口。",
+        lowQuotaDesc: "额度接近下限。",
         active: "活跃",
-        activeDesc: "当前健康且可路由的账号总数。",
+        activeDesc: "当前可路由账号。",
         protected: "保护中",
-        protectedDesc: "近额保护或冷却保护已启用。",
+        protectedDesc: "保护已启用。",
         totalSpend: "总消费",
-        spendDesc: "按官方模型价格估算，默认美元。",
+        spendDesc: "模型价格估算。",
         requestsOverTime: "请求趋势",
         requests: "请求",
         topUsers: "消费靠前用户",
         pricedRequests: "已计价请求",
         accounts: "账号",
-        accountsSub: "支持模型、额度与路由状态",
+        accountsSub: "支持模型、5H/7D 额度与路由状态",
         all: "全部",
+        filterAvailable: "可用",
+        filterInUse: "使用中",
+        filterDisabled: "不可用",
         searchDisabled: "搜索稍后接入",
         quota: "额度",
+        quota5h: "5H",
+        quota7d: "7D",
         route: "出口",
         modelCount: "模型数",
         refreshModels: "刷新模型",
         refreshing: "刷新中...",
         modelsReady: "模型目录已更新",
+        refreshQuota: "刷新额度",
+        quotaRefreshFailed: "刷新额度失败",
+        quotaRefreshed: (label: string) => `账号 ${label} 的额度已刷新`,
         addAccount: "添加账号",
+        cleanupBanned: "删除封禁",
+        cleaningBanned: "删除中...",
+        cleanupFailed: "删除封禁账号失败",
+        bannedDeleted: (count: number) => `已删除 ${count} 个封禁账号`,
+        noBannedAccounts: "没有可删除的封禁账号",
+        autoQuotaRefresh: "自动刷新额度",
+        autoQuotaRefreshHint: "受管账号额度每 60 秒后台刷新一次。",
+        accountMenu: "账号操作",
+        copyAccount: "复制账号信息",
+        deleteAccount: "删除账号",
+        deleteFailed: "删除账号失败",
+        deleting: "删除中...",
+        accountDeleted: (label: string) => `账号 ${label} 已删除`,
+        accountCopied: (label: string) => `已复制 ${label} 的账号信息`,
+        confirmDeleteAccount: (label: string) =>
+          `确认删除账号 ${label}？该操作会移除凭证、租约和受管状态。`,
+        confirmDeleteBanned: "确认一键删除所有封禁账号？该操作不可撤销。",
+        managedOnlyAccountAction: "仅受管 ChatGPT 账号支持刷新额度。",
+        statusLabel: "状态",
+        reasonLabel: "原因",
+        errorLabel: "错误",
+        statusActive: "正常",
+        statusUnavailable: "不可用",
+        statusBanned: "封禁",
         userManagement: "用户管理",
         usersSub: "网关用户、token 消耗与策略控制",
         admin: "管理员",
@@ -650,7 +987,7 @@ function translationFor(language: Language) {
         saved: "策略已保存",
         noUsers: "暂无网关用户",
         alerts: "告警",
-        alertsSub: "账号低额度与保护状态时间线",
+        alertsSub: "账号低额度、保护与不可用信号",
         noAlerts: "暂无告警",
         lowQuotaDetected: (id: string) => `账号 ${id} 检测到低额度`,
         alertDescription: (label: string, severity: string, level: number) =>
@@ -700,62 +1037,105 @@ function translationFor(language: Language) {
         refreshPaused: "后台暂停",
         refreshOffline: "离线暂停",
         lastRefreshed: "最后刷新",
+        settingsPanel: "设置",
         quotaSource: "额度来源：受管账号快照",
         usageSource: "缓存/用量来源：网关请求观测",
         plan: "套餐",
         workspace: "工作区角色",
-        refreshedAt: "刷新于"
+        refreshedAt: "刷新于",
+        cooldownUntil: "冷却至",
+        resetsAt: "重置于"
       }
     : {
-        brandTitle: "AI Pool",
-        brandSubtitle: "Pool Control",
+        brandTitle: "Origin管理端",
+        brandSubtitle: "",
         navOverview: "Overview",
         navAccounts: "Accounts",
         navUsers: "Users",
         navAlerts: "Alerts",
         navLogs: "Logs",
         navConfig: "Config",
-        headerKicker: "AI Account Pool",
-        headerTitle: "Dark Pool Console",
-        headerDescription:
-          "Run intake, user policy, spend tracking, and gateway connection from a single control surface.",
-        summaryCache: "Cache",
+        headerKicker: "",
+        headerTitle: "Origin管理端",
+        headerDescription: "",
+        summaryCache: "Token Hit",
         summaryUsers: "Users",
         summarySpend: "Spend",
         summaryHealth: "Health",
         nominal: "Nominal",
         attention: "Attention",
         overview: "Overview",
-        overviewSub: "Cache, account state, and spend signals",
-        cacheHit: "Cache Hit Rate",
+        overviewSub: "Cache, quota, and account state",
+        cacheHit: "Cache Hit",
+        tokenHitRate: "Token-level Cache Hit Rate",
         prefixCache: "Cached Input Tokens",
-        cacheHitHint:
-          "Computed from the share of the last 512 logged requests that reported cached input tokens.",
+        totalInputTokens: "Total Input Tokens",
+        requestHitLabel: "Request-level",
+        tokenHitLabel: "Token-level",
+        cacheProfileTitle: "Cache Hit Fidelity",
+        cacheProfileDesc: "Prioritize token hit; keep request hit as reference.",
+        observedWindow: "Observed Window",
+        observedWindowValue: "Last 512 logged requests",
+        recoveredInput: "Recovered Input",
+        ringCenterLabel: "Token Hit",
+        cacheHitHint: "Token=cached/input · Request=hit-request share",
         hit: "hit",
-        tokens: "tokens",
+        tokens: "MToken",
         lowQuota: "Low Quota",
-        lowQuotaDesc: "Quota is approaching the lower bound. Review or reroute soon.",
+        lowQuotaDesc: "Quota is nearing the lower bound.",
         active: "Active",
-        activeDesc: "Healthy accounts currently available for routing.",
+        activeDesc: "Accounts currently routable.",
         protected: "Protected",
-        protectedDesc: "Quota guard or cooldown protection is enabled.",
+        protectedDesc: "Protection is enabled.",
         totalSpend: "Total Spend",
-        spendDesc: "Estimated from official model pricing, in USD.",
+        spendDesc: "Estimated from model pricing.",
         requestsOverTime: "Requests over time",
         requests: "Requests",
         topUsers: "Top spend users",
         pricedRequests: "Priced requests",
         accounts: "Accounts",
-        accountsSub: "Supported models, quota, and route state",
+        accountsSub: "Supported models, 5H/7D quota, and route state",
         all: "All",
+        filterAvailable: "Available",
+        filterInUse: "In use",
+        filterDisabled: "Disabled",
         searchDisabled: "Search coming next",
         quota: "Quota",
+        quota5h: "5H",
+        quota7d: "7D",
         route: "Route",
         modelCount: "Models",
         refreshModels: "Refresh Models",
         refreshing: "Refreshing...",
         modelsReady: "Model catalog updated",
+        refreshQuota: "Refresh Quota",
+        quotaRefreshFailed: "Failed to refresh quota",
+        quotaRefreshed: (label: string) => `Quota refreshed for ${label}`,
         addAccount: "Add Account",
+        cleanupBanned: "Delete Banned",
+        cleaningBanned: "Deleting...",
+        cleanupFailed: "Failed to delete banned accounts",
+        bannedDeleted: (count: number) => `Deleted ${count} banned accounts`,
+        noBannedAccounts: "No banned accounts to delete",
+        autoQuotaRefresh: "Quota auto refresh",
+        autoQuotaRefreshHint: "Managed account quota is refreshed in the background every 60 seconds.",
+        accountMenu: "Account actions",
+        copyAccount: "Copy account details",
+        deleteAccount: "Delete Account",
+        deleteFailed: "Failed to delete account",
+        deleting: "Deleting...",
+        accountDeleted: (label: string) => `Deleted account ${label}`,
+        accountCopied: (label: string) => `Copied ${label}`,
+        confirmDeleteAccount: (label: string) =>
+          `Delete account ${label}? This removes credentials, leases, and managed state.`,
+        confirmDeleteBanned: "Delete all banned accounts? This cannot be undone.",
+        managedOnlyAccountAction: "Only managed ChatGPT accounts can refresh quota.",
+        statusLabel: "Status",
+        reasonLabel: "Reason",
+        errorLabel: "Error",
+        statusActive: "Active",
+        statusUnavailable: "Unavailable",
+        statusBanned: "Banned",
         userManagement: "User Management",
         usersSub: "Gateway identities, token usage, and policy control",
         admin: "Admin",
@@ -820,7 +1200,7 @@ function translationFor(language: Language) {
         saved: "Policy saved",
         noUsers: "No gateway users",
         alerts: "Alerts",
-        alertsSub: "Low quota and protected account timeline",
+        alertsSub: "Low quota, protection, and availability signals",
         noAlerts: "No alerts",
         lowQuotaDetected: (id: string) => `Low quota detected for account ${id}`,
         alertDescription: (label: string, severity: string, level: number) =>
@@ -872,11 +1252,14 @@ function translationFor(language: Language) {
         refreshPaused: "Paused in background",
         refreshOffline: "Paused offline",
         lastRefreshed: "Last refresh",
+        settingsPanel: "Settings",
         quotaSource: "Quota source: managed account snapshot",
         usageSource: "Cache/usage source: gateway telemetry",
         plan: "Plan",
         workspace: "Workspace role",
-        refreshedAt: "Refreshed"
+        refreshedAt: "Refreshed",
+        cooldownUntil: "Cooldown until",
+        resetsAt: "Resets"
       };
 }
 
@@ -1054,7 +1437,7 @@ function UserPolicyCard({
           {
             icon: Sparkles,
             label: t.tokens,
-            value: formatNumber(tokenUsage, language)
+            value: formatMToken(tokenUsage, language)
           },
           {
             icon: Activity,
@@ -1590,7 +1973,7 @@ function UserPolicyCard({
                       },
                       {
                         label: t.tokens,
-                        value: formatNumber(instance.totalTokens, language)
+                        value: formatMToken(instance.totalTokens, language)
                       },
                       {
                         label: t.model,
@@ -1685,7 +2068,7 @@ export function DashboardApp({
   gatewayBaseUrl
 }: DashboardAppProps) {
   const [language, setLanguage] = useState<Language>(initialLanguage);
-  const [theme, setTheme] = useState<ThemeMode>("dark");
+  const [theme, setTheme] = useState<ThemeMode>("light");
   const [runtimeSnapshot, setRuntimeSnapshot] = useState(snapshot);
   const [sidebarExpanded, setSidebarExpanded] = useState(false);
   const [sidebarHovered, setSidebarHovered] = useState(false);
@@ -1698,6 +2081,11 @@ export function DashboardApp({
   const [protectionMode, setProtectionMode] = useState(true);
   const [autoRefill, setAutoRefill] = useState(false);
   const [refreshingModels, setRefreshingModels] = useState(false);
+  const [refreshingQuotaAccountId, setRefreshingQuotaAccountId] = useState<string | null>(null);
+  const [deletingAccountId, setDeletingAccountId] = useState<string | null>(null);
+  const [cleaningBannedAccounts, setCleaningBannedAccounts] = useState(false);
+  const [openAccountMenuId, setOpenAccountMenuId] = useState<string | null>(null);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [savingUserId, setSavingUserId] = useState<string | null>(null);
   const [banner, setBanner] = useState<BannerState>(null);
   const [latestCreatedUser, setLatestCreatedUser] =
@@ -1838,6 +2226,7 @@ export function DashboardApp({
           cacheMetrics: livePayload.cacheMetrics,
           accounts: livePayload.accounts,
           leases: livePayload.leases,
+          accountAlerts: livePayload.accountAlerts,
           requestLogs: livePayload.requestLogs,
           billing: livePayload.billing,
           modelCatalog: Array.from(
@@ -1899,22 +2288,100 @@ export function DashboardApp({
     }
   }, [activeView, selectedUserId]);
 
+  useEffect(() => {
+    if (!openAccountMenuId) {
+      return undefined;
+    }
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (
+        event.target instanceof Element &&
+        event.target.closest("[data-account-menu-root='true']")
+      ) {
+        return;
+      }
+      setOpenAccountMenuId(null);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setOpenAccountMenuId(null);
+      }
+    };
+
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [openAccountMenuId]);
+
+  useEffect(() => {
+    if (!isSettingsOpen) {
+      return undefined;
+    }
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (
+        event.target instanceof Element &&
+        event.target.closest("[data-settings-panel-root='true']")
+      ) {
+        return;
+      }
+      setIsSettingsOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setIsSettingsOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isSettingsOpen]);
+
+  useEffect(() => {
+    if (
+      openAccountMenuId &&
+      !runtimeSnapshot.accounts.some((account) => account.id === openAccountMenuId)
+    ) {
+      setOpenAccountMenuId(null);
+    }
+  }, [openAccountMenuId, runtimeSnapshot.accounts]);
+
   const lowQuotaAccounts = useMemo(
     () =>
-      runtimeSnapshot.accounts.filter((account) => accountKind(account) === "low"),
+      runtimeSnapshot.accounts.filter(
+        (account) => account.status === "active" && accountKind(account) === "low"
+      ),
     [runtimeSnapshot.accounts]
   );
   const activeAccounts = useMemo(
     () =>
-      runtimeSnapshot.accounts.filter((account) => accountKind(account) === "active"),
+      runtimeSnapshot.accounts.filter(
+        (account) => account.status === "active" && accountKind(account) === "active"
+      ),
     [runtimeSnapshot.accounts]
   );
   const protectedAccounts = useMemo(
     () =>
       runtimeSnapshot.accounts.filter(
-        (account) => accountKind(account) === "protected"
+        (account) => account.status === "active" && accountKind(account) === "protected"
       ),
     [runtimeSnapshot.accounts]
+  );
+  const bannedAccounts = useMemo(
+    () =>
+      runtimeSnapshot.accounts.filter((account) => account.status === "banned"),
+    [runtimeSnapshot.accounts]
+  );
+  const leasedAccountIds = useMemo(
+    () => new Set(runtimeSnapshot.leases.map((lease) => lease.accountId)),
+    [runtimeSnapshot.leases]
   );
 
   const filteredAccounts = useMemo(() => {
@@ -1923,16 +2390,16 @@ export function DashboardApp({
     }
 
     return runtimeSnapshot.accounts.filter((account) => {
-      const kind = accountKind(account);
-      if (accountFilter === "active") {
-        return kind === "active";
+      const state = accountOperationalState(account, leasedAccountIds);
+      if (accountFilter === "available") {
+        return state === "available";
       }
-      if (accountFilter === "low") {
-        return kind === "low";
+      if (accountFilter === "inUse") {
+        return state === "inUse";
       }
-      return kind === "protected";
+      return state === "disabled";
     });
-  }, [accountFilter, runtimeSnapshot.accounts]);
+  }, [accountFilter, leasedAccountIds, runtimeSnapshot.accounts]);
 
   const requestSeries = useMemo(
     () =>
@@ -2106,6 +2573,47 @@ export function DashboardApp({
     () => [...protectedAccounts, ...lowQuotaAccounts].slice(0, 6),
     [lowQuotaAccounts, protectedAccounts]
   );
+  const requestCacheHit = requestHitRatio(runtimeSnapshot.cacheMetrics);
+  const tokenCacheHit = tokenHitRatio(runtimeSnapshot.cacheMetrics);
+
+  function accountStatusLabel(status: AccountRecord["status"]) {
+    if (status === "banned") {
+      return t.statusBanned;
+    }
+    if (status === "unavailable") {
+      return t.statusUnavailable;
+    }
+    return t.statusActive;
+  }
+
+  function accountAlertLabel(alert: AccountAlertRecord) {
+    if (alert.kind === "disabled") {
+      return t.statusBanned;
+    }
+    if (alert.kind === "unavailable") {
+      return t.statusUnavailable;
+    }
+    if (alert.kind === "protected") {
+      return t.protected;
+    }
+    return t.lowQuota;
+  }
+
+  function accountAlertReason(alert: AccountAlertRecord) {
+    if (alert.kind === "low_quota") {
+      return `${t.quota} ${alert.quotaHeadroom !== null ? `${percent(alert.quotaHeadroom)}%` : "--"}`;
+    }
+    if (alert.kind === "protected") {
+      return alert.cooldownLevel > 0 ? `${t.protected} · L${alert.cooldownLevel}` : t.protected;
+    }
+    if (alert.kind === "disabled") {
+      return t.statusBanned;
+    }
+    if (alert.kind === "unavailable") {
+      return t.statusUnavailable;
+    }
+    return alert.reason ?? "--";
+  }
 
   const navItems = [
     { id: "overview" as const, label: t.navOverview, icon: LayoutDashboard },
@@ -2128,23 +2636,10 @@ export function DashboardApp({
         | null;
 
       if (!response.ok || !Array.isArray(payload)) {
-        const message =
-          payload &&
-          typeof payload === "object" &&
-          !Array.isArray(payload) &&
-          "error" in payload
-            ? payload.error?.message
-            : undefined;
-        throw new Error(message || t.refreshFailed);
+        throw new Error(readApiErrorMessage(payload, t.refreshFailed));
       }
 
-      setRuntimeSnapshot((current) => ({
-        ...current,
-        accounts: payload,
-        modelCatalog: Array.from(
-          new Set(payload.flatMap((account) => account.models))
-        ).sort()
-      }));
+      setRuntimeSnapshot((current) => nextSnapshotWithAccounts(current, payload));
       setBanner({
         tone: "ok",
         message: t.modelsReady
@@ -2156,6 +2651,175 @@ export function DashboardApp({
       });
     } finally {
       setRefreshingModels(false);
+    }
+  }
+
+  function replaceAccount(updatedAccount: AccountRecord) {
+    setRuntimeSnapshot((current) =>
+      nextSnapshotWithAccounts(
+        current,
+        current.accounts.map((account) =>
+          account.id === updatedAccount.id ? updatedAccount : account
+        )
+      )
+    );
+  }
+
+  function removeAccounts(accountIds: string[]) {
+    const removed = new Set(accountIds);
+    setRuntimeSnapshot((current) =>
+      nextSnapshotWithAccounts(
+        current,
+        current.accounts.filter((account) => !removed.has(account.id))
+      )
+    );
+  }
+
+  async function handleRefreshAccountQuota(account: AccountRecord) {
+    setOpenAccountMenuId(null);
+    if (account.authMode !== "chatgpt") {
+      setBanner({
+        tone: "error",
+        message: t.managedOnlyAccountAction
+      });
+      return;
+    }
+
+    try {
+      setRefreshingQuotaAccountId(account.id);
+      const response = await fetch(
+        `/api/dashboard/accounts/${account.id}/quota/refresh`,
+        {
+          method: "POST"
+        }
+      );
+      const payload = (await response.json().catch(() => null)) as
+        | AccountRecord
+        | { error?: { message?: string } }
+        | null;
+
+      if (!response.ok || !isAccountRecordPayload(payload)) {
+        throw new Error(readApiErrorMessage(payload, t.quotaRefreshFailed));
+      }
+
+      replaceAccount(payload);
+      setBanner({
+        tone: "ok",
+        message: t.quotaRefreshed(account.label || shortId(account.id))
+      });
+    } catch (error) {
+      setBanner({
+        tone: "error",
+        message: error instanceof Error ? error.message : t.quotaRefreshFailed
+      });
+    } finally {
+      setRefreshingQuotaAccountId(null);
+    }
+  }
+
+  async function handleCopyAccountDetails(account: AccountRecord) {
+    setOpenAccountMenuId(null);
+    const payload = [
+      accountPrimaryIdentifier(account),
+      accountSecondaryIdentifier(account),
+      shortId(account.id),
+      account.chatgptEmail ?? "",
+      account.baseUrl ?? "",
+      account.models.join(", ")
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    try {
+      await copyText(payload);
+      setBanner({
+        tone: "ok",
+        message: t.accountCopied(account.label || shortId(account.id))
+      });
+    } catch (error) {
+      setBanner({
+        tone: "error",
+        message: error instanceof Error ? error.message : t.copy
+      });
+    }
+  }
+
+  async function handleDeleteAccount(account: AccountRecord) {
+    const displayLabel = account.label || shortId(account.id);
+    setOpenAccountMenuId(null);
+    if (!window.confirm(t.confirmDeleteAccount(displayLabel))) {
+      return;
+    }
+
+    try {
+      setDeletingAccountId(account.id);
+      const response = await fetch(`/api/dashboard/accounts/${account.id}`, {
+        method: "DELETE"
+      });
+      const payload = (await response.json().catch(() => null)) as
+        | { error?: { message?: string } }
+        | null;
+
+      if (!response.ok) {
+        throw new Error(readApiErrorMessage(payload, t.deleteFailed));
+      }
+
+      removeAccounts([account.id]);
+      setBanner({
+        tone: "ok",
+        message: t.accountDeleted(displayLabel)
+      });
+    } catch (error) {
+      setBanner({
+        tone: "error",
+        message: error instanceof Error ? error.message : t.deleteFailed
+      });
+    } finally {
+      setDeletingAccountId(null);
+    }
+  }
+
+  async function handleCleanupBannedAccounts() {
+    if (bannedAccounts.length === 0) {
+      setBanner({
+        tone: "neutral",
+        message: t.noBannedAccounts
+      });
+      return;
+    }
+    if (!window.confirm(t.confirmDeleteBanned)) {
+      return;
+    }
+
+    try {
+      setCleaningBannedAccounts(true);
+      const response = await fetch("/api/dashboard/accounts/cleanup/banned", {
+        method: "POST"
+      });
+      const payload = (await response.json().catch(() => null)) as
+        | AccountCleanupResult
+        | { error?: { message?: string } }
+        | null;
+
+      if (!response.ok || !isAccountCleanupResultPayload(payload)) {
+        throw new Error(readApiErrorMessage(payload, t.cleanupFailed));
+      }
+
+      removeAccounts(payload.deletedAccountIds);
+      setBanner({
+        tone: "ok",
+        message:
+          payload.deleted > 0
+            ? t.bannedDeleted(payload.deleted)
+            : t.noBannedAccounts
+      });
+    } catch (error) {
+      setBanner({
+        tone: "error",
+        message: error instanceof Error ? error.message : t.cleanupFailed
+      });
+    } finally {
+      setCleaningBannedAccounts(false);
     }
   }
 
@@ -2233,18 +2897,18 @@ export function DashboardApp({
   }
 
   const renderOverview = () => (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <SectionCard
         actions={
           <button
             className={cx(
-              "flex h-11 w-11 items-center justify-center rounded-2xl text-white shadow-soft transition-all duration-200 hover:opacity-90",
+              "flex h-10 w-10 items-center justify-center rounded-[18px] text-white shadow-soft transition-all duration-200 hover:opacity-90",
               isDark ? "bg-sky-500" : "bg-zinc-900"
             )}
             onClick={() => setIsDrawerOpen(true)}
             type="button"
           >
-            <Plus size={18} strokeWidth={iconStroke} />
+            <Plus size={16} strokeWidth={iconStroke} />
           </button>
         }
         icon={LayoutDashboard}
@@ -2252,75 +2916,214 @@ export function DashboardApp({
         theme={theme}
         title={t.overview}
       >
-        <div className="grid gap-4 xl:grid-cols-5">
-          <div
-            className={cx(
-              "rounded-[28px] p-5",
-              isDark ? "bg-[#0c0f15]" : "bg-zinc-50"
-            )}
-          >
-            <div className="mb-4 flex items-center justify-between">
-              <div
-                className={cx(
-                  "flex h-9 w-9 items-center justify-center rounded-2xl shadow-soft",
-                  isDark ? "bg-white/[0.05] text-sky-200" : "bg-white text-sky-600"
-                )}
-              >
-                <Database size={18} strokeWidth={iconStroke} />
-              </div>
-              <span className={cx("text-xs font-medium", isDark ? "text-zinc-500" : "text-zinc-400")}>
-                {t.cacheHit}
-              </span>
-            </div>
-            <div className="flex items-center gap-4">
-              <div className="relative h-24 w-24">
-                <svg className="h-24 w-24 -rotate-90" viewBox="0 0 96 96">
-                  <circle
-                    className={isDark ? "stroke-white/10" : "stroke-zinc-200"}
-                    cx="48"
-                    cy="48"
-                    fill="none"
-                    r="38"
-                    strokeWidth="10"
-                  />
-                  <circle
-                    className="stroke-sky-500 transition-all duration-500"
-                    cx="48"
-                    cy="48"
-                    fill="none"
-                    r="38"
-                    strokeLinecap="round"
-                    strokeWidth="10"
-                    style={donutStyle(runtimeSnapshot.cacheMetrics.prefixHitRatio)}
-                  />
-                </svg>
-                <div className="absolute inset-0 flex items-center justify-center text-center">
-                  <div>
-                    <p className={cx("text-xl font-semibold", isDark ? "text-zinc-50" : "text-zinc-900")}>
-                      {percent(runtimeSnapshot.cacheMetrics.prefixHitRatio)}%
-                    </p>
-                    <p className={cx("text-[11px]", isDark ? "text-zinc-500" : "text-zinc-400")}>
-                      {t.hit}
-                    </p>
+        <div className="grid gap-3.5 2xl:grid-cols-[minmax(0,1.56fr)_minmax(300px,0.9fr)]">
+          <div className="apple-panel rounded-[30px] p-4 shadow-panel md:p-5">
+            <div className="grid gap-5 xl:grid-cols-[minmax(0,1.18fr)_minmax(264px,0.88fr)] xl:items-center">
+              <div className="min-w-0 space-y-4">
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <div
+                    className={cx(
+                      "flex h-10 w-10 items-center justify-center rounded-[16px] shadow-soft",
+                      isDark ? "bg-white/[0.06] text-sky-200" : "bg-white text-sky-600"
+                    )}
+                  >
+                    <Database size={16} strokeWidth={iconStroke} />
+                  </div>
+                  <div className="min-w-0">
+                    <h3
+                      className={cx(
+                        "max-w-[16ch] break-keep font-semibold tracking-[-0.05em]",
+                        isDark ? "text-zinc-50" : "text-zinc-950"
+                      )}
+                      style={{ fontSize: "clamp(1.35rem, 2.1vw, 2.35rem)" }}
+                    >
+                      {t.cacheHit}
+                    </h3>
                   </div>
                 </div>
+
+                <p
+                  className={cx(
+                    "max-w-xl text-[13px] leading-6 md:text-sm",
+                    isDark ? "text-zinc-400" : "text-zinc-600"
+                  )}
+                >
+                  {t.cacheProfileDesc}
+                </p>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  {[
+                    {
+                      label: t.recoveredInput,
+                      value: formatMToken(runtimeSnapshot.cacheMetrics.cachedTokens, language),
+                      accent: "text-sky-500"
+                    },
+                    {
+                      label: t.totalInputTokens,
+                      value: formatMToken(runtimeSnapshot.cacheMetrics.replayTokens, language),
+                      accent: isDark ? "text-zinc-100" : "text-zinc-900"
+                    }
+                  ].map((item) => (
+                    <div
+                      className="apple-subtle-panel min-w-0 rounded-[20px] px-4 py-3.5"
+                      key={item.label}
+                    >
+                      <p
+                        className={cx(
+                          "text-[10px] uppercase tracking-[0.14em]",
+                          isDark ? "text-zinc-500" : "text-zinc-400"
+                        )}
+                      >
+                        {item.label}
+                      </p>
+                      <p
+                        className={cx(
+                          "mt-1.5 truncate text-[15px] font-medium tracking-[-0.02em]",
+                          item.accent
+                        )}
+                      >
+                        {item.value}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+
+                <div
+                  className={cx(
+                    "flex flex-wrap items-center gap-x-3 gap-y-1.5 text-[10px] leading-4",
+                    isDark ? "text-zinc-500" : "text-zinc-500"
+                  )}
+                >
+                  {[t.observedWindowValue, t.quotaSource, t.usageSource, t.cacheHitHint].map(
+                    (item) => (
+                      <span className="inline-flex items-center gap-1.5" key={item}>
+                        <span
+                          className={cx(
+                            "h-1 w-1 rounded-full",
+                            isDark ? "bg-white/20" : "bg-zinc-300"
+                          )}
+                        />
+                        <span>{item}</span>
+                      </span>
+                    )
+                  )}
+                </div>
               </div>
-              <div className="space-y-1">
-                <p className={cx("text-sm font-medium", isDark ? "text-zinc-100" : "text-zinc-900")}>
-                  {t.prefixCache}
-                </p>
-                <p className={cx("text-xs", isDark ? "text-zinc-500" : "text-zinc-500")}>
-                  {formatNumber(runtimeSnapshot.cacheMetrics.cachedTokens, language)}{" "}
-                  {t.tokens}
-                </p>
-                <p className={cx("text-[11px] leading-5", isDark ? "text-zinc-500" : "text-zinc-500")}>
-                  {t.cacheHitHint}
-                </p>
+
+              <div className="apple-subtle-panel rounded-[28px] p-4">
+                <div className="relative mx-auto h-52 w-52 sm:h-56 sm:w-56">
+                  <div
+                    className={cx(
+                      "absolute inset-8 rounded-full blur-3xl",
+                      isDark ? "bg-sky-500/10" : "bg-sky-500/8"
+                    )}
+                  />
+                  <svg className="relative h-full w-full -rotate-90" viewBox="0 0 160 160">
+                    <circle
+                      className={isDark ? "stroke-[#182133]" : "stroke-[#d5dbe6]"}
+                      cx="80"
+                      cy="80"
+                      fill="none"
+                      r="54"
+                      strokeWidth="14"
+                    />
+                    <circle
+                      className="stroke-[#0a84ff] transition-all duration-500"
+                      cx="80"
+                      cy="80"
+                      fill="none"
+                      r="54"
+                      strokeLinecap="round"
+                      strokeWidth="14"
+                      style={ringSegmentStyle(tokenCacheHit, 54, 0, 1)}
+                    />
+                    <circle
+                      className="stroke-[#30d158] transition-all duration-500"
+                      cx="80"
+                      cy="80"
+                      fill="none"
+                      r="54"
+                      strokeLinecap="round"
+                      strokeWidth="6"
+                      style={ringSegmentStyle(requestCacheHit, 54, 0, 1)}
+                    />
+                  </svg>
+                  <div className="absolute inset-0 flex items-center justify-center text-center">
+                    <div className="space-y-1.5">
+                      <p
+                        className={cx(
+                          "font-semibold tracking-[-0.05em]",
+                          isDark ? "text-zinc-50" : "text-zinc-950"
+                        )}
+                        style={{ fontSize: "clamp(1.8rem, 3.3vw, 2.6rem)" }}
+                      >
+                        {percent(tokenCacheHit)}%
+                      </p>
+                      <p
+                        className={cx(
+                          "text-[10px] uppercase tracking-[0.16em]",
+                          isDark ? "text-zinc-400" : "text-zinc-500"
+                        )}
+                      >
+                        {t.ringCenterLabel}
+                      </p>
+                      <span
+                        className={cx(
+                          "inline-flex rounded-full px-2.5 py-1 text-[10px]",
+                          isDark ? "bg-white/[0.06] text-zinc-300" : "bg-white/85 text-zinc-600"
+                        )}
+                      >
+                        {t.requestHitLabel} {percent(requestCacheHit)}%
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-4 space-y-2.5">
+                  {[                    
+                    {
+                      label: t.tokenHitLabel,
+                      value: `${percent(tokenCacheHit)}%`,
+                      accent: "bg-[#0a84ff]"
+                    },
+                    {
+                      label: t.requestHitLabel,
+                      value: `${percent(requestCacheHit)}%`,
+                      accent: "bg-[#30d158]"
+                    }
+                  ].map((item) => (
+                    <div
+                      className="flex items-center justify-between gap-3 rounded-[18px] px-1"
+                      key={item.label}
+                    >
+                      <div className="flex min-w-0 items-center gap-3">
+                        <span className={cx("h-2.5 w-2.5 rounded-full", item.accent)} />
+                        <p
+                          className={cx(
+                            "truncate text-[13px]",
+                            isDark ? "text-zinc-200" : "text-zinc-800"
+                          )}
+                        >
+                          {item.label}
+                        </p>
+                      </div>
+                      <span
+                        className={cx(
+                          "text-[13px] font-medium tracking-[-0.02em]",
+                          isDark ? "text-zinc-50" : "text-zinc-900"
+                        )}
+                      >
+                        {item.value}
+                      </span>
+                    </div>
+                  ))}
+                </div>
               </div>
             </div>
           </div>
 
-          {[
+          <div className="grid gap-3 sm:grid-cols-2 2xl:grid-cols-2">
+            {[
             {
               icon: TriangleAlert,
               iconClass: isDark
@@ -2361,47 +3164,32 @@ export function DashboardApp({
             const Icon = item.icon;
             return (
               <div
-                className={cx(
-                  "rounded-[28px] p-5",
-                  isDark ? "bg-[#0c0f15]" : "bg-zinc-50"
-                )}
+                className="apple-subtle-panel min-w-0 rounded-[22px] p-3.5 shadow-soft"
                 key={item.label}
               >
-                <div className="mb-4 flex items-center justify-between">
+                <div className="mb-3 flex items-center justify-between">
                   <div
                     className={cx(
-                      "flex h-9 w-9 items-center justify-center rounded-2xl shadow-soft",
+                      "flex h-8 w-8 items-center justify-center rounded-[14px] shadow-soft",
                       item.iconClass
                     )}
                   >
-                    <Icon size={18} strokeWidth={iconStroke} />
+                    <Icon size={15} strokeWidth={iconStroke} />
                   </div>
-                  <span className={cx("text-xs font-medium", isDark ? "text-zinc-500" : "text-zinc-400")}>
+                  <span className={cx("text-[10px] font-medium uppercase tracking-[0.12em]", isDark ? "text-zinc-500" : "text-zinc-400")}>
                     {item.label}
                   </span>
                 </div>
-                <p className={cx("text-[30px] font-semibold tracking-tight", isDark ? "text-zinc-50" : "text-zinc-900")}>
+                <p className={cx("text-[24px] font-medium tracking-[-0.04em]", isDark ? "text-zinc-50" : "text-zinc-900")}>
                   {item.value}
                 </p>
-                <p className={cx("mt-2 text-xs leading-5", isDark ? "text-zinc-500" : "text-zinc-500")}>
+                <p className={cx("mt-1 max-w-[18ch] text-[10px] leading-4", isDark ? "text-zinc-500" : "text-zinc-500")}>
                   {item.desc}
                 </p>
               </div>
             );
           })}
-        </div>
-        <div className="mt-4 flex flex-wrap gap-2">
-          {[t.quotaSource, t.usageSource].map((item) => (
-            <span
-              className={cx(
-                "rounded-full px-3 py-1.5 text-[11px]",
-                isDark ? "bg-white/[0.05] text-zinc-400" : "bg-zinc-100 text-zinc-600"
-              )}
-              key={item}
-            >
-              {item}
-            </span>
-          ))}
+          </div>
         </div>
       </SectionCard>
 
@@ -2414,7 +3202,7 @@ export function DashboardApp({
         >
           <div
             className={cx(
-              "h-[300px] rounded-[28px] p-3",
+              "h-[264px] rounded-[24px] p-2.5",
               isDark ? "bg-[#0c0f15]" : "bg-zinc-50"
             )}
           >
@@ -2526,8 +3314,8 @@ export function DashboardApp({
                 </p>
               </div>
               <p className={cx("mt-3 text-xs leading-5", isDark ? "text-zinc-500" : "text-zinc-500")}>
-                {formatNumber(runtimeSnapshot.billing.totalTokens, language)} tokens ·{" "}
-                {formatNumber(runtimeSnapshot.billing.totalOutputTokens, language)} output
+                {formatMToken(runtimeSnapshot.billing.totalTokens, language)} ·{" "}
+                {formatMToken(runtimeSnapshot.billing.totalOutputTokens, language)} output
               </p>
             </div>
           </div>
@@ -2539,10 +3327,26 @@ export function DashboardApp({
   const renderAccounts = () => (
     <SectionCard
       actions={
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2">
           <button
             className={cx(
-              "inline-flex items-center gap-2 rounded-2xl px-4 py-2.5 text-sm font-medium transition-all duration-200",
+              "inline-flex h-11 w-11 items-center justify-center rounded-2xl transition-all duration-200 ease-[cubic-bezier(0.25,0.1,0.25,1)] active:scale-[0.98]",
+              isDark
+                ? "bg-rose-500/12 text-rose-200 hover:bg-rose-500/18"
+                : "bg-rose-50 text-rose-600 hover:bg-rose-100",
+              (cleaningBannedAccounts || bannedAccounts.length === 0) &&
+                "cursor-not-allowed opacity-60"
+            )}
+            disabled={cleaningBannedAccounts || bannedAccounts.length === 0}
+            onClick={handleCleanupBannedAccounts}
+            title={t.cleanupBanned}
+            type="button"
+          >
+            <ShieldAlert size={16} strokeWidth={iconStroke} />
+          </button>
+          <button
+            className={cx(
+              "inline-flex h-11 w-11 items-center justify-center rounded-2xl transition-all duration-200 ease-[cubic-bezier(0.25,0.1,0.25,1)] active:scale-[0.98]",
               isDark
                 ? "bg-white/[0.06] text-zinc-200 hover:bg-white/[0.1]"
                 : "bg-zinc-100 text-zinc-600 hover:bg-zinc-200",
@@ -2550,6 +3354,7 @@ export function DashboardApp({
             )}
             disabled={refreshingModels}
             onClick={handleRefreshModels}
+            title={refreshingModels ? t.refreshing : t.refreshModels}
             type="button"
           >
             <RefreshCw
@@ -2557,20 +3362,27 @@ export function DashboardApp({
               size={16}
               strokeWidth={iconStroke}
             />
-            <span className="hidden sm:inline">
-              {refreshingModels ? t.refreshing : t.refreshModels}
-            </span>
           </button>
+          <div
+            className={cx(
+              "apple-segmented inline-flex h-11 items-center gap-2 rounded-2xl px-3 text-xs",
+              isDark ? "text-zinc-400" : "text-zinc-500"
+            )}
+            title={t.autoQuotaRefreshHint}
+          >
+            <Clock3 size={14} strokeWidth={iconStroke} />
+            <span>60s</span>
+          </div>
           <button
             className={cx(
-              "inline-flex items-center gap-2 rounded-2xl px-4 py-2.5 text-sm font-medium transition-all duration-200 hover:opacity-90",
+              "inline-flex h-11 w-11 items-center justify-center rounded-2xl transition-all duration-200 ease-[cubic-bezier(0.25,0.1,0.25,1)] hover:opacity-90 active:scale-[0.98]",
               isDark ? "bg-zinc-100 text-zinc-950" : "bg-zinc-900 text-white"
             )}
             onClick={() => setIsAccountDrawerOpen(true)}
+            title={t.addAccount}
             type="button"
           >
             <Plus size={16} strokeWidth={iconStroke} />
-            <span className="hidden sm:inline">{t.addAccount}</span>
           </button>
         </div>
       }
@@ -2580,184 +3392,381 @@ export function DashboardApp({
       title={t.accounts}
     >
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap gap-2">
+        <div className={cx("apple-segmented inline-flex items-center gap-1 rounded-[22px] p-1.5")}>
           {[
-            { id: "all" as const, label: t.all },
-            { id: "active" as const, label: t.active },
-            { id: "low" as const, label: t.lowQuota },
-            { id: "protected" as const, label: t.protected }
-          ].map((filter) => (
-            <button
-              className={cx(
-                "rounded-full px-4 py-2 text-xs font-medium transition-all duration-200",
-                accountFilter === filter.id
-                  ? isDark
-                    ? "bg-zinc-100 text-zinc-950"
-                    : "bg-zinc-900 text-white"
-                  : isDark
-                    ? "bg-white/[0.05] text-zinc-400 hover:bg-white/[0.08]"
-                    : "bg-zinc-100 text-zinc-500 hover:bg-zinc-200"
-              )}
-              key={filter.id}
-              onClick={() => setAccountFilter(filter.id)}
-              type="button"
-            >
-              {filter.label}
-            </button>
-          ))}
+            { id: "all" as const, icon: LayoutDashboard, title: t.all },
+            { id: "available" as const, icon: CheckCircle2, title: t.filterAvailable },
+            { id: "inUse" as const, icon: User, title: t.filterInUse },
+            { id: "disabled" as const, icon: CircleX, title: t.filterDisabled }
+          ].map((filter) => {
+            const Icon = filter.icon;
+            return (
+              <button
+                className={cx(
+                  "flex h-10 w-10 items-center justify-center rounded-[16px] transition-all duration-200 ease-[cubic-bezier(0.25,0.1,0.25,1)] active:scale-[0.98]",
+                  accountFilter === filter.id
+                    ? isDark
+                      ? "bg-zinc-100 text-zinc-950"
+                      : "bg-zinc-900 text-white"
+                    : isDark
+                      ? "text-zinc-400 hover:bg-white/[0.06]"
+                      : "text-zinc-500 hover:bg-zinc-100"
+                )}
+                key={filter.id}
+                onClick={() => setAccountFilter(filter.id)}
+                title={filter.title}
+                type="button"
+              >
+                <Icon size={16} strokeWidth={iconStroke} />
+              </button>
+            );
+          })}
         </div>
 
-        <div
+        <button
           className={cx(
-            "flex items-center gap-2 rounded-2xl px-3 py-2",
-            isDark ? "bg-white/[0.04] text-zinc-500" : "bg-zinc-100 text-zinc-500"
+            "apple-segmented inline-flex h-11 w-11 items-center justify-center rounded-2xl transition-all duration-200",
+            isDark ? "text-zinc-400 hover:bg-white/[0.05]" : "text-zinc-500 hover:bg-white"
           )}
+          disabled
+          title={t.searchDisabled}
+          type="button"
         >
           <Search size={16} strokeWidth={iconStroke} />
-          <span className="text-xs">{t.searchDisabled}</span>
-        </div>
+        </button>
       </div>
 
-      <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
         {filteredAccounts.map((account) => {
           const kind = accountKind(account);
-          const quota = Math.min(
-            account.quotaHeadroom,
-            account.quotaHeadroom5h,
-            account.quotaHeadroom7d
-          );
+          const quota5hWindow = accountRateLimitWindow(account, "5h");
+          const quota7dWindow = accountRateLimitWindow(account, "7d");
+          const primaryId = accountPrimaryIdentifier(account);
+          const secondaryId = accountSecondaryIdentifier(account);
+          const statusTone = accountStatusTone(account);
+          const menuBusy =
+            refreshingQuotaAccountId === account.id || deletingAccountId === account.id;
+          const operationalState = accountOperationalState(account, leasedAccountIds);
+          const isManaged = account.authMode === "chatgpt";
+          const availabilityTimestamp =
+            account.availabilityState === "quota_exhausted"
+              ? account.availabilityResetAt
+              : account.cooldownUntil;
+          const availabilityIcon =
+            account.availabilityState === "quota_exhausted" ? Clock3 : Shield;
+          const AvailabilityIcon = availabilityIcon;
 
           return (
             <article
               className={cx(
-                "rounded-[28px] border p-5 shadow-soft",
-                isDark
-                  ? "border-white/10 bg-white/[0.03]"
-                  : "border-zinc-200 bg-zinc-50"
+                "apple-panel group rounded-[28px] p-5 shadow-soft transition-all duration-200 ease-[cubic-bezier(0.25,0.1,0.25,1)] hover:-translate-y-0.5 hover:shadow-panel active:scale-[0.995]"
               )}
               key={account.id}
             >
               <div className="mb-4 flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-3">
-                    <span
-                      className={cx(
-                        "h-2.5 w-2.5 rounded-full",
-                        kind === "active"
-                          ? "bg-emerald-500"
-                          : kind === "protected"
-                            ? "bg-amber-500"
-                            : "bg-rose-500"
-                      )}
-                    />
-                    <p className={cx("truncate text-sm font-medium", isDark ? "text-zinc-50" : "text-zinc-900")}>
-                      {account.label || shortId(account.id)}
-                    </p>
-                  </div>
-                  <p className={cx("mt-2 text-xs", isDark ? "text-zinc-500" : "text-zinc-500")}>
-                    {shortId(account.id)}
-                  </p>
-                </div>
-                <button
-                  className={cx(
-                    "flex h-9 w-9 items-center justify-center rounded-2xl transition-all duration-200",
-                    isDark
-                      ? "bg-white/[0.05] text-zinc-400 hover:bg-white/[0.08]"
-                      : "bg-white text-zinc-500 hover:bg-zinc-100"
-                  )}
-                  type="button"
-                >
-                  <MoreHorizontal size={16} strokeWidth={iconStroke} />
-                </button>
-              </div>
-
-              <div className="space-y-2">
-                <div className={cx("flex items-center justify-between text-xs", isDark ? "text-zinc-500" : "text-zinc-500")}>
-                  <span>{t.quota}</span>
-                  <span>{percent(quota)}%</span>
-                </div>
-                <div className={cx("h-2 rounded-full", isDark ? "bg-white/10" : "bg-zinc-200")}>
-                  <div
-                    className={cx("h-2 rounded-full", quotaBarColor(quota))}
-                    style={{ width: `${percent(quota)}%` }}
-                  />
-                </div>
-              </div>
-
-              <div className="mt-4 grid grid-cols-3 gap-3">
-                {[
-                  {
-                    icon: ArrowUpRight,
-                    label: t.route,
-                    value: account.currentMode
-                  },
-                  {
-                    icon: Sparkles,
-                    label: t.modelCount,
-                    value: String(account.models.length)
-                  },
-                  {
-                    icon: Shield,
-                    label: t.protected,
-                    value: kind === "protected" ? "on" : "off"
-                  }
-                ].map((item) => {
-                  const Icon = item.icon;
-                  return (
-                    <div
-                      className={cx(
-                        "rounded-[20px] border px-3 py-3",
-                        isDark ? "border-white/10 bg-[#0c0f15]" : "border-zinc-200 bg-white"
-                      )}
-                      key={item.label}
-                    >
-                      <p className={cx("flex items-center gap-2 text-[11px]", isDark ? "text-zinc-500" : "text-zinc-500")}>
-                        <Icon size={13} strokeWidth={iconStroke} />
-                        {item.label}
-                      </p>
-                      <p className={cx("mt-2 text-sm font-medium uppercase", isDark ? "text-zinc-100" : "text-zinc-900")}>
-                        {item.value}
-                      </p>
-                    </div>
-                  );
-                })}
-              </div>
-
-              <div className="mt-4 flex flex-wrap gap-2">
-                {account.models.slice(0, 4).map((model) => (
+                <div className="min-w-0 flex flex-1 items-center gap-3">
                   <span
                     className={cx(
-                      "rounded-full px-3 py-1.5 text-[11px]",
-                      isDark
-                        ? "bg-white/[0.05] text-zinc-300"
-                        : "bg-white text-zinc-600"
+                      "flex h-11 w-11 shrink-0 items-center justify-center rounded-full shadow-soft",
+                      isDark ? "bg-white/[0.06]" : "bg-white"
                     )}
-                    key={model}
+                    title={isManaged ? "ChatGPT" : "API"}
                   >
-                    {model}
+                    {isManaged ? (
+                      <Bot size={18} strokeWidth={iconStroke} />
+                    ) : (
+                      <KeyRound size={18} strokeWidth={iconStroke} />
+                    )}
                   </span>
+                  <div className="min-w-0 flex-1">
+                    <span
+                      className={cx(
+                        "mb-2 inline-flex h-8 w-8 items-center justify-center rounded-full",
+                        operationalState === "available"
+                          ? isDark
+                            ? "bg-emerald-500/12 text-emerald-300"
+                            : "bg-emerald-50 text-emerald-600"
+                          : operationalState === "inUse"
+                            ? isDark
+                              ? "bg-amber-500/12 text-amber-300"
+                              : "bg-amber-50 text-amber-600"
+                            : isDark
+                              ? "bg-rose-500/12 text-rose-300"
+                              : "bg-rose-50 text-rose-600"
+                      )}
+                      title={
+                        operationalState === "available"
+                          ? t.filterAvailable
+                          : operationalState === "inUse"
+                            ? t.filterInUse
+                            : t.filterDisabled
+                      }
+                    >
+                      {operationalState === "available" ? (
+                        <CheckCircle2 size={14} strokeWidth={iconStroke} />
+                      ) : operationalState === "inUse" ? (
+                        <User size={14} strokeWidth={iconStroke} />
+                      ) : (
+                        <CircleX size={14} strokeWidth={iconStroke} />
+                      )}
+                    </span>
+                    <p
+                      className={cx(
+                        "truncate text-[15px] font-medium tracking-[-0.03em]",
+                        isDark ? "text-zinc-50" : "text-zinc-900"
+                      )}
+                    >
+                      {primaryId}
+                    </p>
+                    <p
+                      className={cx(
+                        "mt-1 truncate text-xs",
+                        isDark ? "text-zinc-500" : "text-zinc-500"
+                      )}
+                    >
+                      {secondaryId}
+                    </p>
+                  </div>
+                </div>
+                <div className="relative" data-account-menu-root="true">
+                  <button
+                    aria-expanded={openAccountMenuId === account.id}
+                    aria-haspopup="menu"
+                    className={cx(
+                      "flex h-9 w-9 items-center justify-center rounded-2xl transition-all duration-200",
+                      isDark
+                        ? "bg-white/[0.05] text-zinc-400 hover:bg-white/[0.08]"
+                        : "bg-white text-zinc-500 hover:bg-zinc-100"
+                    )}
+                    onClick={() =>
+                      setOpenAccountMenuId((current) =>
+                        current === account.id ? null : account.id
+                      )
+                    }
+                    title={t.accountMenu}
+                    type="button"
+                  >
+                    <MoreHorizontal size={16} strokeWidth={iconStroke} />
+                  </button>
+                  {openAccountMenuId === account.id ? (
+                    <div
+                      className={cx(
+                        "absolute right-0 top-11 z-20 rounded-[20px] border p-2 shadow-panel",
+                        isDark
+                          ? "border-white/10 bg-[#11141b]"
+                          : "border-zinc-200 bg-white"
+                      )}
+                      role="menu"
+                    >
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          className={cx(
+                            "flex h-10 w-10 items-center justify-center rounded-2xl transition-all duration-200",
+                            isDark
+                              ? "text-zinc-200 hover:bg-white/[0.06]"
+                              : "text-zinc-700 hover:bg-zinc-100"
+                          )}
+                          onClick={() => void handleCopyAccountDetails(account)}
+                          title={t.copyAccount}
+                          type="button"
+                        >
+                          <Copy size={14} strokeWidth={iconStroke} />
+                        </button>
+                        <button
+                          className={cx(
+                            "flex h-10 w-10 items-center justify-center rounded-2xl transition-all duration-200",
+                            isDark
+                              ? "text-zinc-200 hover:bg-white/[0.06]"
+                              : "text-zinc-700 hover:bg-zinc-100",
+                            (menuBusy || !isManaged) && "cursor-not-allowed opacity-45"
+                          )}
+                          disabled={menuBusy || !isManaged}
+                          onClick={() => void handleRefreshAccountQuota(account)}
+                          title={t.refreshQuota}
+                          type="button"
+                        >
+                          <RefreshCw
+                            className={
+                              refreshingQuotaAccountId === account.id
+                                ? "animate-spin"
+                                : undefined
+                            }
+                            size={14}
+                            strokeWidth={iconStroke}
+                          />
+                        </button>
+                        <button
+                          className={cx(
+                            "flex h-10 w-10 items-center justify-center rounded-2xl transition-all duration-200",
+                            isDark
+                              ? "text-rose-200 hover:bg-rose-500/10"
+                              : "text-rose-600 hover:bg-rose-50",
+                            menuBusy && "cursor-not-allowed opacity-45"
+                          )}
+                          disabled={menuBusy}
+                          onClick={() => void handleDeleteAccount(account)}
+                          title={t.deleteAccount}
+                          type="button"
+                        >
+                          <Trash2 size={14} strokeWidth={iconStroke} />
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                {[
+                  {
+                    label: t.quota5h,
+                    value: accountQuotaHeadroomLabel(account, "5h"),
+                    ratio: clamp01(account.quotaHeadroom5h),
+                    resetAt: quota5hWindow?.resetsAt ?? null
+                  },
+                  {
+                    label: t.quota7d,
+                    value: accountQuotaHeadroomLabel(account, "7d"),
+                    ratio: clamp01(account.quotaHeadroom7d),
+                    resetAt: quota7dWindow?.resetsAt ?? null
+                  }
+                ].map((windowQuota) => (
+                  <div
+                    className="space-y-1.5"
+                    key={windowQuota.label}
+                    title={
+                      windowQuota.resetAt
+                        ? `${t.resetsAt} ${formatDateTime(
+                            new Date(windowQuota.resetAt * 1000).toISOString(),
+                            language
+                          )}`
+                        : windowQuota.label
+                    }
+                  >
+                    <div className={cx("flex items-center justify-between text-xs", isDark ? "text-zinc-500" : "text-zinc-500")}>
+                      <span className="tracking-[0.16em]">{windowQuota.label}</span>
+                      <span className={cx("font-medium tracking-[-0.01em]", isDark ? "text-zinc-200" : "text-zinc-800")}>
+                        {windowQuota.value}%
+                      </span>
+                    </div>
+                    <div className={cx("h-2.5 overflow-hidden rounded-full", isDark ? "bg-white/10" : "bg-zinc-200")}>
+                      <div
+                        className={cx("h-full rounded-full", quotaBarColor(windowQuota.ratio))}
+                        style={{ width: `${windowQuota.value}%` }}
+                      />
+                    </div>
+                  </div>
                 ))}
               </div>
 
-              {account.authMode === "chatgpt" ? (
-                <div
+              <div className="mt-5 flex flex-wrap items-center gap-2">
+                <span
                   className={cx(
-                    "mt-4 rounded-[20px] border px-3 py-3 text-xs",
-                    isDark ? "border-white/10 bg-[#0c0f15]" : "border-zinc-200 bg-white"
+                    "apple-segmented inline-flex h-9 items-center gap-2 rounded-full px-3 text-xs",
+                    isDark ? "text-zinc-300" : "text-zinc-600"
                   )}
+                  title={t.route}
                 >
-                  <div className="flex flex-wrap items-center gap-3">
-                    <span className={cx(isDark ? "text-zinc-500" : "text-zinc-500")}>
-                      {t.plan}: {account.planType ?? "unknown"}
+                  <ArrowUpRight size={13} strokeWidth={iconStroke} />
+                  {account.currentMode}
+                </span>
+                <span
+                  className={cx(
+                    "apple-segmented inline-flex h-9 items-center gap-2 rounded-full px-3 text-xs",
+                    isDark ? "text-zinc-300" : "text-zinc-600"
+                  )}
+                  title={t.modelCount}
+                >
+                  <Sparkles size={13} strokeWidth={iconStroke} />
+                  {account.models.length}
+                </span>
+                {kind === "protected" ? (
+                  <span
+                    className={cx(
+                      "inline-flex h-9 items-center gap-2 rounded-full px-3 text-xs",
+                      isDark ? statusTone.chip : statusTone.chipLight
+                    )}
+                    title={
+                      account.availabilityState === "quota_exhausted"
+                        ? t.resetsAt
+                        : t.protected
+                    }
+                  >
+                    <AvailabilityIcon size={13} strokeWidth={iconStroke} />
+                    {account.availabilityState === "quota_exhausted"
+                      ? account.availabilityResetAt
+                        ? formatDateTime(account.availabilityResetAt, language)
+                        : t.lowQuota
+                      : account.cooldownLevel > 0
+                        ? `L${account.cooldownLevel}`
+                        : t.protected}
+                  </span>
+                ) : null}
+              </div>
+
+              <div className="mt-4 flex items-center justify-between gap-3">
+                <div className="flex min-w-0 flex-wrap gap-2">
+                  {account.models.slice(0, 2).map((model) => (
+                    <span
+                      className={cx(
+                        "truncate rounded-full px-3 py-1.5 text-[11px]",
+                        isDark
+                          ? "bg-white/[0.05] text-zinc-400"
+                          : "bg-white text-zinc-500"
+                      )}
+                      key={model}
+                      title={model}
+                    >
+                      {model}
                     </span>
-                    <span className={cx(isDark ? "text-zinc-500" : "text-zinc-500")}>
-                      {t.workspace}: {account.workspaceRole ?? "--"}
-                    </span>
-                  </div>
-                  <p className={cx("mt-2", isDark ? "text-zinc-500" : "text-zinc-500")}>
-                    {t.refreshedAt}: {formatDateTime(account.managedStateRefreshedAt, language)}
-                  </p>
+                  ))}
                 </div>
+                {isManaged ? (
+                  <span
+                    className={cx(
+                      "inline-flex shrink-0 items-center gap-1.5 text-[11px]",
+                      isDark ? "text-zinc-500" : "text-zinc-500"
+                    )}
+                    title={t.autoQuotaRefreshHint}
+                  >
+                    <Clock3 size={12} strokeWidth={iconStroke} />
+                    {account.managedStateRefreshedAt
+                      ? relativeTime(account.managedStateRefreshedAt, language)
+                      : `${managedQuotaRefreshIntervalMs / 1000}s`}
+                  </span>
+                ) : null}
+              </div>
+
+              {availabilityTimestamp ? (
+                <p
+                  className={cx(
+                    "mt-3 text-[11px]",
+                    account.availabilityState === "quota_exhausted"
+                      ? isDark
+                        ? "text-rose-300"
+                        : "text-rose-600"
+                      : isDark
+                        ? "text-zinc-500"
+                        : "text-zinc-500"
+                  )}
+                  title={account.availabilityReason ?? undefined}
+                >
+                  {account.availabilityState === "quota_exhausted"
+                    ? `${t.resetsAt} ${formatDateTime(availabilityTimestamp, language)}`
+                    : `${t.cooldownUntil} ${formatDateTime(availabilityTimestamp, language)}`}
+                </p>
+              ) : null}
+
+              {account.lastError ? (
+                <p
+                  className={cx(
+                    "mt-4 text-xs leading-5",
+                    isDark ? "text-rose-300" : "text-rose-600"
+                  )}
+                  title={account.lastError}
+                >
+                  {truncateText(account.lastError, 92)}
+                </p>
               ) : null}
             </article>
           );
@@ -2805,7 +3814,7 @@ export function DashboardApp({
               {
                 icon: Sparkles,
                 label: t.tokens,
-                value: formatNumber(runtimeSnapshot.billing.totalTokens, language)
+                value: formatMToken(runtimeSnapshot.billing.totalTokens, language)
               },
               {
                 icon: DollarSign,
@@ -2972,7 +3981,7 @@ export function DashboardApp({
                         {
                           icon: Sparkles,
                           label: t.tokens,
-                          value: formatNumber(totalTokens, language)
+                          value: formatMToken(totalTokens, language)
                         },
                         {
                           icon: DollarSign,
@@ -3048,22 +4057,32 @@ export function DashboardApp({
       theme={theme}
       title={t.alerts}
     >
-      {runtimeSnapshot.cfIncidents.length === 0 ? (
+      {runtimeSnapshot.accountAlerts.length === 0 ? (
         <EmptyState icon={BellOff} theme={theme} title={t.noAlerts} />
       ) : (
         <div className="space-y-4">
-          {runtimeSnapshot.cfIncidents.map((incident) => (
-            <div className="flex gap-4" key={incident.id}>
+          {runtimeSnapshot.accountAlerts.map((alert) => (
+            <div className="flex gap-4" key={alert.id}>
               <div className="flex flex-col items-center">
                 <span
                   className={cx(
                     "flex h-10 w-10 items-center justify-center rounded-2xl shadow-soft",
-                    isDark
-                      ? "bg-amber-500/14 text-amber-200"
-                      : "bg-amber-50 text-amber-600"
+                    alert.severity === "critical"
+                      ? isDark
+                        ? "bg-rose-500/14 text-rose-200"
+                        : "bg-rose-50 text-rose-600"
+                      : isDark
+                        ? "bg-amber-500/14 text-amber-200"
+                        : "bg-amber-50 text-amber-600"
                   )}
                 >
-                  <Bell size={16} strokeWidth={iconStroke} />
+                  {alert.kind === "disabled" ? (
+                    <CircleX size={16} strokeWidth={iconStroke} />
+                  ) : alert.kind === "protected" ? (
+                    <Shield size={16} strokeWidth={iconStroke} />
+                  ) : (
+                    <Bell size={16} strokeWidth={iconStroke} />
+                  )}
                 </span>
                 <span className={cx("mt-2 h-full w-px", isDark ? "bg-white/10" : "bg-zinc-200")} />
               </div>
@@ -3076,17 +4095,13 @@ export function DashboardApp({
                 )}
               >
                 <p className={cx("text-sm font-medium", isDark ? "text-zinc-50" : "text-zinc-900")}>
-                  {t.lowQuotaDetected(shortId(incident.accountId))}
+                  {accountAlertLabel(alert)} · {alert.accountLabel || shortId(alert.accountId)}
                 </p>
                 <p className={cx("mt-2 text-xs leading-5", isDark ? "text-zinc-500" : "text-zinc-500")}>
-                  {t.alertDescription(
-                    incident.accountLabel,
-                    incident.severity,
-                    incident.cooldownLevel
-                  )}
+                  {accountAlertReason(alert)}
                 </p>
                 <p className={cx("mt-3 text-xs", isDark ? "text-zinc-600" : "text-zinc-400")}>
-                  {relativeTime(incident.happenedAt, language)}
+                  {relativeTime(alert.happenedAt, language)}
                 </p>
               </div>
             </div>
@@ -3326,29 +4341,26 @@ export function DashboardApp({
     >
       <aside
         className={cx(
-          "fixed inset-y-4 left-4 z-40 hidden rounded-[34px] border p-2.5 shadow-panel backdrop-blur-xl transition-all duration-200 md:flex md:flex-col",
-          isDark
-            ? "border-white/10 bg-[#10131a]/88"
-            : "border-white/70 bg-white/85",
-          effectiveSidebarExpanded ? "w-[240px]" : "w-[72px]"
+          "apple-shell fixed inset-y-4 left-4 z-40 hidden rounded-[30px] p-2 shadow-panel transition-all duration-200 xl:flex xl:flex-col",
+          effectiveSidebarExpanded ? "w-[220px]" : "w-[64px]"
         )}
         onMouseEnter={() => setSidebarHovered(true)}
         onMouseLeave={() => setSidebarHovered(false)}
       >
         <div
           className={cx(
-            "mb-6 flex items-center overflow-hidden",
+            "mb-4 flex items-center overflow-hidden",
             effectiveSidebarExpanded ? "gap-3" : "justify-center"
           )}
         >
           <div className="flex items-center gap-3 overflow-hidden">
             <span
               className={cx(
-                "flex h-11 w-11 shrink-0 items-center justify-center rounded-[18px]",
+                "flex h-10 w-10 shrink-0 items-center justify-center rounded-[16px]",
                 isDark ? "bg-zinc-100 text-zinc-950" : "bg-zinc-900 text-white"
               )}
             >
-              <Bot size={18} strokeWidth={iconStroke} />
+              <Bot size={16} strokeWidth={iconStroke} />
             </span>
             <div
               className={cx(
@@ -3359,16 +4371,18 @@ export function DashboardApp({
               <p className={cx("text-sm font-semibold", isDark ? "text-zinc-50" : "text-zinc-900")}>
                 {t.brandTitle}
               </p>
-              <p className={cx("text-xs", isDark ? "text-zinc-500" : "text-zinc-500")}>
-                {t.brandSubtitle}
-              </p>
+              {t.brandSubtitle ? (
+                <p className={cx("text-xs", isDark ? "text-zinc-500" : "text-zinc-500")}>
+                  {t.brandSubtitle}
+                </p>
+              ) : null}
             </div>
           </div>
         </div>
 
         <nav
           className={cx(
-            "flex-1 space-y-2",
+            "flex-1 space-y-1.5",
             effectiveSidebarExpanded ? "" : "flex flex-col items-center"
           )}
         >
@@ -3389,96 +4403,85 @@ export function DashboardApp({
           {effectiveSidebarExpanded ? (
             <div
               className={cx(
-                "rounded-[30px] border p-3",
-                isDark
-                  ? "border-white/10 bg-white/[0.04]"
-                  : "border-zinc-200 bg-zinc-100/80"
+                "apple-subtle-panel rounded-[24px] p-2"
               )}
             >
-              <div className="flex items-center gap-3">
+              <div className="flex items-center justify-between gap-2">
                 <span
                   className={cx(
-                    "relative flex h-11 w-11 shrink-0 items-center justify-center rounded-[18px] shadow-soft",
+                    "relative flex h-9 w-9 shrink-0 items-center justify-center rounded-[14px]",
                     isDark ? "bg-white/[0.06] text-zinc-300" : "bg-white text-zinc-500"
                   )}
                 >
-                  <Sparkles size={16} strokeWidth={iconStroke} />
+                  <Sparkles size={14} strokeWidth={iconStroke} />
                   <span
                     className={cx(
-                      "absolute right-2 top-2 h-2 w-2 rounded-full ring-2",
+                      "absolute right-1.5 top-1.5 h-2 w-2 rounded-full ring-2",
                       health.status === "ok" ? "bg-emerald-400" : "bg-amber-400",
                       isDark ? "ring-[#141821]" : "ring-white"
                     )}
                   />
                 </span>
                 <div className="min-w-0">
-                  <p className={cx("text-xs font-medium", isDark ? "text-zinc-100" : "text-zinc-900")}>
+                  <p className={cx("text-[11px] font-medium", isDark ? "text-zinc-100" : "text-zinc-900")}>
                     {health.status === "ok" ? t.systemReady : t.checkSystem}
                   </p>
-                  <p className={cx("mt-1 text-[11px]", isDark ? "text-zinc-500" : "text-zinc-500")}>
+                  <p className={cx("mt-0.5 text-[10px]", isDark ? "text-zinc-500" : "text-zinc-500")}>
                     {t.accountsInPool(runtimeSnapshot.counts.accounts)}
                   </p>
                 </div>
-              </div>
-
-              <div className={cx("my-3 h-px", isDark ? "bg-white/10" : "bg-zinc-200")} />
-
-              <div className="flex justify-end">
                 <button
                   className={cx(
-                    "flex h-11 items-center justify-center gap-2 rounded-full px-4 transition-all duration-200",
+                    "flex h-8 w-8 shrink-0 items-center justify-center rounded-[14px] transition-all duration-200",
                     isDark
-                      ? "bg-white/[0.08] text-zinc-200 hover:bg-white/[0.12]"
-                      : "bg-white text-zinc-600 hover:bg-zinc-50"
+                      ? "text-zinc-400 hover:bg-white/[0.06]"
+                      : "text-zinc-500 hover:bg-white"
                   )}
                   onClick={() => setSidebarExpanded((value) => !value)}
+                  title={t.collapse}
                   type="button"
                 >
-                  <ChevronLeft size={16} strokeWidth={iconStroke} />
-                  <span className="text-sm font-medium">{t.collapse}</span>
+                  <ChevronLeft size={14} strokeWidth={iconStroke} />
                 </button>
               </div>
             </div>
           ) : (
             <div
               className={cx(
-                "mx-auto flex w-12 flex-col items-center gap-2 rounded-[24px] border p-1.5",
-                isDark
-                  ? "border-white/10 bg-white/[0.04]"
-                  : "border-zinc-200 bg-zinc-100/80"
+                "apple-subtle-panel mx-auto flex w-11 flex-col items-center gap-1.5 rounded-[22px] p-1.5"
               )}
             >
               <span
                 className={cx(
-                  "relative flex h-9 w-9 items-center justify-center rounded-[16px] shadow-soft",
+                  "relative flex h-8 w-8 items-center justify-center rounded-[14px]",
                   isDark ? "bg-white/[0.06] text-zinc-300" : "bg-white text-zinc-500"
                 )}
                 title={health.status === "ok" ? t.systemReady : t.checkSystem}
               >
-                <Sparkles size={15} strokeWidth={iconStroke} />
+                <Sparkles size={14} strokeWidth={iconStroke} />
                 <span
                   className={cx(
-                    "absolute right-1.5 top-1.5 h-2 w-2 rounded-full ring-2",
+                    "absolute right-1 top-1 h-2 w-2 rounded-full ring-2",
                     health.status === "ok" ? "bg-emerald-400" : "bg-amber-400",
                     isDark ? "ring-[#141821]" : "ring-white"
                   )}
                 />
               </span>
 
-              <div className={cx("h-px w-6", isDark ? "bg-white/10" : "bg-zinc-200")} />
+              <div className={cx("h-px w-5", isDark ? "bg-white/10" : "bg-zinc-200")} />
 
               <button
                 className={cx(
-                  "flex h-9 w-9 items-center justify-center rounded-[16px] transition-all duration-200",
+                  "flex h-8 w-8 items-center justify-center rounded-[14px] transition-all duration-200",
                   isDark
-                    ? "bg-white/[0.08] text-zinc-200 hover:bg-white/[0.12]"
-                    : "bg-white text-zinc-600 hover:bg-zinc-50"
+                    ? "bg-white/[0.06] text-zinc-300 hover:bg-white/[0.1]"
+                    : "bg-white text-zinc-500 hover:bg-zinc-50"
                 )}
                 onClick={() => setSidebarExpanded((value) => !value)}
                 title={t.expand}
                 type="button"
               >
-                <ChevronRight size={15} strokeWidth={iconStroke} />
+                <ChevronRight size={14} strokeWidth={iconStroke} />
               </button>
             </div>
           )}
@@ -3487,10 +4490,7 @@ export function DashboardApp({
 
       <aside
         className={cx(
-          "fixed inset-x-4 bottom-4 z-40 rounded-[28px] border p-3 shadow-panel backdrop-blur-xl md:hidden",
-          isDark
-            ? "border-white/10 bg-[#10131a]/92"
-            : "border-white/70 bg-white/90"
+          "apple-shell fixed inset-x-4 bottom-4 z-40 rounded-[28px] p-3 shadow-panel xl:hidden"
         )}
       >
         <div className="grid grid-cols-6 gap-2">
@@ -3522,158 +4522,142 @@ export function DashboardApp({
 
       <main
         className={cx(
-          "min-h-screen p-4 pb-28 transition-all duration-200 md:p-6 md:pb-6",
-          effectiveSidebarExpanded ? "md:pl-[264px]" : "md:pl-[104px]"
+          "min-h-screen p-3 pb-28 transition-all duration-200 md:p-5 md:pb-6",
+          effectiveSidebarExpanded ? "xl:pl-[232px]" : "xl:pl-[88px]"
         )}
       >
-        <div className="mx-auto max-w-[1600px] space-y-6">
+        <div className="mx-auto max-w-[1640px] space-y-5">
           <header
             className={cx(
-              "rounded-[36px] border p-6 shadow-soft backdrop-blur-xl",
-              isDark
-                ? "border-white/10 bg-[#10131a]/72"
-                : "border-white/70 bg-white/70"
+              "apple-shell rounded-[34px] p-4 shadow-soft md:p-5"
             )}
           >
-            <div className="flex flex-col gap-5 xl:flex-row xl:items-start xl:justify-between">
-              <div>
-                <p className={cx("text-xs uppercase tracking-[0.24em]", isDark ? "text-zinc-500" : "text-zinc-400")}>
-                  {t.headerKicker}
-                </p>
-                <h1 className={cx("mt-3 text-xl font-semibold tracking-tight md:text-3xl", isDark ? "text-zinc-50" : "text-zinc-900")}>
-                  {t.headerTitle}
-                </h1>
-                <p className={cx("mt-3 max-w-3xl text-sm leading-6", isDark ? "text-zinc-400" : "text-zinc-500")}>
-                  {t.headerDescription}
-                </p>
-              </div>
+            <div className="flex items-center justify-between gap-4">
+              <h1
+                className={cx(
+                  "min-w-0 break-keep text-[clamp(1.7rem,2.8vw,2.7rem)] font-semibold tracking-[-0.05em]",
+                  isDark ? "text-zinc-50" : "text-zinc-950"
+                )}
+              >
+                {t.headerTitle}
+              </h1>
 
-              <div className="flex flex-wrap items-center gap-3">
-                <div
-                  className={cx(
-                    "flex items-center gap-1 rounded-2xl p-1 shadow-soft",
-                    isDark ? "bg-white/[0.06]" : "bg-white"
-                  )}
-                >
-                  <span className={cx("px-2 text-[11px] font-medium uppercase tracking-[0.18em]", isDark ? "text-zinc-500" : "text-zinc-400")}>
-                    {t.language}
-                  </span>
-                  {(["zh", "en"] as Language[]).map((value) => (
-                    <button
-                      className={cx(
-                        "rounded-xl px-3 py-2 text-xs font-medium transition-all duration-200",
-                        language === value
-                          ? isDark
-                            ? "bg-zinc-100 text-zinc-950"
-                            : "bg-zinc-900 text-white"
-                          : isDark
-                            ? "text-zinc-400 hover:bg-white/[0.06]"
-                            : "text-zinc-500 hover:bg-zinc-100"
-                      )}
-                      key={value}
-                      onClick={() => setLanguage(value)}
-                      type="button"
-                    >
-                      {value === "zh" ? "CN" : "EN"}
-                    </button>
-                  ))}
-                </div>
-
-                <div
-                  className={cx(
-                    "rounded-2xl px-3 py-2 shadow-soft",
-                    isDark ? "bg-white/[0.06]" : "bg-white"
-                  )}
-                >
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className={cx("text-[11px] font-medium uppercase tracking-[0.18em]", isDark ? "text-zinc-500" : "text-zinc-400")}>
-                      {t.liveRefresh}
-                    </span>
-                    {([
-                      [5000, "5s"],
-                      [10000, "10s"],
-                      [30000, "30s"],
-                      [0, t.refreshOff]
-                    ] as const).map(([value, label]) => (
-                      <button
-                        className={cx(
-                          "rounded-xl px-3 py-1.5 text-xs font-medium transition-all duration-200",
-                          liveRefreshInterval === value
-                            ? isDark
-                              ? "bg-zinc-100 text-zinc-950"
-                              : "bg-zinc-900 text-white"
-                            : isDark
-                              ? "text-zinc-400 hover:bg-white/[0.06]"
-                              : "text-zinc-500 hover:bg-zinc-100"
-                        )}
-                        key={value}
-                        onClick={() => setLiveRefreshInterval(value)}
-                        type="button"
-                      >
-                        {label}
-                      </button>
-                    ))}
-                  </div>
-                  <p className={cx("mt-2 text-[11px]", isDark ? "text-zinc-500" : "text-zinc-500")}>
-                    {t.lastRefreshed}: {formatDateTime(lastLiveRefreshAt, language)} · {liveRefreshLabel}
-                  </p>
-                </div>
-
+              <div className="relative shrink-0" data-settings-panel-root="true">
                 <button
+                  aria-expanded={isSettingsOpen}
+                  aria-haspopup="dialog"
                   className={cx(
-                    "inline-flex items-center gap-2 rounded-2xl px-4 py-3 text-sm font-medium transition-all duration-200",
+                    "apple-segmented flex h-11 w-11 items-center justify-center rounded-2xl transition-all duration-200",
                     isDark
-                      ? "bg-white/[0.06] text-zinc-200 hover:bg-white/[0.1]"
-                      : "bg-white text-zinc-600 hover:bg-zinc-100"
+                      ? "text-zinc-200 hover:bg-white/[0.08]"
+                      : "text-zinc-700 hover:bg-white"
                   )}
-                  onClick={() =>
-                    setTheme((current) =>
-                      current === "dark" ? "light" : "dark"
-                    )
-                  }
+                  onClick={() => setIsSettingsOpen((current) => !current)}
+                  title={t.settingsPanel}
                   type="button"
                 >
-                  {theme === "dark" ? (
-                    <MoonStar size={16} strokeWidth={iconStroke} />
-                  ) : (
-                    <SunMedium size={16} strokeWidth={iconStroke} />
-                  )}
-                  {theme === "dark" ? t.darkTheme : t.lightTheme}
+                  <Settings size={17} strokeWidth={iconStroke} />
                 </button>
 
-                {[
-                  {
-                    label: t.summaryCache,
-                    value: `${percent(runtimeSnapshot.cacheMetrics.prefixHitRatio)}%`
-                  },
-                  {
-                    label: t.summaryUsers,
-                    value: formatNumber(runtimeSnapshot.counts.users, language)
-                  },
-                  {
-                    label: t.summarySpend,
-                    value: formatUsd(runtimeSnapshot.billing.totalSpendUsd, language)
-                  },
-                  {
-                    label: t.summaryHealth,
-                    value: health.status === "ok" ? t.nominal : t.attention
-                  }
-                ].map((item) => (
+                {isSettingsOpen ? (
                   <div
                     className={cx(
-                      "rounded-2xl px-4 py-3 shadow-soft",
-                      isDark ? "bg-white/[0.06]" : "bg-white"
+                      "apple-panel absolute right-0 top-14 z-30 w-[min(92vw,360px)] rounded-[28px] p-4 shadow-panel"
                     )}
-                    key={item.label}
                   >
-                    <p className={cx("text-[11px] uppercase tracking-[0.2em]", isDark ? "text-zinc-500" : "text-zinc-400")}>
-                      {item.label}
-                    </p>
-                    <p className={cx("mt-1 text-sm font-medium", isDark ? "text-zinc-100" : "text-zinc-900")}>
-                      {item.value}
-                    </p>
+                    <div className="space-y-4">
+                      <div>
+                        <p className={cx("text-sm font-semibold", isDark ? "text-zinc-100" : "text-zinc-900")}>
+                          {t.settingsPanel}
+                        </p>
+                        <p className={cx("mt-1 text-[11px] leading-5", isDark ? "text-zinc-500" : "text-zinc-500")}>
+                          {t.lastRefreshed}: {formatDateTime(lastLiveRefreshAt, language)} · {liveRefreshLabel}
+                        </p>
+                      </div>
+
+                      <div className="space-y-2">
+                        <p className={cx("text-[11px] tracking-[0.16em]", isDark ? "text-zinc-500" : "text-zinc-500")}>
+                          {t.language}
+                        </p>
+                        <div className="apple-segmented inline-flex items-center gap-1 rounded-2xl p-1">
+                          {(["zh", "en"] as Language[]).map((value) => (
+                            <button
+                              className={cx(
+                                "rounded-xl px-3 py-2 text-xs font-medium transition-all duration-200",
+                                language === value
+                                  ? isDark
+                                    ? "bg-zinc-100 text-zinc-950"
+                                    : "bg-zinc-900 text-white"
+                                  : isDark
+                                    ? "text-zinc-400 hover:bg-white/[0.06]"
+                                    : "text-zinc-500 hover:bg-zinc-100"
+                              )}
+                              key={value}
+                              onClick={() => setLanguage(value)}
+                              type="button"
+                            >
+                              {value === "zh" ? "CN" : "EN"}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="space-y-2">
+                        <p className={cx("text-[11px] tracking-[0.16em]", isDark ? "text-zinc-500" : "text-zinc-500")}>
+                          {t.liveRefresh}
+                        </p>
+                        <div className="apple-segmented flex flex-wrap items-center gap-1 rounded-2xl p-1">
+                          {([
+                            [5000, "5s"],
+                            [10000, "10s"],
+                            [30000, "30s"],
+                            [0, t.refreshOff]
+                          ] as const).map(([value, label]) => (
+                            <button
+                              className={cx(
+                                "rounded-xl px-3 py-2 text-xs font-medium transition-all duration-200",
+                                liveRefreshInterval === value
+                                  ? isDark
+                                    ? "bg-zinc-100 text-zinc-950"
+                                    : "bg-zinc-900 text-white"
+                                  : isDark
+                                    ? "text-zinc-400 hover:bg-white/[0.06]"
+                                    : "text-zinc-500 hover:bg-zinc-100"
+                              )}
+                              key={value}
+                              onClick={() => setLiveRefreshInterval(value)}
+                              type="button"
+                            >
+                              {label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <button
+                        className={cx(
+                          "apple-segmented inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl px-4 py-3 text-sm font-medium transition-all duration-200",
+                          isDark
+                            ? "text-zinc-200 hover:bg-white/[0.08]"
+                            : "text-zinc-700 hover:bg-white"
+                        )}
+                        onClick={() =>
+                          setTheme((current) =>
+                            current === "dark" ? "light" : "dark"
+                          )
+                        }
+                        type="button"
+                      >
+                        {theme === "dark" ? (
+                          <MoonStar size={16} strokeWidth={iconStroke} />
+                        ) : (
+                          <SunMedium size={16} strokeWidth={iconStroke} />
+                        )}
+                        {theme === "dark" ? t.darkTheme : t.lightTheme}
+                      </button>
+                    </div>
                   </div>
-                ))}
+                ) : null}
               </div>
             </div>
           </header>

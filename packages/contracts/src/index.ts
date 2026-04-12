@@ -1,10 +1,17 @@
 export type AccountRouteMode = "direct" | "warp";
 export type GatewayUserRole = "admin" | "viewer";
+export type AccountAvailabilityState =
+  | "routable"
+  | "cooldown"
+  | "quota_exhausted"
+  | "unavailable";
 
 export interface CacheMetrics {
   cachedTokens: number;
   replayTokens: number;
   prefixHitRatio: number;
+  requestHitRatio: number;
+  tokenHitRatio: number;
   warmupRoi: number;
   staticPrefixTokens: number;
 }
@@ -35,6 +42,8 @@ export interface ManagedRateLimitSnapshot {
   planType: string | null;
 }
 
+export type ManagedAccountStatus = "active" | "unavailable" | "banned";
+
 export interface AccountSummary {
   id: string;
   tenantId: string;
@@ -63,9 +72,15 @@ export interface AccountSummary {
   planType: string | null;
   workspaceRole: string | null;
   isWorkspaceOwner: boolean | null;
+  status: ManagedAccountStatus;
+  statusReason: string | null;
+  lastError: string | null;
   rateLimits: ManagedRateLimitSnapshot | null;
   rateLimitsByLimitId: Record<string, ManagedRateLimitSnapshot>;
   managedStateRefreshedAt: string | null;
+  availabilityState: AccountAvailabilityState;
+  availabilityReason: string | null;
+  availabilityResetAt: string | null;
   egressGroup: string;
   proxyEnabled: boolean;
 }
@@ -89,6 +104,19 @@ export interface CfIncident {
   severity: string;
   happenedAt: string;
   cooldownLevel: number;
+}
+
+export interface AccountAlert {
+  id: string;
+  accountId: string;
+  accountLabel: string;
+  kind: string;
+  severity: string;
+  happenedAt: string;
+  quotaHeadroom: number | null;
+  cooldownLevel: number;
+  status: ManagedAccountStatus;
+  reason: string | null;
 }
 
 export interface ServiceTopologyNode {
@@ -182,6 +210,7 @@ export interface DashboardSnapshot {
   cacheMetrics: CacheMetrics;
   accounts: AccountSummary[];
   leases: LeaseView[];
+  accountAlerts: AccountAlert[];
   cfIncidents: CfIncident[];
   browserTasks: BrowserTask[];
   users: GatewayUserView[];
@@ -203,8 +232,16 @@ export interface DashboardLiveSnapshot {
   cacheMetrics: CacheMetrics;
   accounts: AccountSummary[];
   leases: LeaseView[];
+  accountAlerts: AccountAlert[];
   requestLogs: RequestLogEntry[];
   billing: BillingSummary;
+}
+
+export interface AccountCleanupResult {
+  scanned: number;
+  deleted: number;
+  skippedNotBanned: number;
+  deletedAccountIds: string[];
 }
 
 export const dashboardFallback: DashboardSnapshot = {
@@ -241,6 +278,8 @@ export const dashboardFallback: DashboardSnapshot = {
     cachedTokens: 0,
     replayTokens: 0,
     prefixHitRatio: 0,
+    requestHitRatio: 0,
+    tokenHitRatio: 0,
     warmupRoi: 0,
     staticPrefixTokens: 0
   },
@@ -273,13 +312,20 @@ export const dashboardFallback: DashboardSnapshot = {
       planType: null,
       workspaceRole: null,
       isWorkspaceOwner: null,
+      status: "active",
+      statusReason: null,
+      lastError: null,
       rateLimits: null,
       rateLimitsByLimitId: {},
       managedStateRefreshedAt: null,
+      availabilityState: "routable",
+      availabilityReason: null,
+      availabilityResetAt: null,
       egressGroup: "direct-native",
       proxyEnabled: false
     }
   ],
+  accountAlerts: [],
   leases: [
     {
       principalId: "tenant:demo/principal:atlas-shell",
